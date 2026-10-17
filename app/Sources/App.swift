@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon
 
 @main
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -7,6 +8,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recorder = Recorder()
     private var isRecording = false
     private var leftCmdDown = false
+    private var lastToggle: TimeInterval = 0
+    // exit 4（疑似非語音）時保留的文字與對應選單項：不自動貼，但讓使用者能手動貼。
+    private var pendingText: String?
+    private var pendingItem: NSMenuItem?
+    // 有沒有收到過真正的 Cmd 修飾鍵事件。某些環境（合成事件、遠端桌面）完全收不到
+    // flagsChanged；那種情況下才降級放行，否則嚴格只認左 Cmd。
+    private var sawCmdFlags = false
+    // 系統層快捷鍵（Carbon RegisterEventHotKey）。不用 NSEvent 全域監聽器當唯一路徑，
+    // 因為那種監聽器依賴 TCC（輔助使用/輸入監控），簽章一換授權就失效、而且失敗時完全
+    // 不會報錯（監聽器照樣註冊，只是永遠不呼叫）。Carbon 熱鍵走系統層，不吃 TCC。
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHeld = false
 
     // 進場點：不要依賴 AppKit 的預設 main。它會走 NSApplicationMain，靠 Info.plist 的
     // NSMainNibFile 指派 delegate；我們沒有 nib，delegate 就永遠不會被設，
@@ -30,10 +43,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.title = "🎙️"
-        statusItem.button?.toolTip = "Voice Input — 左 Cmd+E 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
+        statusItem.button?.toolTip = "Voice Input — ⌘\\ 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "左 Cmd+E：開始/結束錄音", action: #selector(toggleRec), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "⌘\\：開始/結束錄音", action: #selector(toggleRec), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "狀態：待命 🎙️", action: nil, keyEquivalent: ""))
+        let pending = NSMenuItem(title: "貼上上次保留的結果（疑似非語音時）", action: #selector(pastePending), keyEquivalent: "")
+        pending.isEnabled = false
+        pendingItem = pending
+        menu.addItem(pending)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "開啟 VoiceInputMac 檔案位置", action: #selector(revealInFinder), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "重新啟動", action: #selector(relaunch), keyEquivalent: "r"))
@@ -41,15 +58,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         // 檔案 & 輔助：自動建 .app 包（若僅有二進位）並配好 Info.plist
         BundleHelper.ensureAppBundle()
-        NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.handleFlags(e) }
-        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.handleFlags(e); return e }
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.handleKey(e) }
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.handleKey(e); return e }
-        print("[app] launched. python=\(Transcriber.pythonBin) script=\(Transcriber.scriptPath) hotkey=LeftCmd+E toggle, Dock visible, bundle=\(Bundle.main.bundlePath)")
+        NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.handleFlags(e, source: "global") }
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.handleFlags(e, source: "local"); return e }
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.handleKey(e, source: "global") }
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.handleKey(e, source: "local"); return e }
+        // 執行時真的被信任嗎？TCC 的表格說「允許」不代表簽章換過之後還算數，
+        // 所以把實際結果寫進 log（`false` = 全域監聽器一定收不到跨 app 按鍵）。
+        Transcriber.log("[perm] AXIsProcessTrusted=\(AXIsProcessTrusted())")
+        setupCarbonHotKey()
+        Transcriber.log("[app] launched. bundle=\(Bundle.main.bundlePath) python=\(Transcriber.pythonBin) script=\(Transcriber.scriptPath) log=\(Transcriber.logPath)")
     }
 
-    private func handleFlags(_ e: NSEvent) {
+    // MARK: - 系統層快捷鍵（Carbon ⌘\，不需任何 TCC 權限）
+
+    private func setupCarbonHotKey() {
+        var specs = [
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
+        ]
+        let handler: EventHandlerUPP = { _, event, _ in
+            let kind = event.map { GetEventKind($0) } ?? 0
+            DispatchQueue.main.async { AppDelegate.appDelegate.carbonHotKey(kind: kind) }
+            return noErr
+        }
+        var handlerRef: EventHandlerRef?
+        let hs = InstallEventHandler(GetApplicationEventTarget(), handler, specs.count, &specs, nil, &handlerRef)
+        let id = EventHotKeyID(signature: OSType(0x56494E50) /* 'VINP' */, id: 1)
+        let rs = RegisterEventHotKey(UInt32(kVK_ANSI_Backslash), UInt32(cmdKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        Transcriber.log("[hotkey] Carbon ⌘\\ InstallEventHandler=\(hs) RegisterEventHotKey=\(rs) ok=\(hotKeyRef != nil)")
+    }
+
+    func carbonHotKey(kind: UInt32) {
+        switch kind {
+        case UInt32(kEventHotKeyPressed):
+            guard !hotKeyHeld else { return }   // 按住會連續送 pressed，只認第一次
+            hotKeyHeld = true
+            Transcriber.log("[hotkey] Carbon ⌘\\ 按下")
+            trigger(source: "carbon")
+        case UInt32(kEventHotKeyReleased):
+            hotKeyHeld = false
+        default:
+            break
+        }
+    }
+
+    // 所有觸發路徑（Carbon 熱鍵、NSEvent 全域/本地監聽器）共用，去抖動避免同一次
+    // 按鍵被多條路徑各送一次而 start/stop 連發。
+    private func trigger(source: String) {
+        let now = Date().timeIntervalSince1970
+        guard now - lastToggle > 0.4 else {
+            Transcriber.log("[key] 去抖動略過重複的觸發（source=\(source)）")
+            return
+        }
+        lastToggle = now
+        Transcriber.log("[key] 觸發（source=\(source)）")
+        toggleRec()
+    }
+
+    private func handleFlags(_ e: NSEvent, source: String) {
         // 55 = 左 Cmd, 54 = 右 Cmd
+        if e.keyCode == 55 || e.keyCode == 54 { sawCmdFlags = true }
         if e.keyCode == 55 {
             leftCmdDown = e.modifierFlags.contains(.command)
         } else if e.keyCode == 54 {
@@ -59,15 +127,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !e.modifierFlags.contains(.command) { leftCmdDown = false }
     }
 
-    private func handleKey(_ e: NSEvent) {
-        // E keyCode = 14, 需左 Cmd 按住
-        guard e.keyCode == 14, e.modifierFlags.contains(.command) else { return }
-        // 嚴格只認左 Cmd；若 flags 事件漏掉，退化為任何 Cmd+E 也觸發（註解下一行可改為嚴格）
-        if leftCmdDown || true {
-            // 為避免長按重複觸發，只在 keyDown 第一次
-            if e.isARepeat { return }
-            toggleRec()
+    private func handleKey(_ e: NSEvent, source: String) {
+        // 反斜線 \ keyCode = 42, 需 Cmd 按住
+        // 診斷用：只要看到 \\ 鍵（不管修飾鍵）就記一筆，這樣「收不到」和「收到但被規則擋掉」
+        // 才分得出來（先前只有通過檢查才寫 log，收不到時完全沒痕跡）。
+        if e.keyCode == 42 {
+            Transcriber.log("[key] 看到 \\ 鍵 flags=\(e.modifierFlags.rawValue) repeat=\(e.isARepeat) source=\(source)")
         }
+        guard e.keyCode == 42, e.modifierFlags.contains(.command) else { return }
+        // 之前是 `if leftCmdDown || true`（永遠成立），所以任何 app 的 ⌘\\（例如 Finder 的退出光碟）
+        // 都會開始錄音 —— 使用者回報「有時候會自己啟動」。改成嚴格只認左 Cmd。
+        guard leftCmdDown || !sawCmdFlags else {
+            Transcriber.log("[key] 忽略 ⌘\\（source=\(source)）：不是左 Cmd（leftCmdDown=false）")
+            return
+        }
+        if !leftCmdDown && !sawCmdFlags {
+            Transcriber.log("[key] 降級模式：收不到 Cmd flagsChanged，放行 ⌘\\（source=\(source)）")
+        }
+        guard !e.isARepeat else { return }
+        trigger(source: source)
     }
 
     @objc func toggleRec() {
@@ -78,34 +156,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isRecording else { return }
         isRecording = true
         statusItem.button?.title = "🔴"
+        // 趁使用者講話時先把模型載好（暖機 ~6s），按下停止後只剩推論（~0.9s）
+        Transcriber.startWarmServer()
         recorder.start()
-        print("[app] recording...")
+        Transcriber.log("[app] recording start")
     }
 
     @objc func stopAndTranscribe() {
         guard isRecording else { return }
         isRecording = false
+        let tStop = Date()
         statusItem.button?.title = "⏳"
-        guard let url = recorder.stop() else { statusItem.button?.title = "🎙️"; return }
-        print("[app] wav \(url.path)")
+        guard let url = recorder.stop() else {
+            statusItem.button?.title = "🎙️"
+            Transcriber.log("[app] recording stop：沒有音訊，放棄")
+            return
+        }
+        Transcriber.log("[app] recording stop -> \(url.path)")
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let text = try Transcriber.transcribe(wavURL: url)
+                let (text, suspect) = try Transcriber.transcribe(wavURL: url)
                 DispatchQueue.main.async {
-                    print("[app] polished: \(text)")
+                    Transcriber.log("[app] 結果（停止→文字 \(String(format: "%.2f", Date().timeIntervalSince(tStop)))s）：\(text)")
                     self.statusItem.button?.title = "🎙️"
-                    guard !text.isEmpty else { return }
+                    guard !text.isEmpty else {
+                        Transcriber.log("[app] 結果為空，不貼上")
+                        return
+                    }
+                    if suspect {
+                        // exit 4：疑似非語音（噪音幻覺）。不自動貼，但保留文字，讓使用者
+                        // 能從選單手動貼——這樣「真的是我講的」不會掉，噪音卻不會污染文件。
+                        self.pendingText = text
+                        self.pendingItem?.isEnabled = true
+                        Transcriber.log("[app] exit 4：疑似非語音 → 未自動貼上；文字已保留（選單『貼上上次保留的結果』可用）")
+                        self.statusItem.button?.title = "⚠️"
+                        self.statusItem.button?.toolTip = "疑似非語音，未自動貼上。文字已保留：\(text.prefix(40))（選單可手動貼）"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                            self.statusItem.button?.title = "🎙️"
+                            self.statusItem.button?.toolTip = "Voice Input — ⌘\\ 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
+                        }
+                        return
+                    }
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { Transcriber.pasteViaClipboard() }
                 }
             } catch {
+                let code = (error as NSError).code
                 DispatchQueue.main.async {
-                    print("[app] transcribe failed: \(error)")
                     self.statusItem.button?.title = "🎙️"
+                    if code == 3 {
+                        // transcribe.py 的能量閘門：整段幾乎沒收到聲音 → 不貼上（避免幻覺文字被當成逐字稿）
+                        Transcriber.log("[app] exit 3：沒有可用語音（麥克風沒收到聲音，或結果被判為幻覺）→ 未貼上任何東西")
+                        self.statusItem.button?.title = "🔇"
+                        self.statusItem.button?.toolTip = "沒有可用語音（沒收到聲音或判為幻覺）— 詳見 ~/orca/voice-input-mac/.run.log"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                            self.statusItem.button?.title = "🎙️"
+                            self.statusItem.button?.toolTip = "Voice Input — ⌘\\ 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
+                        }
+                        return
+                    }
+                    Transcriber.log("[app] transcribe failed: \(error.localizedDescription)")
                     let alert = NSAlert()
                     alert.messageText = "轉寫失敗"
-                    alert.informativeText = "\(error)"
+                    alert.informativeText = "\(error.localizedDescription)"
                     alert.runModal()
                 }
             }
@@ -119,6 +233,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dockMenu.addItem(NSMenuItem(title: "重新啟動", action: #selector(relaunch), keyEquivalent: ""))
         dockMenu.addItem(NSMenuItem(title: "結束", action: #selector(quit), keyEquivalent: ""))
         return dockMenu
+    }
+
+    // exit 4 保留的文字：使用者確認真的是自己說的話時，從選單手動貼上。
+    @objc func pastePending() {
+        guard let text = pendingText, !text.isEmpty else { return }
+        Transcriber.log("[app] 手動貼上保留的文字（\(text.count) 字）")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { Transcriber.pasteViaClipboard() }
     }
 
     @objc func revealInFinder() { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: Bundle.main.bundlePath)]) }

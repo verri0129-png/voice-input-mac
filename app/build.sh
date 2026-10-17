@@ -24,7 +24,7 @@ built=0
 for sdk in "${SDKS[@]}"; do
   [ -d "$sdk" ] || continue
   if swiftc -sdk "$sdk" -O \
-       -framework AppKit -framework AVFoundation \
+       -framework AppKit -framework AVFoundation -framework Carbon \
        -o "$OUT/VoiceInputMac" "${SOURCES[@]}" 2>"$OUT/.build.err"; then
     echo "[build] compiled with SDK: $sdk"
     built=1
@@ -63,5 +63,29 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP" >/dev/null 2>&1 && echo "[build] ad-hoc signed" || echo "[build] codesign skipped"
+# --- 簽章：穩定身分（不是 adhoc）------------------------------------------------
+# adhoc 簽章的 designated requirement 就是 binary 的 cdhash → 每次重建都變，macOS 會
+# 當成新 app，麥克風/輔助使用授權每次都要重問（使用者回報的「一直跳權限通知」）。
+# 用固定憑證簽章後，DR 變成 identifier + 憑證 leaf hash → 常數，授權只問一次。
+#   一次性設定：./tools/make-identity.sh
+#   臨時退回 adhoc：VOICE_INPUT_SIGN=adhoc ./build.sh
+SIGN_KC="$HOME/Library/Keychains/voice-input-mac-signing.keychain-db"
+SIGN_ID="${VOICE_INPUT_SIGN_ID:-VoiceInputMac Local Signing}"
+sign_mode="adhoc"
+if [ "${VOICE_INPUT_SIGN:-stable}" != "adhoc" ] && [ -f "$SIGN_KC" ]; then
+  security unlock-keychain -p "" "$SIGN_KC" 2>/dev/null || true
+  SIGN_HASH="$(security find-identity -p codesigning "$SIGN_KC" 2>/dev/null |
+               awk -v n="$SIGN_ID" 'index($0, n) { print $2; exit }')"
+  if [ -n "${SIGN_HASH:-}" ] &&
+     codesign --force --sign "$SIGN_HASH" --keychain "$SIGN_KC" "$APP" >/dev/null 2>&1; then
+    sign_mode="stable($SIGN_ID)"
+  fi
+fi
+if [ "$sign_mode" = "adhoc" ]; then
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || sign_mode="none"
+  echo "[build] ⚠️  adhoc 簽章：每次重建 macOS 都會重新問權限。"
+  echo "[build]     一次性修法：./tools/make-identity.sh"
+fi
+echo "[build] signed: $sign_mode"
+echo "[build] designated requirement: $(codesign -dr - "$APP" 2>&1 | tail -1)"
 echo "[build] ok -> $APP"
