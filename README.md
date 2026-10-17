@@ -11,7 +11,7 @@ STT `mlx-whisper large-v3-turbo`（~1.6GB）+ 潤飾 `Qwen2.5-7B 4bit`（~4.3GB�
   - `I want to schedule a meeting um tomorrow at 3pm actually make it 4pm` → `I want to schedule a meeting for 4 pm tomorrow.`（語言保持正確，不翻成中文）
 - 靜音幻覺已知：空錄音會產生假字串，已用 RMS 能量門控過濾
 - Swift Menu Bar App `swift build` 通過
-- 現場 `sounddevice` 錄音：本機無實體麥克風（僅 Teams 虛擬裝置），需外接麥克風或耳機麥克風方可實測；檔案管線不受影響
+- 現場 `sounddevice` 錄音：輸入裝置**不寫死**——預設用系統預設輸入，可用 `--device`（索引或名稱子串）指定。兩台裝置不同（M4: `MixPre-6 II`；M2: `SOUNDPEATS POP Clip` 藍芽 / `BOYA mini 2`），以 `--list-devices` 查。
 
 ## M2 16GB 備註
 
@@ -32,7 +32,9 @@ pip install -r requirements.txt
 .venv/bin/python transcribe.py /tmp/test.wav              # 轉寫+潤飾
 .venv/bin/python transcribe.py /tmp/test.wav --no-polish  # 只看 STT raw
 .venv/bin/python transcribe.py /tmp/test.wav --copy       # 進剪貼簿
-.venv/bin/python transcribe.py --record-seconds 5          # 現場錄 5 秒
+.venv/bin/python transcribe.py --record-seconds 5          # 現場錄 5 秒（系統預設輸入）
+.venv/bin/python transcribe.py --list-devices              # 列出可用輸入裝置
+.venv/bin/python transcribe.py --record-seconds 5 --device "BOYA"   # 指定裝置（索引或名稱子串）
 ```
 
 ## Menu Bar App

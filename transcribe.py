@@ -88,15 +88,39 @@ def polish_text(text: str) -> str:
         pass
     return polished
 
+def resolve_input_device(spec):
+    """Map a device spec (index or name substring) to a sounddevice input index.
+    Returns None for system default. Not hardcoded — M4 and M2 have different devices."""
+    import sounddevice as sd
+    if spec is None or str(spec).strip() == "":
+        return None
+    s = str(spec).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    hits = [(i, d) for i, d in enumerate(sd.query_devices())
+            if d.get("max_input_channels", 0) > 0 and s.lower() in d["name"].lower()]
+    if not hits:
+        raise SystemExit(f"[rec] no input device matching '{spec}'")
+    return hits[0][0]
+
 def main():
     ap = argparse.ArgumentParser(description="Transcribe + polish (local, no network)")
     ap.add_argument("wav", nargs="?", help="wav file (16kHz mono). If omitted, records from mic.")
     ap.add_argument("--no-polish", action="store_true")
     ap.add_argument("--language", default="zh", help="zh / en / auto (empty for auto-detect)")
     ap.add_argument("--record-seconds", type=float, default=5)
+    ap.add_argument("--device", default=None, help="input device: index or name substring (default: system default). Not hardcoded — M4/M2 devices differ.")
+    ap.add_argument("--list-devices", action="store_true", help="list audio input devices and exit")
     ap.add_argument("--copy", action="store_true", help="copy result to clipboard via pbcopy")
     ap.add_argument("--paste", action="store_true", help="paste via clipboard+ AppleScript Cmd+V")
     args = ap.parse_args()
+
+    if args.list_devices:
+        import sounddevice as sd
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) > 0:
+                print(f"{i}\t{d['name']}\t({d['max_input_channels']} in)")
+        return
 
     if args.wav:
         import mlx_whisper
@@ -121,7 +145,10 @@ def main():
     sr = SAMPLE_RATE
     secs = args.record_seconds
     print(f"[rec] recording {secs}s @ {sr}Hz ... speak now", file=sys.stderr)
-    audio = sd.rec(int(secs * sr), samplerate=sr, channels=1, dtype="float32")
+    dev = resolve_input_device(args.device)
+    if dev is not None:
+        print(f"[rec] using device {dev}: {sd.query_devices(dev)['name']}", file=sys.stderr)
+    audio = sd.rec(int(secs * sr), samplerate=sr, channels=1, dtype="float32", device=dev)
     sd.wait()
     audio = audio.flatten()
     print(f"[rec] captured {len(audio)} samples, rms {rms_db(audio):.1f} dB", file=sys.stderr)
