@@ -1,0 +1,6 @@
+mlx-whisper
+mlx-lm
+sounddevice
+huggingface_hub
+numpy
+opencc-python-reimplemented
