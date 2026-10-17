@@ -56,7 +56,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
-    <key>LSUIElement</key><true/>
+    <key>LSUIElement</key><false/>
     <key>NSMicrophoneUsageDescription</key><string>語音輸入需要麥克風權限以錄音並轉寫。</string>
     <key>NSAppleEventsUsageDescription</key><string>需要送出 Cmd+V 以將轉寫結果貼到目前游標位置。</string>
 </dict>
