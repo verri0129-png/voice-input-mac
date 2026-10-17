@@ -83,7 +83,7 @@ def polish_text(text: str) -> str:
     try:
         from opencc import OpenCC  # s2t
         if any("\u4e00" <= c <= "\u9fff" for c in polished):
-            polished = OpenCC("s2t.json").convert(polished)
+            polished = OpenCC("s2t").convert(polished)
     except Exception:
         pass
     return polished
