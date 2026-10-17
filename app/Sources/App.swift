@@ -43,9 +43,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.title = "🎙️"
-        statusItem.button?.toolTip = "Voice Input — ⌘\\ 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
+        statusItem.button?.toolTip = "Voice Input — ⌘E 開始/結束錄音，文字插入當下游標處 — Dock 可見，選單有 開啟/重新啟動/結束"
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "⌘\\：開始/結束錄音", action: #selector(toggleRec), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "⌘E：開始/結束錄音", action: #selector(toggleRec), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "狀態：待命 🎙️", action: nil, keyEquivalent: ""))
         let pending = NSMenuItem(title: "貼上上次保留的結果（疑似非語音時）", action: #selector(pastePending), keyEquivalent: "")
         pending.isEnabled = false
@@ -72,6 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Transcriber.log("[app] launched. bundle=\(Bundle.main.bundlePath) python=\(Transcriber.pythonBin) script=\(Transcriber.scriptPath) log=\(Transcriber.logPath)")
     }
 
+    // 熱鍵：⌘E（使用者指定）。按一下開始錄音，再按一下結束並把文字插入「當下游標所在的位置」。
+    // Carbon 熱鍵無法分辨左右 Cmd，所以左右都算（使用者要的就是 ⌘E）。
+    private let hotKeyCode: UInt16 = UInt16(kVK_ANSI_E)
+    private let hotKeyLabel = "⌘E"
+
     // MARK: - 系統層快捷鍵（Carbon ⌘\，不需任何 TCC 權限）
 
     private func setupCarbonHotKey() {
@@ -87,8 +92,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var handlerRef: EventHandlerRef?
         let hs = InstallEventHandler(GetApplicationEventTarget(), handler, specs.count, &specs, nil, &handlerRef)
         let id = EventHotKeyID(signature: OSType(0x56494E50) /* 'VINP' */, id: 1)
-        let rs = RegisterEventHotKey(UInt32(kVK_ANSI_Backslash), UInt32(cmdKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
-        Transcriber.log("[hotkey] Carbon ⌘\\ InstallEventHandler=\(hs) RegisterEventHotKey=\(rs) ok=\(hotKeyRef != nil)")
+        let rs = RegisterEventHotKey(UInt32(hotKeyCode), UInt32(cmdKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        Transcriber.log("[hotkey] Carbon ⌘E InstallEventHandler=\(hs) RegisterEventHotKey=\(rs) ok=\(hotKeyRef != nil)")
     }
 
     func carbonHotKey(kind: UInt32) {
@@ -96,7 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case UInt32(kEventHotKeyPressed):
             guard !hotKeyHeld else { return }   // 按住會連續送 pressed，只認第一次
             hotKeyHeld = true
-            Transcriber.log("[hotkey] Carbon ⌘\\ 按下")
+            Transcriber.log("[hotkey] Carbon ⌘E 按下")
             trigger(source: "carbon")
         case UInt32(kEventHotKeyReleased):
             hotKeyHeld = false
@@ -131,22 +136,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleKey(_ e: NSEvent, source: String) {
-        // 反斜線 \ keyCode = 42, 需 Cmd 按住
-        // 診斷用：只要看到 \\ 鍵（不管修飾鍵）就記一筆，這樣「收不到」和「收到但被規則擋掉」
+        // E 鍵 keyCode = 14（kVK_ANSI_E），需 Cmd 按住
+        // 診斷用：只要看到 E 鍵（不管修飾鍵）就記一筆，這樣「收不到」和「收到但被規則擋掉」
         // 才分得出來（先前只有通過檢查才寫 log，收不到時完全沒痕跡）。
-        if e.keyCode == 42 {
-            Transcriber.log("[key] 看到 \\ 鍵 flags=\(e.modifierFlags.rawValue) repeat=\(e.isARepeat) source=\(source)")
+        if e.keyCode == hotKeyCode {
+            Transcriber.log("[key] 看到 E 鍵 flags=\(e.modifierFlags.rawValue) repeat=\(e.isARepeat) source=\(source)")
         }
-        guard e.keyCode == 42, e.modifierFlags.contains(.command) else { return }
-        // 之前是 `if leftCmdDown || true`（永遠成立），所以任何 app 的 ⌘\\（例如 Finder 的退出光碟）
-        // 都會開始錄音 —— 使用者回報「有時候會自己啟動」。改成嚴格只認左 Cmd。
-        guard leftCmdDown || !sawCmdFlags else {
-            Transcriber.log("[key] 忽略 ⌘\\（source=\(source)）：不是左 Cmd（leftCmdDown=false）")
-            return
-        }
-        if !leftCmdDown && !sawCmdFlags {
-            Transcriber.log("[key] 降級模式：收不到 Cmd flagsChanged，放行 ⌘\\（source=\(source)）")
-        }
+        guard e.keyCode == hotKeyCode, e.modifierFlags.contains(.command) else { return }
+        // 左右 Cmd 都接受（使用者要的就是 ⌘E；Carbon 熱鍵本來也分辨不出左右）
         guard !e.isARepeat else { return }
         trigger(source: source)
     }
@@ -196,7 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.statusItem.button?.toolTip = "疑似非語音，未自動貼上。文字已保留：\(text.prefix(40))（選單可手動貼）"
                         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                             self.statusItem.button?.title = "🎙️"
-                            self.statusItem.button?.toolTip = "Voice Input — ⌘\\ 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
+                            self.statusItem.button?.toolTip = "Voice Input — ⌘E 開始/結束錄音，文字插入當下游標處 — Dock 可見，選單有 開啟/重新啟動/結束"
                         }
                         return
                     }
@@ -216,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.statusItem.button?.toolTip = "沒有可用語音（沒收到聲音或判為幻覺）— 詳見 ~/orca/voice-input-mac/.run.log"
                         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                             self.statusItem.button?.title = "🎙️"
-                            self.statusItem.button?.toolTip = "Voice Input — ⌘\\ 開始/結束錄音並貼上 — Dock 可見，選單有 開啟/重新啟動/結束"
+                            self.statusItem.button?.toolTip = "Voice Input — ⌘E 開始/結束錄音，文字插入當下游標處 — Dock 可見，選單有 開啟/重新啟動/結束"
                         }
                         return
                     }

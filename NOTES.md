@@ -108,3 +108,14 @@ openai.sky / qwenlm.opencomputeruse）… 不需要知道是誰吃掉的，繞�
 - 換行一律換成空格：TUI 會把 `\n` 當成「送出訊息」，逐字稿不該觸發送出。
 - 剪貼簿仍然照放一份，手動 ⌘V 隨時可用；⌘V 的兩條路（AppleScript / CGEvent）降為保底。
 - 這條路需要**輔助使用**權限（跟全域快捷鍵同一筆），所以那筆授權仍然是關鍵。
+
+## 2026-10-17 熱鍵規格定案：⌘E（使用者指定）
+
+- 使用者要的是：**按 ⌘E 開始錄音、再按 ⌘E 結束並把文字放進「當下游標所在的位置」**，
+  且不限於 Orca。⌘\ 是先前另一條要求（找一個沒被佔用的鍵）下的產物，已改回 ⌘E。
+- 熱鍵碼集中在 `AppDelegate.hotKeyCode`（`kVK_ANSI_E` = 14）＋ `hotKeyLabel`，Carbon／NSEvent
+  兩條路徑共用；左右 Cmd 都接受（Carbon 熱鍵本來就分不出左右）。
+- 「文字進當下游標處」＝ CGEvent unicode 注入到**最前面的 app**（誰有鍵盤焦點就進誰），
+  與 app 種類無關；剪貼簿另外留一份。
+- 驗證：`[hotkey] Carbon ⌘E InstallEventHandler=0 RegisterEventHotKey=0 ok=true`。
+  Carbon 熱鍵**無法用合成按鍵驗證**（合成事件不觸發 Carbon hot key），只能真人按。
