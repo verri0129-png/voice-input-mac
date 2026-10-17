@@ -8,6 +8,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recorder = Recorder()
     // 錄音中的畫面音波指示圖（不搶焦點，讓使用者知道現在在錄音）
     private let indicator = RecordingIndicator()
+    // 錄音中的即時預覽：每 ~1.2s 把「目前為止」的音訊丟給暖機程序跑一次 Whisper（不潤飾），
+    // 顯示在指示圖上方。純提示，「停止後插入的最終文字」仍走原本的完整管線。
+    private var previewTimer: DispatchSourceTimer?
+    private var previewPath: URL?
+    private var previewBusy = false
+    private var previewReadySkipLogged = false
     private var isRecording = false
     private var leftCmdDown = false
     private var lastToggle: TimeInterval = 0
@@ -164,13 +170,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Transcriber.startWarmServer()
         recorder.start()
         indicator.show()          // 畫面上的音波指示圖（不搶焦點）
+        startPreviewLoop()        // 即時預覽（暖機完成後才真的開始送）
         Transcriber.log("[app] recording start")
     }
 
     @objc func stopAndTranscribe() {
         guard isRecording else { return }
         isRecording = false
-        indicator.hide()          // 停止錄音就收掉音波圖
+        stopPreviewLoop()
+        indicator.hide()          // 停止錄音就收掉音波圖（含即時預覽）
         let tStop = Date()
         statusItem.button?.title = "⏳"
         guard let url = recorder.stop() else {
@@ -231,6 +239,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    // MARK: - 錄音中的即時預覽（partial）
+
+    private func startPreviewLoop() {
+        previewPath = FileManager.default.temporaryDirectory.appendingPathComponent("voice-preview.wav")
+        previewBusy = false
+        previewReadySkipLogged = false
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        t.schedule(deadline: .now() + 1.0, repeating: 1.2)
+        t.setEventHandler { [weak self] in self?.previewTick() }
+        t.resume()
+        previewTimer = t
+        Transcriber.log("[preview] 即時預覽迴圈啟動（每 1.2s 一次）")
+    }
+
+    private func stopPreviewLoop() {
+        guard previewTimer != nil else { return }
+        previewTimer?.cancel()
+        previewTimer = nil
+        Transcriber.log("[preview] 即時預覽迴圈停止")
+    }
+
+    /// 計時器在背景執行緒；狀態（isRecording／previewBusy）只在主執行緒讀寫。
+    private func previewTick() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording, !self.previewBusy else { return }
+            self.previewBusy = true
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                self.runPreview()
+                DispatchQueue.main.async { self.previewBusy = false }
+            }
+        }
+    }
+
+    /// 把「目前為止」的音訊寫成 wav，丟給暖機程序做一次 Whisper（partial = 不潤飾、不做貼上判斷）。
+    private func runPreview() {
+        guard let url = previewPath else { return }
+        // 暖機完成前不要送：那個請求會卡在「模型還在載」的管子裡，正式結果得排在它後面等
+        guard Transcriber.warmReady else {
+            if !previewReadySkipLogged {
+                previewReadySkipLogged = true
+                Transcriber.log("[preview] 暖機還沒完成，先不送預覽（模型載完才開始預覽）")
+            }
+            return
+        }
+        guard recorder.writePartialWav(to: url) else { return }
+        let t0 = Date()
+        guard let text = Transcriber.partialText(wavURL: url) else { return }
+        Transcriber.log("[preview] \(String(format: "%.2f", Date().timeIntervalSince(t0)))s → \(text)")
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording else { return }
+            self.indicator.setPreview(text)
         }
     }
 

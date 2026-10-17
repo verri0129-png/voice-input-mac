@@ -1,5 +1,5 @@
 """Pipe: record or file -> mlx-whisper -> qwen polish -> clipboard or stdout."""
-import argparse, subprocess, sys, tempfile, os, time, re
+import argparse, subprocess, sys, tempfile, os, time, re, unicodedata
 from pathlib import Path
 
 # Ensure Homebrew ffmpeg is found under non-interactive ssh (PATH is /usr/bin:/bin only)
@@ -36,6 +36,13 @@ def _setting(name, default):
     return os.environ.get(name) or _LOCAL.get(name) or default
 
 STT_REPO = _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
+# Whisper 的 initial_prompt：實測能修掉同音字誤判（「逗號」被聽成「痘号」），
+# 而且因為寫了「台灣中文」，輸出傾向繁體（OpenCC 那道仍然保留當保險）。
+STT_INITIAL_PROMPT = _setting(
+    "VOICE_STT_INITIAL_PROMPT",
+    "以下是台灣中文的語音轉文字。標點符號：逗號、句號、問號、驚嘆號、頓號、引號、分號。"
+    "常見詞：錄音、音波震動、語音轉文字、麥克風、快捷鍵、標點、潤飾。",
+)
 POLISH_REPO = _setting("VOICE_POLISH_REPO", "mlx-community/Qwen2.5-7B-Instruct-4bit")
 DEFAULT_INPUT_DEVICE = _setting("VOICE_INPUT_DEVICE", None)
 SAMPLE_RATE = 16000
@@ -243,6 +250,7 @@ def transcribe_audio(audio, language="zh"):
         path_or_hf_repo=STT_REPO,
         language=language if language else None,
         verbose=False,
+        initial_prompt=STT_INITIAL_PROMPT,
     )
     text = (result.get("text") or "").strip()
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
@@ -301,8 +309,17 @@ def normalize_punct_only(s: str) -> str:
     return "".join(out)
 
 def _puncts_only(s: str) -> str:
-    """只留標點（去掉文字與空白）。"""
-    return "".join(ch for ch in s if not ch.isalnum() and not ch.isspace())
+    """只留真正的標點（Unicode 類別 P）。
+
+    不能寫成「非文字就當標點」：模型偶爾會吐壞字元（實測輸出夾帶 U+FFFD，
+    結果「log發現」變成「log�發現」）。類別 P 只含標點，壞字元（So/Cf/Cc）自然被排除。
+    """
+    return "".join(ch for ch in s if unicodedata.category(ch).startswith("P"))
+
+def _strip_invisible(s: str) -> str:
+    """丟掉控制字元與替換字元（保留換行）。避免看不見的垃圾被貼到游標處。"""
+    return "".join(ch for ch in s
+                   if ch == "\n" or (not unicodedata.category(ch).startswith("C") and ch != "\ufffd"))
 
 def transfer_punctuation(raw: str, polished: str) -> str:
     """把潤飾結果的標點搬到原文上：原文的字一個都不動，只採用模型多插的標點。
@@ -353,28 +370,70 @@ def insert_clause_commas(s: str) -> str:
             i = out.find(m, j + 1)
     return out
 
+_TERMINAL_PUNCT = "。？！"
+_CLAUSE_PUNCT = "，、：；"
+_ALL_PUNCT = _TERMINAL_PUNCT + _CLAUSE_PUNCT + "「」『』（）【】…—～"
+
+def sanitize_punctuation(s: str) -> str:
+    """把疊在一起的標點收乾淨（「吧，？」→「吧？」、「，，」→「，」）。
+
+    模型偶爾會把逗號和問號一起吐出來（實測：「…或是頓號吧，？」），照搬到輸出會看起來像壞掉。
+    只動標點，不碰任何文字。
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch not in _ALL_PUNCT:
+            out.append(ch)
+            i += 1
+            continue
+        j = i
+        while j < n and s[j] in _ALL_PUNCT:
+            j += 1
+        run = s[i:j]
+        # 這一段裡如果有句末標點（。？！），前面吊著的逗號類就是多餘的
+        if any(c in _TERMINAL_PUNCT for c in run):
+            keep = [c for c in run if c not in _CLAUSE_PUNCT]
+        else:
+            keep = list(run)
+        out.append("".join(c for k, c in enumerate(keep) if k == 0 or c != keep[k - 1]))
+        i = j
+    result = "".join(out)
+    # 結尾吊著逗號類很難看（「…是在錄音的，」）→ 收成句號
+    if result and result[-1] in _CLAUSE_PUNCT:
+        result = result[:-1] + "。"
+    return result
+
 def finalize_punctuation(s: str) -> str:
-    """整段都沒有逗號又是長句時，才動用連接詞規則補斷句。"""
-    if not s or "，" in s or len(_text_only(s)) < 24:
+    """輸出前最後一道：疊字標點收乾淨；整段沒有逗號又是長句時，才動用連接詞規則補斷句。"""
+    if not s:
         return s
-    patched = insert_clause_commas(s)
-    if patched != s:
+    cleaned = sanitize_punctuation(_strip_invisible(normalize_punct_only(s)))
+    if "，" in cleaned or len(_text_only(cleaned)) < 24:
+        return cleaned
+    patched = insert_clause_commas(cleaned)
+    if patched != cleaned:
         print("[polish] 模型沒斷句（0 個逗號）→ 用連接詞規則補上", file=sys.stderr)
     return patched
 
 POLISH_SYSTEM_PROMPT = (
-    "你是語音轉文字的標點處理器。唯一任務：加上標點符號，並確保是繁體中文。\n"
-    "嚴格禁止（做了就算失敗）：\n"
-    "- 不可增加、刪除、改寫、合併或重排任何字詞。重複的字必須原樣保留：\n"
-    "  「會不會」「看看」「非常非常」「好好」都是原話，不是錯字，不要順稿。\n"
-    "- 不可刪除口語詞（呃、嗯、那個、然後、就是…一律保留）。\n"
-    "- 不可改變句型與語意：疑問句要保持疑問句、句尾用「？」，不可把問句改成直述句。\n"
-    "- 不可翻譯、不可摘要、不可改寫。\n"
-    "可以做的只有兩件事：\n"
-    "1. 依語氣插入全形標點（，。？！、：；「」）。標點要符合原句語氣，沒有把握時用「，」或「。」，不要亂加「？」。\n"
-    "   一句話很長時，必須在語氣停頓處插入「，」（例如「…的時候」「…之後」「然後」「但是」「因為」「所以」"
-    "「不過」「如果」「而且」「讓我知道」「是不是」等處），不要把整段擠成一句都不斷句。\n"
-    "2. 簡體字轉繁體中文（台灣用語）。\n"
+    "你是中文標點符號處理器。任務只有一個：把使用者給的文字標上正確的標點符號，"
+    "並確保輸出是繁體中文（台灣用語）。\n"
+    "標點要依說話者的語意決定，該用什麼就用什麼：\n"
+    "- 「，」語氣停頓、子句之間。一句話很長時務必在停頓處斷開，不要整段擠成一句。\n"
+    "- 「。」陳述句結束。\n"
+    "- 「？」疑問句（嗎、呢、吧、是不是、要不要、可不可以、對不對、為什麼、怎麼辦…等疑問語氣）。\n"
+    "- 「！」感嘆、強調、情緒強烈的句子。\n"
+    "- 「、」並列詞語之間；「：」列舉或說明之前；「；」對等的分句之間。\n"
+    "- 「」引述或強調的詞語。\n"
+    "嚴禁（做了就算失敗）：\n"
+    "- 不可以增加、刪除、改寫、合併或重排任何字。重複的字是原話，不是錯字：\n"
+    "  「會不會」「看看」「非常非常」「好好」都要原樣保留。\n"
+    "- 不可以刪掉口語詞（呃、嗯、那個、然後、就是…一律保留）。\n"
+    "- 不可以把問句改成直述句，也不可以把直述句改成問句。\n"
+    "- 不可以翻譯、摘要、順稿。\n"
+    "- 標點不可以疊在一起（不要出現「，？」「，。」「，，」這種）。\n"
     "只輸出處理後的文字，不要解釋、不要加引號。"
 )
 
@@ -452,7 +511,8 @@ def process_wav_file(path, language="zh", polish=True, label=""):
         return {"status": "silence", "text": ""}
     import mlx_whisper
     lang = None if language == "auto" else language
-    result = mlx_whisper.transcribe(path, path_or_hf_repo=STT_REPO, language=lang, verbose=False)
+    result = mlx_whisper.transcribe(path, path_or_hf_repo=STT_REPO, language=lang, verbose=False,
+                                    initial_prompt=STT_INITIAL_PROMPT)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
     raw = (result.get("text") or "").strip()
@@ -472,6 +532,95 @@ def process_wav_file(path, language="zh", polish=True, label=""):
               "）→ 不自動貼上（文字仍在 stdout，可用選單手動貼）", file=sys.stderr)
         return {"status": "suspect", "text": final}
     return {"status": "ok", "text": final}
+
+def partial_text(path, language="zh"):
+    """錄音中「即時預覽」用：Whisper ＋ 繁化，**不潤飾**。
+
+    刻意與 process_wav_file 不同：
+      - 不潤飾：Qwen 一次 0.6s，預覽要跟著講話更新，等不起（而且預覽不是最終文字）
+      - 不做 suspect／fabrication 投票：那是「要不要自動貼」的判斷，與預覽無關
+      - 靜音直接回空字串：不跑 Whisper（每次停頓都燒一次推論沒有意義）
+
+    實測（M4 Max，暖機）：whisper-large-v3-turbo 約 33x 即時速度
+    → 10s 的音訊一次預覽約 0.3s，1.2s 一次完全跟得上。
+    """
+    a = wav_samples(path)
+    if a is None or is_silence(a):
+        return ""
+    lang = None if language == "auto" else language
+    raw = transcribe_audio(a, language=lang)
+    return to_taiwan_traditional(raw) if raw else ""
+
+
+class _RequestReader:
+    """stdin「一行一請求」的讀取器（自己組行，不用 sys.stdin.readline）。
+
+    為什麼不用 sys.stdin.readline：TextIOWrapper 會把管子裡**後面的行**先讀進自己的緩衝區，
+    之後 select() 看到的是空的 fd —— 就沒辦法知道「已經有下一個請求在排隊」，
+    而預覽請求必須能立刻讓位給使用者的停止請求（實測過：第三個測試因此沒讓位）。
+    """
+
+    def __init__(self, fd=0):
+        self.fd = fd
+        self.buf = b""
+        self.pending = []      # 已經讀進來、還沒處理的整行（FIFO）
+        self.eof = False
+
+    def _split_ready(self):
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            s = line.decode("utf-8", "replace").strip()
+            if s:
+                self.pending.append(s)
+
+    def next_request(self, idle_timeout):
+        """回傳 ('line', 請求) 或 ('idle', None) 或 ('eof', None)。"""
+        import os
+        import select
+        while True:
+            self._split_ready()
+            if self.pending:
+                return ("line", self.pending.pop(0))
+            if self.eof:
+                return ("eof", None)
+            try:
+                ready, _, _ = select.select([self.fd], [], [], idle_timeout)
+            except (OSError, ValueError):
+                return ("eof", None)
+            if not ready:
+                return ("idle", None)
+            try:
+                chunk = os.read(self.fd, 1 << 16)
+            except OSError:
+                return ("eof", None)
+            if not chunk:
+                return ("eof", None)
+            self.buf += chunk
+
+    def drain(self):
+        """回傳「已經在排隊、還沒處理」的所有請求，並把它們從佇列移除（不阻塞）。"""
+        import os
+        import select
+        while not self.eof:
+            try:
+                ready, _, _ = select.select([self.fd], [], [], 0)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                break
+            try:
+                chunk = os.read(self.fd, 1 << 16)
+            except OSError:
+                break
+            if not chunk:
+                self.eof = True
+                break
+            self.buf += chunk
+        self._split_ready()
+        out = self.pending
+        self.pending = []
+        return out
+
 
 def serve_forever(language="zh", polish=True):
     """暖機伺服器：模型只載入一次，之後每個請求只做推論。
@@ -497,25 +646,36 @@ def serve_forever(language="zh", polish=True):
     except Exception as e:  # noqa: BLE001
         print(f"[serve] 暖機失敗（不致命：第一次請求會慢一點）: {e!r}", file=sys.stderr)
     idle_timeout = float(os.environ.get("VOICE_SERVE_IDLE_TIMEOUT", "600"))  # 10 分鐘沒用到就退出，別整天佔 6GB
-    import select
+    reader = _RequestReader()
     while True:
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], idle_timeout)
-        except (OSError, ValueError):
-            break
-        if not ready:
+        kind, req = reader.next_request(idle_timeout)
+        if kind == "idle":
             print(f"[serve] 閒置 {int(idle_timeout)}s → 結束（下次開始錄音會重新暖機）", file=sys.stderr)
             break
-        line = sys.stdin.readline()
-        if not line:      # app 結束 → stdin EOF → 不留孤兒程序
+        if kind == "eof":
             break
-        path = line.strip()
-        if not path:
-            continue
-        if path == "__quit__":
+        if req == "__quit__":
             break
+        if req.startswith("partial "):
+            # 錄音中的即時預覽。優先權最低：先看不阻塞地是不是已經有「完整請求」在排隊，
+            # 有就直接放棄這次預覽去處理它 —— 使用者按下停止後不該再等一個過期的預覽跑完。
+            queued = reader.drain()
+            fulls = [q for q in queued if not q.startswith("partial ")]
+            if not fulls:
+                try:
+                    t = partial_text(req[len("partial "):], language=language)
+                except Exception as e:  # noqa: BLE001
+                    t = ""
+                    print(f"[partial] 預覽失敗: {e!r}", file=sys.stderr)
+                print(f"[partial] 目前為止 {len(t)} 字", file=sys.stderr)
+                print(json.dumps({"status": "partial", "text": t}, ensure_ascii=False), flush=True)
+                continue
+            # 排隊中的預覽全部丢掉；完整請求只留最後一個（前面的音訊是它的前綴）
+            req = fulls[-1]
+            print(f"[partial] 偵測到完整請求在排隊 → 丢掉 {len(queued) - len(fulls)} 個過期預覽、"
+                  f"跳過 {len(fulls) - 1} 個過期完整請求，直接處理最後一個", file=sys.stderr)
         try:
-            r = process_wav_file(path, language=language, polish=polish, label="[serve]")
+            r = process_wav_file(req, language=language, polish=polish, label="[serve]")
         except Exception as e:  # noqa: BLE001
             r = {"status": "error", "text": "", "detail": repr(e)}
             print(f"[serve] 處理失敗: {e!r}", file=sys.stderr)

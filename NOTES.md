@@ -201,3 +201,48 @@ log 出現 `[rec] …（畫面音波圖峰值 0.29）`；停止後指示圖消�
 另外查到：同機還有一條雲端線 `~/orca/meeting-translate`（OpenAI Realtime ASR ＋ `/polish`，
 `zh_tw_normalization.json` 10,607 條）；superwhisper／Wispr Flow／MacWhisper／VoiceInk／WhisperKit
 在這台機器上**完全沒有痕跡**（grep／brew／pipx／~/Library 全 0 命中）。
+
+## 2026-10-18 錄音中的即時部分轉錄（partial 預覽）
+
+機制：錄音中每 1.2s 把「目前為止」的音訊寫成 `voice-preview.wav`，送到**同一個**暖機程序
+（協定多一種請求：`partial <path>`），只跑 Whisper ＋ OpenCC 繁化（**刻意不潤飾**：Qwen 一次
+0.6s 追不上講話速度，而且預覽不是最終文字），結果顯示在音波膠囊上方的面板
+（`RecordingIndicator.setPreview()`）。停止後插入的最終文字完全不變（仍走 whisper ＋ 繁化 ＋
+逐字保真潤飾 ＋ CGEvent 注入）——預覽只是提示，不影響契約。
+
+實測（M4 Max）：預覽 0.24s/次（5.6s 音檔、暖機後；冷啟含載模型 7.3s）；13 秒錄音跑 11 次
+預覽（≒1.2s 一次）；stub 端到端 11:11 對帳；注入位置以 TextEdit 文件內容（不是 log 自述）驗證。
+
+踩到的坑（都已修，別再犯）：
+
+1. **`sys.stdin.readline()` 會讓 `select()` 看不到排隊的請求**：TextIOWrapper 會把管子裡後面的
+   行先讀進自己的緩衝區，於是「預覽讓位給停止請求」的判斷永遠看不到那行（實測第三個測試因此
+   沒讓位）。改成自己用 `os.read` 組行（`_RequestReader`），drain 才看得到。
+2. **`.run.log` 有兩個寫者就會掉行**：主執行緒事件與抽乾 serve stderr 的背景執行緒各自
+   `seekToEndOfFile` ＋ write → 撞在一起整行消失（實測 Python 印了 2 次 `[partial]`、Swift 只有
+   1 行 `[preview]`）。已加 `Transcriber.logLock`。log 是唯一證據通道，掉了就等於沒發生。
+3. **NSTextField 標籤高度算錯＝第二行整行消失**：15pt 一行約 18px，兩行要 36px；只給 34px 時
+   畫面看起來像「文字被截斷」（其實是根本沒畫出來）。現在面板 78px、標籤 48px。
+4. **暖機完成前不要送預覽**：那個請求會卡在「模型還在載」的管子裡，使用者講 3 秒就按停止時，
+   正式結果得排在它後面等模型載完（~7s）。已加 `Transcriber.warmReady`（以 serve stderr 的
+   「暖機完成」為訊號）。
+5. **暖機程序同時間只准一個請求在飛**（`Transcriber.requestLock`）：預覽與正式結果共用同一條
+   stdin/stdout，兩個讀者並行會把「誰的回應」讀錯（等於拿到別人的文字）。
+
+已知取捨：
+
+- 第一次錄音（暖機中，約 7s）不會有預覽，暖機完成後才開始。要「第一次就有預覽」得讓暖機程序
+  常駐（現在閒置 600s 退出，不整天佔 6.1GB）——這是記憶體 vs 體驗的選擇，要改再改。
+- 長錄音（>30s）每次預覽要重解整段音訊 → 更新變慢（60s 音檔約 2s 一次），且停止後可能多等
+  一次預覽的時間（≤2s）。短句聽寫不受影響。
+
+驗證方式（重跑用）：
+
+```bash
+# Python 協定（決定性、不用麥克風）：預覽 0.24s、排隊的完整請求會讓預覽直接讓位
+cd ~/orca/voice-input-mac && .venv/bin/python /tmp/serve_partial_test.py
+# app 管線（stub 不依賴麥克風音量）：
+launchctl setenv VOICE_INPUT_TRANSCRIBE_PY /tmp/stub_preview.py && open -a /Applications/VoiceInputMac.app
+# 用選單觸發開始/停止（合成事件不會觸發 Carbon 熱鍵）
+osascript -e 'tell application "System Events" to tell process "VoiceInputMac" to click menu item 1 of menu 1 of menu bar item 1 of menu bar 2'
+```

@@ -5,6 +5,8 @@ import Foundation
 final class Recorder: NSObject {
     private var engine: AVAudioEngine?
     private var samples: [Float] = []
+    /// 音訊執行緒 append、主執行緒／預覽執行緒讀 → 一律走這把鎖
+    private let sampleLock = NSLock()
     private let sampleRate: Double = 16000
     /// 錄音中的即時音量 0…1（在主執行緒回呼），給畫面錄音指示圖用。
     var onLevel: ((Float) -> Void)?
@@ -12,7 +14,7 @@ final class Recorder: NSObject {
     private var loggedLevel = false
 
     func start() {
-        samples = []
+        sampleLock.lock(); samples = []; sampleLock.unlock()
         maxLevel = 0
         loggedLevel = false
         let engine = AVAudioEngine()
@@ -87,13 +89,17 @@ final class Recorder: NSObject {
                 DispatchQueue.main.async { onLevel(norm) }
             }
             if chCount == 1 {
+                self.sampleLock.lock()
                 self.samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: n))
+                self.sampleLock.unlock()
             } else {
+                self.sampleLock.lock()
                 for i in 0..<n {
                     var sum: Float = 0
                     for c in 0..<chCount { sum += ch[c][i] }
                     self.samples.append(sum / Float(chCount))
                 }
+                self.sampleLock.unlock()
             }
         }
         engine.prepare()
@@ -104,20 +110,36 @@ final class Recorder: NSObject {
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
-        guard !samples.isEmpty else {
+        let snapshot = snapshotSamples()
+        guard !snapshot.isEmpty else {
             Transcriber.log("[rec] 沒有取到任何樣本（麥克風權限被拒，或輸入裝置沒送訊號）")
             return nil
         }
-        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        let peak = snapshot.reduce(Float(0)) { max($0, abs($1)) }
         let peakDb = 20 * log10(Double(peak) + 1e-9)
-        Transcriber.log("[rec] \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / sampleRate))s) peak \(String(format: "%.1f", peakDb)) dB（畫面音波圖峰值 \(String(format: "%.2f", maxLevel))）")
+        Transcriber.log("[rec] \(snapshot.count) samples (\(String(format: "%.1f", Double(snapshot.count) / sampleRate))s) peak \(String(format: "%.1f", peakDb)) dB（畫面音波圖峰值 \(String(format: "%.2f", maxLevel))）")
         if peakDb < -60 {
             Transcriber.log("[rec] 警告：整段幾乎是靜音 —— whisper 只會產生幻覺文字")
         }
         // Write WAV 16k mono float32 -> int16
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("voice-\(Int(Date().timeIntervalSince1970)).wav")
-        writeWAV(samples: samples, sampleRate: Int(sampleRate), url: url)
+        writeWAV(samples: snapshot, sampleRate: Int(sampleRate), url: url)
         return url
+    }
+
+    /// 目前為止的音訊快照（錄音中即時預覽用；音訊執行緒同時在 append，所以一定要走鎖）。
+    func snapshotSamples() -> [Float] {
+        sampleLock.lock(); defer { sampleLock.unlock() }
+        return samples
+    }
+
+    /// 把「目前為止」的音訊寫成獨立的 wav 檔給預覽用（不動正式結果用的緩衝）。
+    /// 太短（<0.5s）回 false：這種長度 Whisper 只會吐幻覺，預覽也沒有意義。
+    func writePartialWav(to url: URL) -> Bool {
+        let snapshot = snapshotSamples()
+        guard Double(snapshot.count) / sampleRate >= 0.5 else { return false }
+        writeWAV(samples: snapshot, sampleRate: Int(sampleRate), url: url)
+        return true
     }
 
     private func inputDeviceName() -> String {

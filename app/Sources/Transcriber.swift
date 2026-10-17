@@ -20,9 +20,17 @@ enum Transcriber {
     }
 
     // app 用 `open`/launchd 啟動時 stdout 沒人接，診斷一律寫檔
+    //
+    // 這個 log 是唯一的證據通道，所以寫入要互斥：有兩個寫者（主執行緒的事件，
+    // 以及抽乾 serve stderr 的背景執行緒）。兩邊各自 seekToEndOfFile 再寫 → 撞在一起
+    // 會整行消失（實測：preview 有回應、Python 也印了 [partial]，但 Swift 那行不見了）。
+    private static let logLock = NSLock()
+
     static func log(_ message: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
         let line = "[\(ts)] \(message)\n"
+        logLock.lock()
+        defer { logLock.unlock() }
         let fm = FileManager.default
         if !fm.fileExists(atPath: logPath) { fm.createFile(atPath: logPath, contents: nil) }
         guard let h = FileHandle(forWritingAtPath: logPath) else { return }
@@ -93,6 +101,23 @@ enum Transcriber {
     private static var _server: Process?
     private static var _serverIn: FileHandle?
     private static var _serverOut: FileHandle?
+    /// 暖機程序同時間只准有一個請求在飛：預覽與正式結果共用同一條 stdin/stdout，
+    /// 兩個讀者同時讀會把「誰的回應」讀錯（等於拿到別人的文字）。這把鎖讓請求排隊。
+    private static let requestLock = NSLock()
+    /// 暖機完成了沒（模型載入完才准送預覽請求）。
+    /// 沒這個開關的話：錄音一開始就送預覽 → 那個請求卡在「模型還在載」的管子裡，
+    /// 使用者講 3 秒就按停止時，正式結果得排在它後面等 6 秒載完模型（實測就是這個病）。
+    private static let readyLock = NSLock()
+    private static var _warmReady = false
+
+    static var warmReady: Bool {
+        readyLock.lock(); defer { readyLock.unlock() }
+        return _warmReady
+    }
+
+    private static func setWarmReady(_ v: Bool) {
+        readyLock.lock(); _warmReady = v; readyLock.unlock()
+    }
 
     private static func serverHandles() -> (Process, FileHandle, FileHandle)? {
         serverLock.lock(); defer { serverLock.unlock() }
@@ -108,6 +133,7 @@ enum Transcriber {
     static func startWarmServer() {
         serverQueue.async {
             if let (p, _, _) = serverHandles() { Transcriber.log("[serve] 已有暖機程序 pid=\(p.processIdentifier)，不重啟"); return }
+            setWarmReady(false)
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: pythonBin)
             proc.arguments = [scriptPath, "--serve"]
@@ -125,6 +151,8 @@ enum Transcriber {
                 guard !d.isEmpty else { h.readabilityHandler = nil; return }
                 let s = (String(data: d, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !s.isEmpty { Transcriber.log("  serve: \(s.suffix(300))") }
+                // 暖機完成才准送預覽（見 warmReady 的說明）
+                if s.contains("暖機完成") || s.contains("暖機失敗") { Transcriber.setWarmReady(true) }
             }
             setServer(proc, inPipe.fileHandleForWriting, outPipe.fileHandleForReading)
             Transcriber.log("[serve] 暖機程序啟動 pid=\(proc.processIdentifier)")
@@ -156,10 +184,14 @@ enum Transcriber {
         }
     }
 
-    private static func serverRequest(wavPath: String, timeout: TimeInterval) -> String? {
+    /// 送一個請求並等一行回應。**同時只准一個在飛**（requestLock）：預覽與正式結果共用同一條
+    /// stdin/stdout，兩個讀者並行會把回應讀錯（等於拿到別人的文字）。
+    private static func serverRequest(_ request: String, timeout: TimeInterval) -> String? {
         guard let (_, stdin, stdout) = serverHandles() else { return nil }
+        requestLock.lock()
+        defer { requestLock.unlock() }
         do {
-            try stdin.write(contentsOf: Data((wavPath + "\n").utf8))
+            try stdin.write(contentsOf: Data((request + "\n").utf8))
         } catch {
             Transcriber.log("[serve] 寫入請求失敗: \(error.localizedDescription)")
             killServer(reason: "寫入失敗")
@@ -182,7 +214,7 @@ enum Transcriber {
     /// 暖機路徑。回傳 nil = 這條路不能走（呼叫端退回一次性）。
     /// 沒有可用語音一樣用 throw code 3 表示（與一次性路徑的 exit 3 同語意）。
     private static func transcribeWarm(wavURL: URL) throws -> (text: String, suspect: Bool)? {
-        guard let raw = serverRequest(wavPath: wavURL.path, timeout: 30) else { return nil }
+        guard let raw = serverRequest(wavURL.path, timeout: 30) else { return nil }
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             Transcriber.log("[serve] 回應不是 JSON，退回一次性路徑：\(raw.prefix(120))")
@@ -206,6 +238,20 @@ enum Transcriber {
             return r
         }
         return try transcribeOneShot(wavURL: wavURL)
+    }
+
+    /// 錄音中的即時預覽（partial 請求）。只走暖機路徑：沒有暖機程序就沒有預覽 ——
+    /// 預覽不值得為它去載 6GB 模型（一次性路徑是給正式結果用的）。
+    /// 回傳 nil = 這次預覽拿不到（逾時、格式不對、或暖機還沒好）。
+    static func partialText(wavURL: URL) -> String? {
+        guard let raw = serverRequest("partial " + wavURL.path, timeout: 20) else { return nil }
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (obj["status"] as? String) == "partial" else {
+            Transcriber.log("[preview] 回應不是預覽結果，略過：\(raw.prefix(120))")
+            return nil
+        }
+        return (obj["text"] as? String) ?? ""
     }
 
     /// 啟動時檢查貼上要用的「自動化」權限。
