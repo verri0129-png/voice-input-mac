@@ -300,6 +300,68 @@ def normalize_punct_only(s: str) -> str:
         out.append(ch)
     return "".join(out)
 
+def _puncts_only(s: str) -> str:
+    """只留標點（去掉文字與空白）。"""
+    return "".join(ch for ch in s if not ch.isalnum() and not ch.isspace())
+
+def transfer_punctuation(raw: str, polished: str) -> str:
+    """把潤飾結果的標點搬到原文上：原文的字一個都不動，只採用模型多插的標點。
+
+    這是對付「模型手癢改字」的根本解：Qwen 會想把句尾「…是在錄音的」修成「…是在錄音？」，
+    整句就因為這一字之差被逐字驗證擋掉、連逗號都沒了（實測 71→70 字）。
+    逐字對齊後只搬標點，就能同時拿到「它標的逗號」與「你的原話」。
+    """
+    import difflib
+    sm = difflib.SequenceMatcher(None, raw, polished, autojunk=False)
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.append(raw[i1:i2])
+            continue
+        # delete / replace：字一律保留原文，只把模型那側的標點撿過來
+        out.append(raw[i1:i2])
+        if tag == "replace":
+            out.append(_puncts_only(polished[j1:j2]))
+        elif tag == "insert":
+            out.append(_puncts_only(polished[j1:j2]))
+    return "".join(out)
+
+_CLAUSE_PREFIX = ("然後", "但是", "不過", "因為", "所以", "如果", "而且", "可是", "接下來", "另外", "還有")
+_CLAUSE_SUFFIX = ("的時候", "的話", "之後")
+
+def insert_clause_commas(s: str) -> str:
+    """LLM 不肯斷句時的確定性補救：只在常見語氣停頓的連接詞處插「，」。
+
+    只插入標點、不碰任何字，所以不可能改到原話；位置就算不理想，也只是讀起來怪，
+    不會改變語意（實測 Qwen 7B 對 70 字的長句只擠得出一個句尾問號）。
+    """
+    out = s
+    for m in _CLAUSE_PREFIX:
+        i = out.find(m)
+        while i > 0:
+            prev = out[i - 1]
+            if prev not in "，。？！、：；「」（）：…" and (prev.isalnum() or _is_cjk(prev)):
+                out = out[:i] + "，" + out[i:]
+                i += 1
+            i = out.find(m, i + len(m) + 1)
+    for m in _CLAUSE_SUFFIX:
+        i = out.find(m)
+        while i >= 0:
+            j = i + len(m)
+            if j < len(out) and out[j] not in "，。？！、：；「」（）：…":
+                out = out[:j] + "，" + out[j:]
+            i = out.find(m, j + 1)
+    return out
+
+def finalize_punctuation(s: str) -> str:
+    """整段都沒有逗號又是長句時，才動用連接詞規則補斷句。"""
+    if not s or "，" in s or len(_text_only(s)) < 24:
+        return s
+    patched = insert_clause_commas(s)
+    if patched != s:
+        print("[polish] 模型沒斷句（0 個逗號）→ 用連接詞規則補上", file=sys.stderr)
+    return patched
+
 POLISH_SYSTEM_PROMPT = (
     "你是語音轉文字的標點處理器。唯一任務：加上標點符號，並確保是繁體中文。\n"
     "嚴格禁止（做了就算失敗）：\n"
@@ -310,6 +372,8 @@ POLISH_SYSTEM_PROMPT = (
     "- 不可翻譯、不可摘要、不可改寫。\n"
     "可以做的只有兩件事：\n"
     "1. 依語氣插入全形標點（，。？！、：；「」）。標點要符合原句語氣，沒有把握時用「，」或「。」，不要亂加「？」。\n"
+    "   一句話很長時，必須在語氣停頓處插入「，」（例如「…的時候」「…之後」「然後」「但是」「因為」「所以」"
+    "「不過」「如果」「而且」「讓我知道」「是不是」等處），不要把整段擠成一句都不斷句。\n"
     "2. 簡體字轉繁體中文（台灣用語）。\n"
     "只輸出處理後的文字，不要解釋、不要加引號。"
 )
@@ -339,14 +403,22 @@ def polish_text(text: str) -> str:
         polished = to_taiwan_traditional(polished.strip())
         got = _text_only(polished)
         if polished and got == want:
-            return polished
-        # 動到字＝語意被改掉了（實例：原話「文字現在會不會出現？」被順稿成「文字現在不會出現。」）
-        print(f"[polish] 第 {attempt} 次輸出動到文字（原 {len(want)} 字 → 結果 {len(got)} 字）→ "
+            return finalize_punctuation(polished)
+        # 模型動到字了。它通常只是想「順」掉一個語助詞（實測：句尾「的」被吃掉），
+        # 這種情況不該整句丟掉：把它的標點搬到原文，字一個都不動。
+        if len(got) >= len(want) * 3 // 4:
+            merged = transfer_punctuation(text, polished)
+            if _text_only(to_taiwan_traditional(merged)) == want:
+                print(f"[polish] 第 {attempt} 次輸出動到文字（原 {len(want)} 字 → 結果 {len(got)} 字）"
+                      f"→ 只採用它的標點，字保留原文", file=sys.stderr)
+                print(f"[polish]   模型版本：{polished}", file=sys.stderr)
+                return finalize_punctuation(merged)
+        print(f"[polish] 第 {attempt} 次輸出偏離原文（原 {len(want)} 字 → 結果 {len(got)} 字）→ "
               + ("重試並加強提示" if attempt == 1 else "放棄潤飾，退回原文＋標點正規化"),
               file=sys.stderr)
         if polished:
             print(f"[polish]   模型版本：{polished}", file=sys.stderr)
-    return normalize_punct_only(text)
+    return finalize_punctuation(normalize_punct_only(text))
 
 
 def resolve_input_device(spec):

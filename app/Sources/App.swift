@@ -6,6 +6,8 @@ import Carbon
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var recorder = Recorder()
+    // 錄音中的畫面音波指示圖（不搶焦點，讓使用者知道現在在錄音）
+    private let indicator = RecordingIndicator()
     private var isRecording = false
     private var leftCmdDown = false
     private var lastToggle: TimeInterval = 0
@@ -68,6 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 貼上要用的「自動化」權限也在啟動時先確認（缺的話現在跳對話框，
         // 而不是等按下停止貼上時才靜默失敗 → 使用者只會看到「沒反應」）
         Transcriber.preflightAutomation()
+        // 錄音音量 → 畫面音波指示圖（音波要跟著講話跳動，才知道麥克風有在收）
+        recorder.onLevel = { [weak self] level in self?.indicator.push(level) }
         setupCarbonHotKey()
         Transcriber.log("[app] launched. bundle=\(Bundle.main.bundlePath) python=\(Transcriber.pythonBin) script=\(Transcriber.scriptPath) log=\(Transcriber.logPath)")
     }
@@ -159,12 +163,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 趁使用者講話時先把模型載好（暖機 ~6s），按下停止後只剩推論（~0.9s）
         Transcriber.startWarmServer()
         recorder.start()
+        indicator.show()          // 畫面上的音波指示圖（不搶焦點）
         Transcriber.log("[app] recording start")
     }
 
     @objc func stopAndTranscribe() {
         guard isRecording else { return }
         isRecording = false
+        indicator.hide()          // 停止錄音就收掉音波圖
         let tStop = Date()
         statusItem.button?.title = "⏳"
         guard let url = recorder.stop() else {
