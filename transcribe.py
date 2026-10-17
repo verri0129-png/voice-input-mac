@@ -1,5 +1,5 @@
 """Pipe: record or file -> mlx-whisper -> qwen polish -> clipboard or stdout."""
-import argparse, subprocess, sys, tempfile, os, time
+import argparse, subprocess, sys, tempfile, os, time, re
 from pathlib import Path
 
 # Ensure Homebrew ffmpeg is found under non-interactive ssh (PATH is /usr/bin:/bin only)
@@ -278,6 +278,42 @@ def to_taiwan_traditional(text: str) -> str:
         raise SystemExit(f"[opencc] opencc 不可用（{_OPENCC_ERROR}）——為避免輸出簡體，中止")
     return _OPENCC.convert(text)
 
+def _text_only(s: str) -> str:
+    """只留文字（去掉標點、空白、符號）。用來驗證潤飾「一個字都沒動」。"""
+    return re.sub(r"[\W_]+", "", s, flags=re.UNICODE)
+
+_ASCII_TO_FULLWIDTH = {",": "，", ".": "。", "?": "？", "!": "！", ":": "：", ";": "；"}
+
+def _is_cjk(ch: str) -> bool:
+    return bool(ch) and ("\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff")
+
+def normalize_punct_only(s: str) -> str:
+    """保底路徑：不動任何字，只把緊鄰中文的半形標點換成全形。"""
+    out = []
+    for i, ch in enumerate(s):
+        if ch in _ASCII_TO_FULLWIDTH:
+            prev = out[-1] if out else ""
+            nxt = s[i + 1] if i + 1 < len(s) else ""
+            if _is_cjk(prev) or _is_cjk(nxt):
+                out.append(_ASCII_TO_FULLWIDTH[ch])
+                continue
+        out.append(ch)
+    return "".join(out)
+
+POLISH_SYSTEM_PROMPT = (
+    "你是語音轉文字的標點處理器。唯一任務：加上標點符號，並確保是繁體中文。\n"
+    "嚴格禁止（做了就算失敗）：\n"
+    "- 不可增加、刪除、改寫、合併或重排任何字詞。重複的字必須原樣保留：\n"
+    "  「會不會」「看看」「非常非常」「好好」都是原話，不是錯字，不要順稿。\n"
+    "- 不可刪除口語詞（呃、嗯、那個、然後、就是…一律保留）。\n"
+    "- 不可改變句型與語意：疑問句要保持疑問句、句尾用「？」，不可把問句改成直述句。\n"
+    "- 不可翻譯、不可摘要、不可改寫。\n"
+    "可以做的只有兩件事：\n"
+    "1. 依語氣插入全形標點（，。？！、：；「」）。標點要符合原句語氣，沒有把握時用「，」或「。」，不要亂加「？」。\n"
+    "2. 簡體字轉繁體中文（台灣用語）。\n"
+    "只輸出處理後的文字，不要解釋、不要加引號。"
+)
+
 def polish_text(text: str) -> str:
     if not text or not text.strip():
         return ""
@@ -287,33 +323,31 @@ def polish_text(text: str) -> str:
         print(f"[polish] loading {POLISH_REPO} ...", file=sys.stderr)
         polish_text._model, polish_text._tok = load(POLISH_REPO)
     model, tok = polish_text._model, polish_text._tok
-    system = (
-        "你是語音轉文字的潤飾助手。只做潤飾，不做翻譯。\n"
-        "規則（只輸出最終潤飾結果，不要解釋、不要加引號）：\n"
-        "1. 移除填充詞：呃、嗯、那個、然後、就是、um、uh、like、you know 等\n"
-        "2. 刪除猶豫重複的字詞句\n"
-        "3. 若中途改口，只保留最後意圖\n"
-        "4. 依語意自動分段或條列\n"
-        "5. 口語贅字改為精煉書面用詞\n"
-        "重要：\n"
-        "- 保持原文語言，中文就輸出中文、英文就輸出英文、中英夾雜就保持夾雜，絕對不要翻譯。\n"
-        "- 任何中文必須用繁體中文輸出，嚴禁簡體（盡量 → 儘量、軟件 → 軟體、數據 → 資料、視頻 → 影片、網絡 → 網路、…等一律轉繁體用詞）。"
-    )
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
-    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    out = generate(model, tok, prompt=prompt, max_tokens=512, verbose=False)
-    # mlx_lm.generate(prompt=...) 只回傳「新生成的部分」，不含 prompt，所以正常情況
-    # 不會 startswith(prompt)。只有在它真的把 prompt 一起吐回來時才需要切掉（那才是異常）。
-    if prompt[:40] in out:
-        print(f"[polish] 警告：模型輸出夾帶 prompt（out={len(out)}字）", file=sys.stderr)
-    polished = out[len(prompt):] if out.startswith(prompt) else out
-    polished = polished.strip()
-    if not polished:
-        print(f"[polish] 警告：潤飾結果為空（原文 {len(text)} 字）——不輸出任何東西，不退回原文", file=sys.stderr)
-    # hard fallback: model often still outputs Simplified; s2twp converts phrases (软件/数据/视频/网络 -> 軟體/資料/影片/網路)
-    # s2t only converts characters, leaving 数据 as 數據; s2t.json causes s2t.json.json error
-    polished = to_taiwan_traditional(polished)
-    return polished
+    want = _text_only(to_taiwan_traditional(text))
+    for attempt in (1, 2):
+        user = text if attempt == 1 else (
+            text + "\n\n（注意：上一次的輸出動到了文字。這次務必逐字保留，只加標點。）")
+        messages = [{"role": "system", "content": POLISH_SYSTEM_PROMPT},
+                    {"role": "user", "content": user}]
+        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        out = generate(model, tok, prompt=prompt, max_tokens=512, verbose=False)
+        # mlx_lm.generate(prompt=...) 只回傳新生成的部分；只有它真的把 prompt 一起吐回來才需要切掉
+        if prompt[:40] in out:
+            print(f"[polish] 警告：模型輸出夾帶 prompt（out={len(out)}字）", file=sys.stderr)
+        polished = out[len(prompt):] if out.startswith(prompt) else out
+        # hard fallback: 模型常吐簡體；s2twp 會連用詞一起轉（软件→軟體、数据→資料）
+        polished = to_taiwan_traditional(polished.strip())
+        got = _text_only(polished)
+        if polished and got == want:
+            return polished
+        # 動到字＝語意被改掉了（實例：原話「文字現在會不會出現？」被順稿成「文字現在不會出現。」）
+        print(f"[polish] 第 {attempt} 次輸出動到文字（原 {len(want)} 字 → 結果 {len(got)} 字）→ "
+              + ("重試並加強提示" if attempt == 1 else "放棄潤飾，退回原文＋標點正規化"),
+              file=sys.stderr)
+        if polished:
+            print(f"[polish]   模型版本：{polished}", file=sys.stderr)
+    return normalize_punct_only(text)
+
 
 def resolve_input_device(spec):
     """Map a device spec (index or name substring) to a sounddevice input index.
