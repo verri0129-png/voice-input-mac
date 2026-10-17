@@ -82,6 +82,16 @@ def transcribe_audio(audio, language="zh"):
             return ""
     return text
 
+def to_taiwan_traditional(text: str) -> str:
+    """Unconditional Simplified->Traditional Taiwan (with phrases). No-op if no CJK."""
+    if not text or not any("\u4e00" <= c <= "\u9fff" for c in text):
+        return text
+    try:
+        from opencc import OpenCC
+        return OpenCC("s2twp").convert(text)
+    except Exception:
+        return text
+
 def polish_text(text: str) -> str:
     if not text or not text.strip():
         return ""
@@ -108,15 +118,9 @@ def polish_text(text: str) -> str:
     out = generate(model, tok, prompt=prompt, max_tokens=512, verbose=False)
     polished = out[len(prompt):] if out.startswith(prompt) else out
     polished = polished.strip()
-    # hard fallback: if model still outputs Simplified, convert via OpenCC if available
-    # s2twp = Simplified -> Traditional (Taiwan, with phrases) — converts 软件/数据/视频/网络 -> 軟體/資料/影片/網路
-    # s2t only converts characters, leaving phrases like 数据 as 數據; s2t.json causes s2t.json.json error
-    try:
-        from opencc import OpenCC
-        if any("\u4e00" <= c <= "\u9fff" for c in polished):
-            polished = OpenCC("s2twp").convert(polished)
-    except Exception:
-        pass
+    # hard fallback: model often still outputs Simplified; s2twp converts phrases (软件/数据/视频/网络 -> 軟體/資料/影片/網路)
+    # s2t only converts characters, leaving 数据 as 數據; s2t.json causes s2t.json.json error
+    polished = to_taiwan_traditional(polished)
     return polished
 
 def resolve_input_device(spec):
@@ -163,6 +167,8 @@ def main():
             final = raw
         else:
             final = polish_text(raw) if raw else ""
+        # final hard guarantee: any remaining simplified -> Taiwan traditional (covers --no-polish and polish fallback failures)
+        final = to_taiwan_traditional(final)
         print(final)
         if args.copy or args.paste:
             subprocess.run(["pbcopy"], input=final.encode("utf-8"), check=True)
@@ -189,6 +195,7 @@ def main():
         final = raw
     else:
         final = polish_text(raw) if raw else ""
+    final = to_taiwan_traditional(final)
     print(final)
     if args.copy or args.paste:
         subprocess.run(["pbcopy"], input=final.encode("utf-8"), check=True)
