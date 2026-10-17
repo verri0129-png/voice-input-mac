@@ -188,13 +188,16 @@ log 出現 `[rec] …（畫面音波圖峰值 0.29）`；停止後指示圖消�
 中文潤飾回歸測試素材）。可搬碼的來源首選 MIT 的 `platx-ai/Talk`（同架構、有中文測試素材）；
 `Open-Less/openless`（雲端 ASR＋雲端潤飾、2.0 起 AGPL-3.0）只當功能對照表，不要搬碼進本公開 repo。
 
-**盤點時推翻的兩個舊假設（環境事實，重要）**：
+**盤點後修正的舊假設（環境事實，重要）**：
 
-1. **Orca 內建聽寫現在是開啟的**：`~/Library/Application Support/orca/profiles/local-default/orca-data.json`
-   內 `settings.voice = {enabled: true, sttModel: "zipformer-bilingual-zh-en", dictationMode: "toggle"}`，
-   模型在 `speech-models/`（10-04 與 10-14 落地），`ui.featureInteractions["voice-dictation"].interactionCount = 3`。
-   → 之前以為「使用者自己關掉了」是錯的；它會搶麥克風（`~/orca/state/voice-watch/run1/mic.log`
-   的麥克風 TCC 目標 pid 42151 = `Orca Helper --utility-sub-type=audio.mojom.AudioService`）。
+1. **Orca 內建聽寫是關的**（使用者 2026-10-17 21:49 自行關閉）：**現行設定在
+   `~/Library/Application Support/orca/profiles/local-default/profile-state.db`（SQLite）的
+   `settings` domain**，`voice.enabled = false`（連 `microphoneDeviceLabel: "MixPre-6 II"` 一起）。
+   **不要讀同目錄的 `orca-data.json` 判斷現況**：它是 2026-10-10 遷移前的退役快照
+   （`profile-state.db.authority` 的內容就是 `sqlite`），mtime 停在 10-10，裡面
+   `voice.enabled: true` 是舊值——第一版競合評估就是這樣誤判、被使用者當場糾正。
+   pid 42151 那個 `Orca Helper … audio.mojom.AudioService` 也不能當聽寫證據：它是 Chromium
+   通用音訊服務，App 播任何聲音都會在，與麥克風無關。
 2. **macOS 內建聽寫用過且仍啟用**：`defaults read com.apple.speech.recognition.AppleSpeechRecognition.prefs`
    → `DictationIMLastDictationDate` = 2026-10-11、麥克風 `MixPre-6 II`、語言 zh_TW、自動標點 True。
 

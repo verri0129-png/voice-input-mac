@@ -21,9 +21,8 @@
    自動從你的手動修正學聽錯的詞、per-app 潤飾風格、真正的 VAD、設定介面與自動更新。
 4. **用了會得到什麼**：若你想要的痛點是「講完才發現聽錯」與「不知道到底有沒有在錄」，
    借這幾塊能直接解掉；整包換過去只會多拿到 UI 與更新機制，而我們缺的那幾塊它也是各自實作，
-   不會自動流進來。另外盤點時挖到一件跟你痛點直接相關的事：**Orca 內建聽寫現在的設定是
-   開啟的（`settings.voice.enabled: true`），它會搶麥克風**——你之前用 `voice-watch` 追的
-   「到底是誰在錄音」還沒結案。
+   不會自動流進來。（更正：我第一版說「Orca 內建聽寫是開的、會搶麥克風」是錯的——你 10-17
+   晚上就關掉了，我讀到的是 10-10 遷移前的退役設定檔。）
 5. **代價**：`openless` 預設要 **Volcengine ASR＋Ark 潤飾的雲端憑證**（本地只有 ASR），而且
    2.0.0-Beta.1 起改為 **AGPL-3.0-only**（1.x 才是 MIT）——把它的碼搬進我們這個公開 repo 會被
    授權傳染；`Talk` 是 MIT，但要再下載 ~3GB 模型、重新授權 TCC，且會與現有 ⌘E 流程互搶。
@@ -52,14 +51,15 @@
 | VAD | 只有能量閘 | in-trial | adoption-verified |
 | 發佈工程 | 本機 `build.sh` 裝 `/Applications` | in-trial | adoption-verified |
 | 第二條線（同機、非同用途） | `~/orca/meeting-translate` 雲端 ASR（OpenAI Realtime）＋`/polish`＋`zh_tw_normalization.json`（10,607 條） | mature | adoption-verified（subagent 實查） |
-| Orca 內建聽寫 | sherpa-onnx（zipformer-bilingual-zh-en），RPC `DictationStart/Chunk` | active（`settings.voice.enabled: true`） | adoption-verified（`orca-data.json`＋`voice-watch/run1/mic.log` pid 42151 為 Orca audio service） |
+| Orca 內建聽寫 | sherpa-onnx（zipformer-bilingual-zh-en），RPC `DictationStart/Chunk` | **disabled**（`settings.voice.enabled=false`，2026-10-17 21:49 更新） | adoption-verified（`profile-state.db` 的 `settings` domain；`orca-data.json` 是 2026-10-10 遷移前的退役快照，**不可**用來判斷現況） |
 | macOS 內建聽寫 | `com.apple.speech.recognition…prefs`，zh_TW、麥克風 MixPre-6 II | previously used（2026-10-11 最後一次） | adoption-verified（`defaults read`） |
 | 第三方商業聽寫工具 | superwhisper／Wispr Flow／MacWhisper／VoiceInk／WhisperKit | not found（無任何痕跡） | adoption-verified（grep／brew／pipx／Library 全 0 命中） |
 
 **這個領域的既有決策主軸**：本地、零帳號、可改；而且**以本機實測為準**——這台機器會吞掉任何
 帶 Command 的合成按鍵，且 Accessibility 授權會被重新簽章打掉，所以「別人的 README 怎麼寫」
-不構成可行證據。盤點另修正了兩個我先前的錯誤假設：Orca 內建聽寫**沒有被關掉**（現為 enabled），
-macOS 內建聽寫在本自製 app 可用之前仍在使用中。
+不構成可行證據。盤點修正了一個我先前的錯誤假設：**Orca 內建聽寫是關的**（2026-10-17 21:49 由
+使用者關閉；我第一版誤讀 10-10 遷移前的 `orca-data.json`，那是退役快照）。macOS 內建聽寫在本自製
+app 可用之前仍在使用中（最後一次 2026-10-11）。
 
 ## Block 2 — 候選 ÷ 現有成熟度（逐項）
 
