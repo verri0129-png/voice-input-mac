@@ -6,3 +6,4 @@ __pycache__/
 *.wav
 HANDOFF-*.md
 local.env
+.run.log
