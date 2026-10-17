@@ -40,9 +40,14 @@ pip install -r requirements.txt
 ## Menu Bar App
 
 ```bash
-cd app && swift build -c release
-.build/release/VoiceInputMac  # 需麥克風 + 輔助使用權限
+cd app && ./build.sh                          # 產出 .build/release/VoiceInputMac.app（繞過壞掉的 SwiftPM）
+open .build/release/VoiceInputMac.app
 ```
+
+首次啟動會跳「輔助使用」授權提示；第一次錄音會跳麥克風授權——兩者都要允許，
+全域熱鍵與自動貼上才會生效（TCC 權限無法用腳本授予，需手動開關）。
+`build.sh` 會在預設 SDK 被拒時自動改用較舊的 CLT SDK（見檔頭註解）。
+若 `swift build` 可用，也可沿用 `swift build -c release`。
 
 操作：`左 Cmd+E` 按一次開始錄音、再按一次結束並轉寫貼到當前游標（任意 App）。結果進剪貼簿並自動 `Cmd+V`，中文一律繁體。
 

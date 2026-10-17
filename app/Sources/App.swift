@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 
 @main
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -8,6 +9,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var leftCmdDown = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 全域熱鍵 + 自動貼上需要「輔助使用」權限；首次啟動跳出系統提示，方便加入清單並開關
+        let axOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(axOpts)
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.title = "🎙️"
