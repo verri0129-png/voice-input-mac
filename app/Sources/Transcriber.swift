@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreGraphics
 import ApplicationServices
 
@@ -229,12 +230,64 @@ enum Transcriber {
         }
     }
 
-    /// 貼上：先用 AppleScript（需要「自動化」權限），失敗就用 CGEvent 保底
-    /// （需要「輔助使用」權限）。兩條都沒有時會明確寫進 log，不再靜默。
-    static func pasteViaClipboard() {
+    /// 把文字送進最前面的 app。
+    ///
+    /// 實測（2026-10-17）：這台機器上**所有帶 ⌘ 的合成按鍵都會被吃掉**——純打字成功、
+    /// ⌘V／⌘A／⌘X 全部無效（System Events 回報成功但目標 app 什麼都沒收到；
+    /// 機器上裝了一堆事件工具：Karabiner / WindowsShortcuts / 各家 computer-use）。
+    /// 所以主要路徑改成 CGEvent unicode 注入（等同使用者打字），⌘V 只當保底。
+    /// 剪貼簿一定也放一份，使用者手動 ⌘V 隨時可用。
+    static func insertText(_ text: String) {
+        guard !text.isEmpty else { return }
+        // TUI／終端機會把換行當成「送出」：逐字稿不需要換行，一律換成空格
+        let safe = text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(safe, forType: .string)
+        log("[insert] 文字已放進剪貼簿（\(safe.count) 字），開始注入")
+        if typeViaCGEvent(safe) { return }
         if pasteViaAppleScript() { return }
         if pasteViaCGEvent() { return }
-        log("[paste] ❌ 兩條路都不通：自動化權限與輔助使用權限目前都不可用 → 文字只在剪貼簿裡（手動按 ⌘V 可以貼）")
+        log("[insert] ❌ 三條路都不通 → 文字只在剪貼簿裡（手動按 ⌘V 可以貼）")
+    }
+
+    /// CGEvent unicode 注入：把字串當成鍵盤輸入打進最前面的 app。
+    /// 不需要 ⌘ 修飾鍵（修飾鍵在本機的合成事件會被吃掉），但需要「輔助使用」權限。
+    private static func typeViaCGEvent(_ text: String) -> Bool {
+        guard AXIsProcessTrusted() else {
+            log("[insert] 輔助使用權限未生效（AXIsProcessTrusted=false）→ 無法注入文字")
+            return false
+        }
+        guard let src = CGEventSource(stateID: .combinedSessionState) else {
+            log("[insert] CGEventSource 建立失敗")
+            return false
+        }
+        let units = Array(text.utf16)
+        let chunkSize = 20          // 一次送太長，終端機／TUI 會掉字
+        var i = 0
+        var chunks = 0
+        while i < units.count {
+            let end = min(i + chunkSize, units.count)
+            let chunk = Array(units[i..<end])
+            guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
+                log("[insert] CGEvent 建立失敗")
+                return false
+            }
+            // 字串只掛在 keyDown：掛兩邊有些 app 會重複插入
+            chunk.withUnsafeBufferPointer { p in
+                down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: p.baseAddress)
+            }
+            down.post(tap: CGEventTapLocation.cgAnnotatedSessionEventTap)
+            up.post(tap: CGEventTapLocation.cgAnnotatedSessionEventTap)
+            i = end
+            chunks += 1
+            if i < units.count { usleep(8000) }   // 8ms：讓目標 app 跟上
+        }
+        log("[insert] ✅ CGEvent 注入 \(units.count) 字（\(chunks) 塊）")
+        return true
     }
 
     private static func pasteViaAppleScript() -> Bool {

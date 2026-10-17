@@ -200,13 +200,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                         return
                     }
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
-                    Transcriber.log("[app] 文字已放進剪貼簿（\(text.count) 字），0.15s 後送 ⌘V")
+                    // 等 0.15s 讓焦點穩定，再於背景注入文字（TCC 對話框可能阻塞，不能卡主執行緒）
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        // 丟到背景：macOS 的 TCC 對話框會讓 osascript 阻塞最久兩分鐘，
-                        // 卡在主執行緒的話整個 app（含熱鍵）都會沒反應。
-                        DispatchQueue.global(qos: .userInitiated).async { Transcriber.pasteViaClipboard() }
+                        DispatchQueue.global(qos: .userInitiated).async { Transcriber.insertText(text) }
                     }
                 }
             } catch {
@@ -247,10 +243,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func pastePending() {
         guard let text = pendingText, !text.isEmpty else { return }
         Transcriber.log("[app] 手動貼上保留的文字（\(text.count) 字）")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            DispatchQueue.global(qos: .userInitiated).async { Transcriber.pasteViaClipboard() }
+            DispatchQueue.global(qos: .userInitiated).async { Transcriber.insertText(text) }
         }
     }
 

@@ -82,3 +82,29 @@ log 顯示：
   否則整個 app（含熱鍵）會像當掉。
 - 啟動時用 `NSAppleScript` 做一次無害查詢（`get version`）當權限 preflight，把「缺權限」
   提前到啟動當下，而不是等貼上時才無聲失敗。
+
+## 2026-10-17 「貼上成功但沒出現」第二層：這台機器把所有帶 ⌘ 的合成按鍵都吃掉
+
+授權修好之後 `[paste] ✅ AppleScript 送出 ⌘V`，但畫面上依然什麼都沒有。用對照實驗
+（TextEdit 開一個實體檔，貼完從記憶體＋磁碟讀回）釐清：
+
+| 合成事件 | 結果 |
+|---|---|
+| `keystroke "XYZ"`（純打字，無修飾鍵） | ✅ 文字進去了 |
+| `keystroke "v" using command down` | ❌ 完全沒反應 |
+| `keystroke "a"/"x" using command down` | ❌ 完全沒反應 |
+
+→ **不是權限、不是目標 app：這台機器上所有「帶 Command 的合成按鍵」都會被吃掉**
+（純按鍵正常）。機器上有一堆事件工具在跑：Karabiner-Elements（Core Service + DriverKit
+VirtualHIDDevice）、WindowsShortcuts、各家的 computer-use（orca.computer-use / trycua /
+openai.sky / qwenlm.opencomputeruse）… 不需要知道是誰吃掉的，繞過去就好。
+
+**修法：改成 CGEvent unicode 注入（等同使用者打字），不走 ⌘V**：
+
+- `CGEvent(keyboardEventSource:virtualKey:0,keyDown:)` + `keyboardSetUnicodeString(...)`
+  → 目標 app 收到的是鍵盤輸入，中文與標點都進得去（實測 TextEdit：`起始＿注入測試：STUB_PROBE_2026 中文與標點都要進得去。`）。
+- 字串**只掛在 keyDown**（掛兩邊有些 app 會重複插入）；分塊 20 字、塊間 8ms
+  （一次送太長終端機／TUI 會掉字）。
+- 換行一律換成空格：TUI 會把 `\n` 當成「送出訊息」，逐字稿不該觸發送出。
+- 剪貼簿仍然照放一份，手動 ⌘V 隨時可用；⌘V 的兩條路（AppleScript / CGEvent）降為保底。
+- 這條路需要**輔助使用**權限（跟全域快捷鍵同一筆），所以那筆授權仍然是關鍵。
