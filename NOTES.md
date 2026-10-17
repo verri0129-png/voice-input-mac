@@ -180,3 +180,24 @@ log 出現 `[rec] …（畫面音波圖峰值 0.29）`；停止後指示圖消�
 
 **驗證**：5 個對抗案例 0 動字；長句得到「…在啟動的時候，做一個像是…是在錄音的？」；
 完整 pipeline（TTS→Whisper→潤飾）字全對、標點全形。
+
+## 2026-10-18 競合評估：GitHub topic「typeless」36 repos
+
+完整評估（Blocks 1–4＋Gate Ledger＋Verdict）在 `EVAL-open-typeless-landscape-2026-10-18.md`。
+判決 **extract**：不整包換，借五個機制（即時部分轉錄、從修正學熱詞、Silero VAD、潤飾強度分級、
+中文潤飾回歸測試素材）。可搬碼的來源首選 MIT 的 `platx-ai/Talk`（同架構、有中文測試素材）；
+`Open-Less/openless`（雲端 ASR＋雲端潤飾、2.0 起 AGPL-3.0）只當功能對照表，不要搬碼進本公開 repo。
+
+**盤點時推翻的兩個舊假設（環境事實，重要）**：
+
+1. **Orca 內建聽寫現在是開啟的**：`~/Library/Application Support/orca/profiles/local-default/orca-data.json`
+   內 `settings.voice = {enabled: true, sttModel: "zipformer-bilingual-zh-en", dictationMode: "toggle"}`，
+   模型在 `speech-models/`（10-04 與 10-14 落地），`ui.featureInteractions["voice-dictation"].interactionCount = 3`。
+   → 之前以為「使用者自己關掉了」是錯的；它會搶麥克風（`~/orca/state/voice-watch/run1/mic.log`
+   的麥克風 TCC 目標 pid 42151 = `Orca Helper --utility-sub-type=audio.mojom.AudioService`）。
+2. **macOS 內建聽寫用過且仍啟用**：`defaults read com.apple.speech.recognition.AppleSpeechRecognition.prefs`
+   → `DictationIMLastDictationDate` = 2026-10-11、麥克風 `MixPre-6 II`、語言 zh_TW、自動標點 True。
+
+另外查到：同機還有一條雲端線 `~/orca/meeting-translate`（OpenAI Realtime ASR ＋ `/polish`，
+`zh_tw_normalization.json` 10,607 條）；superwhisper／Wispr Flow／MacWhisper／VoiceInk／WhisperKit
+在這台機器上**完全沒有痕跡**（grep／brew／pipx／~/Library 全 0 命中）。
