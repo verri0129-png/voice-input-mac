@@ -43,3 +43,42 @@
   **不會載入模型** → 暖機必須餵「不是靜音」的音（用 0.27 振幅以下的雜訊即可）。
 - 陷阱：同一套 exit 3/4 邏輯原本在 CLI 檔案模式與 live-record 模式各有一份，已把檔案模式
   抽成 `process_wav_file()` 給 CLI 與 `--serve` 共用；live-record 模式仍留著舊的重複（未動）。
+
+## 2026-10-17 「按了 ⌘\ 但沒反應」的真正原因：輔助使用授權失效（一次修好兩個症狀）
+
+**症狀**：⌘\ 有觸發（log 有 `[hotkey] Carbon ⌘\ 按下`、文字也轉出來了），但畫面上什麼都沒出現。
+log 顯示：
+
+```
+[paste] ❌ osascript exit=1 stderr=execution error: System Events發生錯誤：不允許「osascript」傳送按鍵。(1002)
+```
+
+**根因**：`tccutil` 系統層那一筆 `kTCCServiceAccessibility|local.hunghanchu.voice-input-mac|2`
+的 `csreq` 對不上現在的簽章（今天 20:50 之後重新簽章／重裝過），所以：
+
+1. `AXIsProcessTrusted()==false` → 全域 NSEvent 監聽器**靜默失效**（嚴格左 Cmd 路徑死掉）。
+2. System Events 的 `keystroke` 也被拒 → **貼不出去**（錯誤 1002「不允許…傳送按鍵」）。
+
+也就是「快捷鍵」與「貼上」是同一個病：**輔助使用授權綁簽章，授權過期兩個一起壞**。
+
+**修法**：`tccutil reset Accessibility local.hunghanchu.voice-input-mac` → 重啟 app →
+在「系統設定 → 隱私權與安全性 → 輔助使用」把 `Voice Input` 開關**關掉再打開**
+（開關一次會把 csreq 改寫成現在的簽章；只按＋加入或只重開不會改寫舊 csreq）。
+
+**驗證**：`[perm] AXIsProcessTrusted=true`、`[paste] ✅ AppleScript 送出 ⌘V（耗時 0.07s）`。
+
+**踩到的坑**：
+
+- 貼上失敗原本是**完全靜默**的（`try? src.run()` + 不讀 stderr）。診斷一開始就該把
+  子行程的 exit code／stderr 寫進 log，否則「文字有進剪貼簿但沒跳到游標」根本看不出來。
+- `tccutil reset AppleEvents` 之後，AppleScript 的錯誤訊息會從「不允許「osascript」…」
+  變成「不允許「Voice Input」…」——**spawn 出去的 `osascript` 送 AppleEvent 時，
+  TCC 會算在 osascript 身上**。改用 `NSAppleScript`（自己行程送）才保證授權綁我們的 bundle id。
+- 錯誤碼分工：`-1743` = 沒有自動化權限；`1002`（System Events）＝送按鍵的行程沒有
+  **輔助使用**權限。看到 1002 要去查 Accessibility，不是 AppleEvents。
+- 輔助使用記在**系統層** TCC（`/Library/.../TCC.db`），自動化／麥克風記在**使用者層**；
+  查錯層會看到「清單空的」這種假象。
+- TCC 對話框會讓送 AppleEvent 的呼叫**阻塞最久兩分鐘**：貼上務必丟到背景佇列，
+  否則整個 app（含熱鍵）會像當掉。
+- 啟動時用 `NSAppleScript` 做一次無害查詢（`get version`）當權限 preflight，把「缺權限」
+  提前到啟動當下，而不是等貼上時才無聲失敗。

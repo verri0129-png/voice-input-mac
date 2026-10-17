@@ -65,6 +65,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 執行時真的被信任嗎？TCC 的表格說「允許」不代表簽章換過之後還算數，
         // 所以把實際結果寫進 log（`false` = 全域監聽器一定收不到跨 app 按鍵）。
         Transcriber.log("[perm] AXIsProcessTrusted=\(AXIsProcessTrusted())")
+        // 貼上要用的「自動化」權限也在啟動時先確認（缺的話現在跳對話框，
+        // 而不是等按下停止貼上時才靜默失敗 → 使用者只會看到「沒反應」）
+        Transcriber.preflightAutomation()
         setupCarbonHotKey()
         Transcriber.log("[app] launched. bundle=\(Bundle.main.bundlePath) python=\(Transcriber.pythonBin) script=\(Transcriber.scriptPath) log=\(Transcriber.logPath)")
     }
@@ -199,7 +202,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { Transcriber.pasteViaClipboard() }
+                    Transcriber.log("[app] 文字已放進剪貼簿（\(text.count) 字），0.15s 後送 ⌘V")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        // 丟到背景：macOS 的 TCC 對話框會讓 osascript 阻塞最久兩分鐘，
+                        // 卡在主執行緒的話整個 app（含熱鍵）都會沒反應。
+                        DispatchQueue.global(qos: .userInitiated).async { Transcriber.pasteViaClipboard() }
+                    }
                 }
             } catch {
                 let code = (error as NSError).code
@@ -241,7 +249,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Transcriber.log("[app] 手動貼上保留的文字（\(text.count) 字）")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { Transcriber.pasteViaClipboard() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            DispatchQueue.global(qos: .userInitiated).async { Transcriber.pasteViaClipboard() }
+        }
     }
 
     @objc func revealInFinder() { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: Bundle.main.bundlePath)]) }

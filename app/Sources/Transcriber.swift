@@ -1,4 +1,6 @@
 import Foundation
+import CoreGraphics
+import ApplicationServices
 
 enum Transcriber {
     static var pythonBin: String {
@@ -205,15 +207,73 @@ enum Transcriber {
         return try transcribeOneShot(wavURL: wavURL)
     }
 
+    /// 啟動時檢查貼上要用的「自動化」權限。
+    ///
+    /// 送 ⌘V 的 AppleScript 需要 `kTCCServiceAppleEvents`；授權是綁簽章的，重新簽章後
+    /// 舊授權會失效，而失敗完全靜默（若只查 System Events 的版本這種無害查詢，不會送按鍵）。
+    /// 這裡先問一次，缺權限時對話框會出現在啟動當下，而不是貼上當下。
+    static func preflightAutomation() {
+        DispatchQueue.global(qos: .utility).async {
+            // 用自己的行程送（不是 spawn osascript，見 pasteViaAppleScript 的說明）
+            guard let script = NSAppleScript(source: "tell application \"System Events\" to get version") else {
+                log("[perm] 無法建立 AppleScript")
+                return
+            }
+            var err: NSDictionary?
+            _ = script.executeAndReturnError(&err)
+            if let err = err {
+                log("[perm] 自動化權限不可用（貼上會失敗，文字仍會留在剪貼簿）: \(err)")
+            } else {
+                log("[perm] 自動化權限 OK（貼上可用）")
+            }
+        }
+    }
+
+    /// 貼上：先用 AppleScript（需要「自動化」權限），失敗就用 CGEvent 保底
+    /// （需要「輔助使用」權限）。兩條都沒有時會明確寫進 log，不再靜默。
     static func pasteViaClipboard() {
+        if pasteViaAppleScript() { return }
+        if pasteViaCGEvent() { return }
+        log("[paste] ❌ 兩條路都不通：自動化權限與輔助使用權限目前都不可用 → 文字只在剪貼簿裡（手動按 ⌘V 可以貼）")
+    }
+
+    private static func pasteViaAppleScript() -> Bool {
         let t0 = Date()
-        let src = Process()
-        src.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        src.arguments = ["-e", "tell application \"System Events\" to keystroke \"v\" using command down"]
-        try? src.run()
-        src.waitUntilExit()
-        // 貼上要等 System Events（有時還要等自動化權限），慢的話體感就是「等很久才出現文字」
+        // 用自己行程送 AppleEvent（不是 spawn osascript）。TCC 的「自動化」授權綁「哪個行程送的」：
+        // 用 osascript 時送按鍵的是 osascript（錯誤訊息就是寫它），授權／對話框不一定對得上我們的
+        // bundle id；用 NSAppleScript 才保證是 local.hunghanchu.voice-input-mac 在送。
+        guard let script = NSAppleScript(source: "tell application \"System Events\" to keystroke \"v\" using command down") else {
+            log("[paste] 無法建立 AppleScript")
+            return false
+        }
+        var err: NSDictionary?
+        _ = script.executeAndReturnError(&err)
         let dt = Date().timeIntervalSince(t0)
-        if dt > 0.3 { log("[paste] osascript 花了 \(String(format: "%.2f", dt))s") }
+        if let err = err {
+            // 常見：-1743 / 1002 = 沒有自動化權限；-600 = System Events 沒起來
+            log("[paste] AppleScript 失敗（耗時 \(String(format: "%.2f", dt))s）: \(err)")
+            return false
+        }
+        log("[paste] ✅ AppleScript 送出 ⌘V（耗時 \(String(format: "%.2f", dt))s）")
+        return true
+    }
+
+    private static func pasteViaCGEvent() -> Bool {
+        guard AXIsProcessTrusted() else {
+            log("[paste] 輔助使用權限未生效（AXIsProcessTrusted=false）→ CGEvent 保底也不可用")
+            return false
+        }
+        guard let src = CGEventSource(stateID: .combinedSessionState),
+              let down = CGEvent(keyboardEventSource: src, virtualKey: 9 /* kVK_ANSI_V */, keyDown: true),
+              let up = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false) else {
+            log("[paste] CGEvent 建立失敗")
+            return false
+        }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: CGEventTapLocation.cgAnnotatedSessionEventTap)
+        up.post(tap: CGEventTapLocation.cgAnnotatedSessionEventTap)
+        log("[paste] ✅ CGEvent 送出 ⌘V")
+        return true
     }
 }
