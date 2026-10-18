@@ -249,3 +249,36 @@ launchctl setenv VOICE_INPUT_TRANSCRIBE_PY /tmp/stub_preview.py && open -a /Appl
 # 用選單觸發開始/停止（合成事件不會觸發 Carbon 熱鍵）
 osascript -e 'tell application "System Events" to tell process "VoiceInputMac" to click menu item 1 of menu 1 of menu bar item 1 of menu bar 2'
 ```
+
+## 2026-10-19 ASR 換成 Breeze-ASR-25（MLX 4bit，使用者決定）
+
+**決定**：ASR 由 `whisper-large-v3-turbo` 換成 `Breeze-ASR-25`（聯發科，Whisper-large-v2 微調，
+Apache-2.0）；**潤飾模型不動**（仍是 Qwen2.5-7B-4bit）。理由：台灣中文＋中英混用是使用者實際情境，
+官方 benchmark 在該情境勝過 large-v3（CV16-zh-TW 8.95→7.97、CSZS 26.43→13.01），
+而 turbo 的優勢只有速度。
+
+**接法**（不進版控）：
+- 模型放 `models/breeze-asr-25-mlx-4bit/`（`config.json` ＋ `weights.safetensors` symlink 到 HF cache 的 blob）。
+  用社群 MLX 轉檔 `BRlin/Breeze-ASR-25-mlx-4bit`（官方只給 transformers 格式；`weights.safetensors`
+  這個檔名是 mlx_whisper 硬需求，BRlin 原本叫 `model.safetensors`）。
+- `local.env` 設 `VOICE_STT_REPO=<repo>/models/breeze-asr-25-mlx-4bit`（`.gitignore` 已含 `models/`）。
+- 回滾：刪掉 `local.env` 的 `VOICE_STT_REPO` 那一行（或改回 `mlx-community/whisper-large-v3-turbo`）。
+
+**實測（M4 Max，同一批 4 段音、同一個 initial_prompt）**：
+
+| | turbo fp16 | Breeze fp16 | Breeze 4bit |
+|---|---|---|---|
+| 推論/段 | 0.26–0.28s | 0.44–0.54s | 0.41–0.48s |
+| 峰值 RSS（ASR 程序） | 1.86 GB | 3.35 GB | 1.16 GB |
+| 暖機程序總量（含 Qwen） | 6.16 GB | — | **5.47 GB** |
+
+**Breeze 的兩個行為差異（已用程式補償）**：
+1. **完全不吐標點** → 標點全交給 Qwen，實測 p1 會少結尾句號（其餘正常）。
+2. **中文與數字/英文之間會加空格**（「早上 10 點」「這個 spec」）→ 新增 `normalize_spacing()`，
+   在 ASR 輸出與最終文字各跑一次（Qwen 也會把空格加回來，只補 ASR 端不夠）。
+   只移除緊鄰中日韓字元的空格，英文單字之間的空格保留。
+
+**踩到的坑**：改完 `local.env` 後，app 說「已有暖機程序 pid=…，不重啟」——那是**改設定前**啟動的
+舊伺服器，還載著舊模型（RSS 6.16 GB）。換模型後**必須手動 kill 舊的 `transcribe.py --serve`**，
+否則下一次錄音還是用舊模型。現在 `serve_forever` 啟動時會印 `[serve] STT=… POLISH=…`，
+log 可以直接確認載入的是哪一顆。

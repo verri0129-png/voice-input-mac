@@ -7,3 +7,4 @@ __pycache__/
 HANDOFF-*.md
 local.env
 .run.log
+models/

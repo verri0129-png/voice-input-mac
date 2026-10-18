@@ -252,7 +252,7 @@ def transcribe_audio(audio, language="zh"):
         verbose=False,
         initial_prompt=STT_INITIAL_PROMPT,
     )
-    text = (result.get("text") or "").strip()
+    text = normalize_spacing((result.get("text") or "").strip())
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
     # 實測全 0 音檔的幻覺 no_speech_prob=0.000，所以主要防線仍是能量門檻）
     segs = result.get("segments") or []
@@ -320,6 +320,21 @@ def _strip_invisible(s: str) -> str:
     """丟掉控制字元與替換字元（保留換行）。避免看不見的垃圾被貼到游標處。"""
     return "".join(ch for ch in s
                    if ch == "\n" or (not unicodedata.category(ch).startswith("C") and ch != "\ufffd"))
+
+_CJK = "\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef"
+
+def normalize_spacing(s: str) -> str:
+    """去掉「緊鄰中日韓字元」的空格，保留英文單字之間的空格。
+
+    Breeze-ASR-25 會在中文與數字/英文之間塞空格（「早上 10 點」「這個 spec」），
+    whisper-large-v3-turbo 不會。這種空格會原樣貼到游標處，看起來像亂碼。
+    只動空格、不動字：英文片語（"API doc"）中間的空格保留。
+    """
+    if not s:
+        return s
+    t = re.sub(rf"(?<=[{_CJK}])[ \t]+", "", s)
+    t = re.sub(rf"[ \t]+(?=[{_CJK}])", "", t)
+    return t
 
 def transfer_punctuation(raw: str, polished: str) -> str:
     """把潤飾結果的標點搬到原文上：原文的字一個都不動，只採用模型多插的標點。
@@ -515,12 +530,14 @@ def process_wav_file(path, language="zh", polish=True, label=""):
                                     initial_prompt=STT_INITIAL_PROMPT)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
-    raw = (result.get("text") or "").strip()
+    raw = normalize_spacing((result.get("text") or "").strip())
     if not raw:
         print("[stt] 沒有辨識到內容（靜音，或麥克風根本沒收到訊號）", file=sys.stderr)
     print(f"[raw] {raw}", file=sys.stderr)
     print(f"[raw-tw] {to_taiwan_traditional(raw)}", file=sys.stderr)
     final = raw if not polish else (polish_text(raw) if raw else "")
+    # 潤飾模型會把英文/數字兩側的空格加回來（Breeze 原文也可能有）→ 最終文字再正規化一次
+    final = normalize_spacing(final)
     # final hard guarantee: any remaining simplified -> Taiwan traditional
     final = to_taiwan_traditional(final)
     print(f"[final] {final}", file=sys.stderr)
@@ -634,6 +651,9 @@ def serve_forever(language="zh", polish=True):
     """
     import json
     print("[serve] 暖機中（OpenCC + Whisper + Qwen）…", file=sys.stderr)
+    # 把實際載入的模型寫進 log：改 local.env 之後要一眼看出「現在是哪一顆」
+    # （踩過：改完設定，舊的暖機程序還在跑，log 只看得到「已有暖機程序，不重啟」）
+    print(f"[serve] STT={STT_REPO} POLISH={POLISH_REPO}", file=sys.stderr)
     try:
         to_taiwan_traditional("暖機")
         import numpy as np
@@ -748,6 +768,7 @@ def main():
         final = raw
     else:
         final = polish_text(raw) if raw else ""
+    final = normalize_spacing(final)
     final = to_taiwan_traditional(final)
     print(f"[final] {final}", file=sys.stderr)
     if final:
