@@ -252,7 +252,7 @@ def transcribe_audio(audio, language="zh"):
         verbose=False,
         initial_prompt=STT_INITIAL_PROMPT,
     )
-    text = normalize_spacing((result.get("text") or "").strip())
+    text = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
     # 實測全 0 音檔的幻覺 no_speech_prob=0.000，所以主要防線仍是能量門檻）
     segs = result.get("segments") or []
@@ -322,6 +322,57 @@ def _strip_invisible(s: str) -> str:
                    if ch == "\n" or (not unicodedata.category(ch).startswith("C") and ch != "\ufffd"))
 
 _CJK = "\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef"
+
+# --- 口頭禪／結巴的規則化清理（潤飾之前跑）-----------------------------------
+# 為什麼不讓模型清：它會「順稿」——實測把「會不會」改成「不會」（語意反轉）。
+# 為什麼不能「所有重複字都折疊」：中文正常疊字很多（看看、試試、非常非常、會不會），
+# 全部折疊會誤刪語意。所以只折疊兩類：
+#   1) 整詞重複：那個那個 → 那個（重複一個虛詞永遠沒有語意）
+#   2) 高風險結巴單字：我我 / 你你 / 這這 / 就就（看、試、想、聽 等實義動詞不在名單）
+_REPEAT_WORDS = ("那個", "這個", "就是", "因為", "然後", "所以", "可是", "但是",
+                 "其實", "我們", "你們", "他們", "現在", "然後")
+_STUTTER_CHARS = "我你他她它這那個就是的對好"
+# 只刪「獨立」的語助詞：前面是句首/標點/空白、後面是標點/空白/句尾。
+# 句尾的語氣詞（好啊、對啊）不動，因為那是語氣不是結巴。
+_FILLERS = ("嗯哼", "嗯", "呃", "啊", "喔", "哦", "欸", "唉")
+
+def _collapse_repeats(s):
+    """折疊整詞重複與結巴單字，回傳 (新字串, 折疊次數)。"""
+    removed = 0
+    for _ in range(3):                     # 我我我 → 我（多跑幾輪到收斂）
+        changed = False
+        for w in _REPEAT_WORDS:
+            s, n = re.subn(rf"({re.escape(w)})[、,\s]*\1", r"\1", s)
+            removed += n; changed = changed or n > 0
+        for ch in _STUTTER_CHARS:
+            s, n = re.subn(rf"({re.escape(ch)})[、,\s]*\1", r"\1", s)
+            removed += n; changed = changed or n > 0
+        if not changed:
+            break
+    return s, removed
+
+def _strip_fillers(s):
+    """刪掉獨立的語助詞，回傳 (新字串, 刪除次數)。全句只有語助詞時保留原樣。"""
+    removed = 0
+    for f in _FILLERS:
+        pat = re.compile(rf"(?:^|(?<=[，。、！？,.!?\s])){re.escape(f)}[，、,]?\s*")
+        new, n = pat.subn("", s)
+        if n and _text_only(new):           # 不能清到整句變空
+            s = new; removed += n
+    return s, removed
+
+def cleanup_disfluencies(s: str) -> str:
+    """規則化清掉結巴與語助詞（只刪這兩類，其餘一字不動）。"""
+    if not s:
+        return s
+    before = s
+    s, n_rep = _collapse_repeats(s)
+    s, n_fill = _strip_fillers(s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    if n_rep or n_fill:
+        print(f"[cleanup] 折疊 {n_rep} 處、刪語助詞 {n_fill} 處："
+              f"{before[:60]} → {s[:60]}", file=sys.stderr)
+    return s
 
 def normalize_spacing(s: str) -> str:
     """去掉「緊鄰中日韓字元」的空格，保留英文單字之間的空格。
@@ -530,7 +581,7 @@ def process_wav_file(path, language="zh", polish=True, label=""):
                                     initial_prompt=STT_INITIAL_PROMPT)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
-    raw = normalize_spacing((result.get("text") or "").strip())
+    raw = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
     if not raw:
         print("[stt] 沒有辨識到內容（靜音，或麥克風根本沒收到訊號）", file=sys.stderr)
     print(f"[raw] {raw}", file=sys.stderr)
