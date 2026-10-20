@@ -307,3 +307,34 @@ log 可以直接確認載入的是哪一顆。
 
 **坑**：改完程式一定要 `pkill -f "transcribe.py --serve"`——暖機程序把舊程式載在記憶體裡，
 不重啟就還是跑舊邏輯（跟換模型那次同一個坑）。
+
+## 2026-10-19 M2 記憶體爆掉：根因與定案（M2 = 純 Breeze、無 polish）
+
+- 09:00 使用者回報「M2 語音輸入太慢、還碰到記憶體不足」。09:08 從 M4 ssh 進 M2 量到：
+  **swap 9.5GB/10GB、15 分鐘 load 15.28、free 20%**，畫面已卡死。
+- 根因不是單一模型太大，是 **16GB 上同時有三份 7B 等級模型**：
+  1. VoiceInputMac 底下掛了**兩個** `transcribe.py`（各自載 Breeze + Qwen2.5-7B-4bit）；
+  2. 另一個 session 啟的 `/tmp/polish_eval.py` 迴圈（7B→3B→4B 依序跑，當時 7B 正在跑）。
+  不是三個模型同時載入，是「兩份 7B + 第三份 7B」疊起來。09:14 M2 重開機後 swap 歸零。
+- 09:41 **M2 本機實測**（不是推算）：Breeze STT only 尖峰 **2.35GB**（常駐 footprint 2.26GB）；
+  Breeze + Qwen3-4B polish 尖峰 **5.42GB**；Breeze 4bit 權重本身 837MB。
+- 09:47 使用者選 **no-polish**：`app/Sources/Transcriber.swift` 的暖機與一次性退路都固定加
+  `--no-polish`；`local.env` 註解掉 `VOICE_POLISH_REPO`；暖機 log 改印
+  `POLISH=disabled (--no-polish)`。**M2 現行尖峰約 2.3GB。**
+- 09:58 證實 Breeze 不吐標點（`[raw]` 與 `[final]` 一字不差）→ 10:01 接**零成本規則標點**
+  （連接詞前逗號＋句尾句號／問號；`insert_clause_commas()` 等），不載模型、不增延遲。
+- 10:18–10:22 依使用者指示清掉 M2 的 Qwen 2.5-3B/7B、Qwen3-4B 與 whisper-large-v3-turbo
+  （HF cache 6.1GB → 837MB）；`test_stt.py`／`test_hallucination.py` 不再寫死 whisper；
+  `transcribe.py` 預設 STT 改 `BRlin/Breeze-ASR-25-mlx-4bit`、`POLISH_REPO` 預設空＝自動關閉潤飾。
+- **兩台刻意不同（使用者明確要求不要混）**：
+  | | ASR | 潤飾 | 尖峰 |
+  |---|---|---|---|
+  | M4 | Breeze-ASR-25 4bit | Qwen2.5-7B-4bit | ~5.5GB |
+  | M2 | Breeze-ASR-25 4bit | 無（規則標點） | ~2.3GB |
+- 10-20 16:27 M2 的無版控工作副本被 park 成 `origin/wip/m2-voice-input-20261020`
+  （commit `7147610`，排除 `local.env`／`models/`／`.venv/`），內容含 `--no-polish`、規則標點、
+  熱鍵 toggle、LoginAgent 自動啟動。**尚未併入 main**，要用前先審。
+- 證據位置：OpenCode session DB `~/.local/share/opencode/opencode.db`
+  → `ses_eaf9b7d3dffeUI4b1n5G0kem0t`（09:00 事故、09:08–09:14 診斷）、
+  `ses_eae4fbff3ffeFKlXzekClOXq8L`（08:17 換 Breeze、09:41 量測、09:47 no-polish、10:18+ 刪模型）。
+- M2 本機的 `.run.log`／`HANDOFF-M2.md` 隨機器關機無法讀取；以上以 M4 端 session 紀錄為準。
