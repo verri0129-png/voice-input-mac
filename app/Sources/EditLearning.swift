@@ -22,12 +22,22 @@ enum EditLearning {
         context: [String: Any],
         termsFile: URL
     ) {
-        guard shouldLearn(),
-              let originalField, !originalField.isEmpty,
-              !insertedText.isEmpty,
-              let bundleID = context["bundle_id"] as? String,
+        guard shouldLearn() else {
+            Transcriber.log("[learn] 略過：VOICE_LEARN_EDITS=0")
+            return
+        }
+        guard let originalField, !originalField.isEmpty else {
+            Transcriber.log("[learn] 略過：貼上前抓不到欄位文字（learningSnapshot 失敗或欄位為空）")
+            return
+        }
+        guard !insertedText.isEmpty else {
+            Transcriber.log("[learn] 略過：注入文字為空")
+            return
+        }
+        guard let bundleID = context["bundle_id"] as? String,
               let windowTitle = context["window_title"] as? String,
               let fieldRole = context["field_role"] as? String else {
+            Transcriber.log("[learn] 略過：context 缺 bundle_id/window_title/field_role")
             return
         }
         let pending = Pending(
@@ -43,6 +53,7 @@ enum EditLearning {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delaySeconds) {
             check(pending: pending)
         }
+        Transcriber.log("[learn] 已排程：\(Int(delaySeconds)) 秒後比對欄位（app=\(bundleID)）")
     }
 
     static func shouldLearn() -> Bool {
@@ -88,12 +99,25 @@ enum EditLearning {
     }
 
     private static func check(pending: Pending) {
-        guard let current = ContextCapture.learningSnapshot(),
-              current["bundle_id"] == pending.bundleID,
+        guard let current = ContextCapture.learningSnapshot() else {
+            Transcriber.log("[learn] 略過：20 秒後抓不到欄位（換了 App 或欄位不可讀）")
+            return
+        }
+        guard current["bundle_id"] == pending.bundleID,
               current["window_title"] == pending.windowTitle,
-              current["field_role"] == pending.fieldRole,
-              let currentField = current["field_text"],
-              currentField != pending.originalField else {
+              current["field_role"] == pending.fieldRole else {
+            Transcriber.log(
+                "[learn] 略過：焦點已改變 app=\(current["bundle_id"] ?? "-")"
+                + " title=\(current["window_title"] ?? "-") role=\(current["field_role"] ?? "-")"
+            )
+            return
+        }
+        guard let currentField = current["field_text"] else {
+            Transcriber.log("[learn] 略過：欄位讀不到文字")
+            return
+        }
+        guard currentField != pending.originalField else {
+            Transcriber.log("[learn] 略過：文字跟貼上時一樣（沒有手動修改）")
             return
         }
         let payload: [String: String] = [
