@@ -139,6 +139,39 @@ def _insertion_index(field: str, before: str, after: str) -> int | None:
     return positions[0] if len(positions) == 1 else None
 
 
+def _insertion_block(original: str, current: str, inserted: str) -> tuple[int, int] | None:
+    """Find where the pasted block sits in `current` by comparing both snapshots.
+
+    The cursor context is often too short to be a unique anchor (a single
+    Chinese character repeats constantly), so locate the paste structurally:
+    strip the common prefix/suffix, and require what is left in `current` to be
+    the pasted text plus at most a small manual edit.
+
+    Returns (start, end) offsets into `current`, or None when the shape does not
+    match (field changed elsewhere, several insertions, mismatched payload).
+    """
+    limit = min(len(original), len(current))
+    prefix = 0
+    while prefix < limit and original[prefix] == current[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < limit - prefix
+        and original[len(original) - 1 - suffix] == current[len(current) - 1 - suffix]
+    ):
+        suffix += 1
+    # The paste must be the only difference between the two snapshots.
+    if original[prefix: len(original) - suffix]:
+        return None
+    start, end = prefix, len(current) - suffix
+    if end <= start:
+        return None
+    tolerance = max(4, len(inserted) // 4)
+    if abs((end - start) - len(inserted)) > tolerance:
+        return None
+    return start, end
+
+
 def infer_term_candidates(payload: dict) -> list[TermRule]:
     """Infer one context-bound correction from a later manual edit."""
     original = normalize_edit_text(payload.get("original_field"))
@@ -146,11 +179,15 @@ def infer_term_candidates(payload: dict) -> list[TermRule]:
     inserted = normalize_edit_text(payload.get("inserted_text"))
     before = normalize_edit_text(payload.get("text_before"))
     after = normalize_edit_text(payload.get("text_after"))
-    if not original or not current or not inserted or original == current:
+    if not current or not inserted or original == current:
         return []
-    index = _insertion_index(original, before, after)
-    if index is None:
-        return []
+    span = _insertion_block(original, current, inserted)
+    if span is not None:
+        index = span[0]
+    else:
+        index = _insertion_index(original, before, after)
+        if index is None:
+            return []
     insert_end = index + len(inserted)
     expected = original[:index] + inserted + original[index:]
     if expected == current:
@@ -587,6 +624,20 @@ def _declared_replacements(terms: list[TermRule]) -> list[tuple[str, str]]:
     return replacements
 
 
+def _describe_protected_change(draft: str, candidate: str) -> str:
+    """Name the first identifier/number the cloud output disturbed."""
+    before = _protected_spans(canonical_draft(draft))
+    after = _protected_spans(canonical_draft(candidate))
+    for original_token, revised_token in zip(before, after):
+        if original_token != revised_token:
+            return f"{original_token[:20]} → {revised_token[:20]}"
+    if len(before) > len(after):
+        return f"少了 {before[len(after)][:20]}"
+    if len(after) > len(before):
+        return f"多了 {after[len(before)][:20]}"
+    return ""
+
+
 def validate_rewrite(
     draft: str,
     candidate: str,
@@ -600,7 +651,9 @@ def validate_rewrite(
     if not revised:
         return False, "雲端輸出為空", 0
     if _protected_spans(canonical_draft(draft)) != _protected_spans(canonical_draft(candidate)):
-        return False, "英文代號或數字被改動", 0
+        detail = _describe_protected_change(draft, candidate)
+        reason = f"英文代號或數字被改動（{detail}）" if detail else "英文代號或數字被改動"
+        return False, reason, 0
     if original == revised:
         return True, "pass（只動標點或空白）", 0
 

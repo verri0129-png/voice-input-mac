@@ -146,6 +146,48 @@ class RewriteCloudTests(unittest.TestCase):
             [("會議共識", ("會議公式",))],
         )
 
+    def test_learned_edit_without_usable_cursor_anchor(self):
+        # 真實情境：ContextCapture 只抓到 after=1 個字，而該字在欄位裡重複出現，
+        # 錨點無法唯一定位。改由前後兩份欄位快照 diff 出插入區塊，仍要學到。
+        inserted = "原有工廠下載c級部reject的部bkcc跟nvy其餘維持reject"
+        original_field = "會議紀錄 布況確認 請留意 布"
+        current_field = original_field + inserted
+        current_field = current_field.replace("c級部", "c級布", 1)
+        payload = {
+            "original_field": original_field,
+            "inserted_text": inserted,
+            "text_before": "",
+            "text_after": "布",  # 在 original_field 出現兩次 → 錨點定位失敗
+            "current_field": current_field,
+        }
+        candidates = transcribe.infer_term_candidates(payload)
+        self.assertEqual(
+            [(candidate.text, candidate.variants) for candidate in candidates],
+            [("c級布re", ("c級部re",))],
+        )
+
+    def test_learned_edit_in_empty_field(self):
+        payload = {
+            "original_field": "",
+            "inserted_text": "sketcher的Barry提出29卷",
+            "text_before": "",
+            "text_after": "",
+            "current_field": "sketcher的Barry提出29捲",
+        }
+        candidates = transcribe.infer_term_candidates(payload)
+        self.assertEqual(
+            [(candidate.text, candidate.variants) for candidate in candidates],
+            [("29捲", ("29卷",))],
+        )
+
+    def test_validate_names_the_disturbed_identifier(self):
+        ok, reason, _ = rewrite_cloud.validate_rewrite(
+            "原有的bkcc跟nvy要維持reject",
+            "原有的bkcc跟NVY要維持reject",
+        )
+        self.assertFalse(ok)
+        self.assertIn("nvy → NVY", reason)
+
     def test_learned_edit_merges_into_personal_terms(self):
         with tempfile.TemporaryDirectory() as tmp:
             terms_path = Path(tmp) / "terms.json"
