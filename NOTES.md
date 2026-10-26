@@ -338,3 +338,45 @@ log 可以直接確認載入的是哪一顆。
   → `ses_eaf9b7d3dffeUI4b1n5G0kem0t`（09:00 事故、09:08–09:14 診斷）、
   `ses_eae4fbff3ffeFKlXzekClOXq8L`（08:17 換 Breeze、09:41 量測、09:47 no-polish、10:18+ 刪模型）。
 - M2 本機的 `.run.log`／`HANDOFF-M2.md` 隨機器關機無法讀取；以上以 M4 端 session 紀錄為準。
+
+## 2026-10-26 晚間 「停止後要等 22 秒」→ 改成 Typeless 式「先貼再定版」（`9e5bd48`）
+
+**症狀**：Typeless 模式實跑只有一筆紀錄 `[app] 結果（停止→文字 21.98s）`，而且那筆的雲端還
+`Vertex 呼叫失敗：TimeoutError`。對照同一支 app 在本地潤飾時代是 1.0–1.9s（10/19、10/25 共 40 次）。
+
+**量測（不是猜）**：
+
+| 項目 | 結果 |
+|---|---|
+| ASR | 停止時只剩 ~1s（錄音中 partial 已持續在跑），**不是瓶頸** |
+| 單次 Vertex 呼叫 | 同一個請求 2.2–26s；`thinkingBudget=0`／`thinkingLevel=low` 都不穩定生效（0～264 thoughts） |
+| 輸出預算 | 長句 thoughts 吃掉 ~980/1024 → `finish=MAX_TOKENS`，只吐 40 token（半句話）。**舊版完全沒檢查 finishReason** |
+| 串流 | TTFT 2.0–4.1s ≈ 全部時間；瓶頸在首字之前，串流救不了 |
+| 模型選擇 | 這個 project 只叫得動 `gemini-3.8-flash`；`3.8-flash-lite`／`3-flash`／`2.5-flash`／`2.5-flash-lite`／`3.8-pro`、us-central1 全 404 |
+| 配額 | 撞過一次 `429 Resource exhausted`，退避花 46s（所以不能「講話中每 1.2s 一直送」） |
+| 價值 | 代號密集句 4/4 被守門退回；乾淨短句多半只「動標點」——規則後端 0ms 就能做 |
+
+**結論**：單次雲端呼叫的地板就是 2–4 秒（尾端十幾秒），所以「停止後才等雲端」永遠慢；
+只能像 Typeless 一樣把等待藏起來。
+
+**改法（四層）**：
+
+1. `transcribe.py`：serve 請求多一個 `"refine"` 路徑。有它就**只做規則標點**立刻回
+   `{"status":"ok","refine_pending":true}`，雲端重寫丟背景執行緒，結果原子寫進 refine 檔
+   （`{"ok":…,"text":…,"reason":…,"elapsed_ms":…}`）。逾時 20s→8s。
+2. `rewrite_cloud.py`：送 `thinkingConfig.thinkingBudget=0`；`finishReason=MAX_TOKENS` 一律
+   raise（退回規則版）；用後學習每個 `return []` 改成在 stderr 說明原因。
+3. Swift：`Transcriber.awaitRefinement` 等檔（≤10s）；`refineInsertedBlock` 選取剛貼的那段
+   重打定版，四個守門＝**欄位去掉那段後仍等於貼上前內容**、那段**唯一出現**、App 支援 AX
+   選取、**回讀相符**；用 `ContextCapture.focusedTextField`／`selectFieldRange`。
+4. `App.swift`：定版完成後才排用後學習，並**以定版文字記帳**（否則 20 秒後的比對會把定版
+   本身當成使用者手改，學到垃圾詞）。
+
+**實測**（TTS 產的中文音檔 + 真 serve 協定，不是真人）：停止→文字 **0.56s**（原本 21.98s）；
+定版在回應後 **3.25s** 背景完成、`ok=true`、`reason=pass（只動標點）`；serve 迴圈不再被雲端
+擋住（錄音中的 `[preview]` 照跑）。單元測試 19 條全綠。
+
+**還沒驗**：真人按 ⌘E 的原地替換（Swift 那半）。判準＝`.run.log` 出現
+`[refine] 收到定版` → `[refine] ✅ 原地定版`，或 `[refine] 不動手：<原因>`。
+使用者會看到「文字先出現、3–5 秒後自己變一次」，那是預期行為。
+
