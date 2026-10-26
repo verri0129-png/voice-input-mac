@@ -1,21 +1,19 @@
-# voice-input-mac — 純本地語音輸入（M4 / M2 皆可跑）
+# voice-input-mac — 本地辨識＋雲端語意重寫（M4 / M2 皆可跑）
 
-免費、離線、系統級「按住說話放開貼字」，在任意 App 輸入框可用。
-STT `mlx-whisper large-v3-turbo`（~1.6GB）+ 潤飾 `Qwen2.5-7B 4bit`（~4.3GB），走 MLX/Metal，不需雲端 key。
+免費、系統級「按住說話放開貼字」，在任意 App 輸入框可用。
+STT `Breeze-ASR-25 MLX 4bit` 走本地 MLX/Metal；停止錄音後的語意重寫走 Vertex AI
+`gemini-3.8-flash`（只送文字草稿與游標周圍的有限上下文，不送音訊）。
 
 ## 已驗證（M4 Max 64GB, macOS 26.2）
 
-- `mlx-whisper` 1.6GB + `mlx-lm` 4.3GB 下載落地，`Metal.is_available() == True`
-- `say` 合成中文/英文 → `transcribe.py` → Qwen 潤飾，全鏈路通過：
-  - `呃 就是 那個 我昨天呃昨天去開會...101大樓` → `昨天開會，地點在101大樓的會議室。`
-  - `I want to schedule a meeting um tomorrow at 3pm actually make it 4pm` → `I want to schedule a meeting for 4 pm tomorrow.`（語言保持正確，不翻成中文）
-- 靜音幻覺已知：空錄音會產生假字串，已用 RMS 能量門控過濾
-- Swift Menu Bar App `swift build` 通過
+- Breeze ASR 走本地 MLX/Metal，並保留繁體正規化、靜音／幻覺門控
+- 受控文字測試走 Vertex AI `gemini-3.8-flash`：`會議公式` → `會議共識`，守門允許字典強制替換後才輸出
+- Swift Menu Bar App `./build.sh` 通過
 - 現場 `sounddevice` 錄音：輸入裝置**不寫死**——預設用系統預設輸入，可用 `--device`（索引或名稱子串）指定。兩台裝置不同（M4: `MixPre-6 II`；M2: `SOUNDPEATS POP Clip` 藍芽 / `BOYA mini 2`），以 `--list-devices` 查。
 
 ## M2 16GB 備註
 
-Qwen2.5-7B 4bit 約 4.3GB + Whisper 1.6GB = ~6GB，16GB 機型可直接跑，無需降至 3B。
+M2 仍然只在本地跑 ASR；重寫使用同一個雲端模型，所以不需要在 M2 上放 20GB 本地 LLM。
 
 ## 安裝
 
@@ -23,16 +21,19 @@ Qwen2.5-7B 4bit 約 4.3GB + Whisper 1.6GB = ~6GB，16GB 機型可直接跑，無
 brew install portaudio   # 已裝可略
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-# 模型首次自動下載到 ~/.cache/huggingface/hub（共 ~6GB）
+# ASR 權重會依 `VOICE_STT_REPO` 在首次轉寫時自動取得
 ```
 
 ## 命令列
 
 ```bash
-.venv/bin/python transcribe.py /tmp/test.wav              # 轉寫+潤飾
-.venv/bin/python transcribe.py /tmp/test.wav --no-polish  # 只看 STT raw
+.venv/bin/python transcribe.py /tmp/test.wav              # 轉寫+雲端重寫
+.venv/bin/python transcribe.py /tmp/test.wav --rewrite-backend rules  # 只做確定性標點
+.venv/bin/python transcribe.py /tmp/test.wav --rewrite-backend off    # 只看 STT raw
+.venv/bin/python transcribe.py /tmp/test.wav --context-json /tmp/context.json --terms-file ./rewrite_terms.json
 .venv/bin/python transcribe.py /tmp/test.wav --copy       # 進剪貼簿
 .venv/bin/python transcribe.py --record-seconds 5          # 現場錄 5 秒（系統預設輸入）
+.venv/bin/python -m unittest test_rewrite_cloud -v        # 雲端守門與協定測試
 .venv/bin/python transcribe.py --list-devices              # 列出可用輸入裝置
 .venv/bin/python transcribe.py --record-seconds 5 --device "BOYA"   # 指定裝置（索引或名稱子串）
 ```
@@ -49,14 +50,16 @@ open .build/release/VoiceInputMac.app
 `build.sh` 會在預設 SDK 被拒時自動改用較舊的 CLT SDK（見檔頭註解）。
 若 `swift build` 可用，也可沿用 `swift build -c release`。
 
-操作：`左 Cmd+E` 按一次開始錄音、再按一次結束並轉寫貼到當前游標（任意 App）。結果進剪貼簿並自動 `Cmd+V`，中文一律繁體。
+操作：`⌘E` 按一次開始錄音、再按一次結束並轉寫貼到當前游標（任意 App；左右 Cmd 都可）。結果進剪貼簿並自動 `Cmd+V`，中文一律繁體。
 
 ## 模型來源
 
-- STT: `mlx-community/whisper-large-v3-turbo`
-- 潤飾: `mlx-community/Qwen2.5-7B-Instruct-4bit`（中文能力與語言保持優於 Breeze v0.1 4bit MLX 社群版）
+- STT: 本地 `models/breeze-asr-25-mlx-4bit`
+- 重寫：Vertex AI `gemini-3.8-flash`，失敗時自動退回確定性規則標點
+- 個人專有名詞：`rewrite_terms.json`（未進版控；格式見 `rewrite_terms.example.json`）
+- 用後學習：貼上後約 20 秒，若你在同一欄位手動改字，會從那次修改推導窄範圍 `誤聽→正確` 映射並寫入本機詞庫。音訊不上傳，學習也不走雲端。
 
 ## 設計決策
 
-- Breeze 官方無 MLX 4bit，社群量化 `YouJun3627/Breeze-7B-Instruct-v0_1-4bit-mlx` 實測會把英文翻成中文、潤飾不穩；改用 Qwen2.5-7B-4bit。
+- 本地 7B 潤飾模型已移除；語意修正改走雲端 `gemini-3.8-flash`，失敗時退回確定性規則標點。
 - Whisper 靜音幻覺改用 RMS 能量門控過濾（`no_speech_threshold` 對 mlx-whisper 幻覺掩蓋無效）。
