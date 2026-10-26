@@ -191,9 +191,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let context = ContextCapture.capture()
                 Transcriber.log("[context] \(ContextCapture.describe(context))")
-                let (text, suspect) = try Transcriber.transcribe(
+                // Typeless 式定版：先貼規則版（快），雲端結果寫進這個檔再由 App 原地替換。
+                let refineURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("voice-refine-\(UUID().uuidString).json")
+                let (text, suspect, refinePending) = try Transcriber.transcribe(
                     wavURL: url,
-                    contextJSON: ContextCapture.encode(context)
+                    contextJSON: ContextCapture.encode(context),
+                    refinePath: refineURL.path
                 )
                 DispatchQueue.main.async {
                     Transcriber.log("[app] 結果（停止→文字 \(String(format: "%.2f", Date().timeIntervalSince(tStop)))s）：\(text)")
@@ -221,9 +225,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         DispatchQueue.global(qos: .userInitiated).async {
                             let originalField = ContextCapture.learningSnapshot()?["field_text"]
                             let inserted = Transcriber.insertText(text)
+                            var settled = inserted
+                            if refinePending {
+                                if let refined = Transcriber.awaitRefinement(refineURL, timeout: 10),
+                                   refined != inserted,
+                                   Transcriber.refineInsertedBlock(
+                                       originalField: originalField,
+                                       inserted: inserted,
+                                       refined: refined
+                                   ) {
+                                    settled = refined
+                                }
+                                try? FileManager.default.removeItem(at: refineURL)
+                            }
+                            // 用「定版後」的文字記帳，否則 20 秒後的比對會把定版本身
+                            // 當成使用者手改，學到錯誤的詞。
                             EditLearning.schedule(
                                 originalField: originalField,
-                                insertedText: inserted,
+                                insertedText: settled,
                                 context: context,
                                 termsFile: EditLearning.termsFileURL()
                             )

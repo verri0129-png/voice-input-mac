@@ -128,6 +128,48 @@ enum ContextCapture {
         ]
     }
 
+    /// Typeless 式定版用：回前景文字欄位的 element 與內容（與 learningSnapshot 同一套
+    /// 解析，但保留 element，才能把剛貼上的那一段選起來改寫）。
+    static func focusedTextField(
+        deadlineMilliseconds: Int = 500
+    ) -> (element: AXUIElement, text: String, role: String)? {
+        let deadline = Date().addingTimeInterval(Double(deadlineMilliseconds) / 1000.0)
+        guard AXIsProcessTrusted(),
+              let frontmost = NSWorkspace.shared.frontmostApplication,
+              let bundleID = frontmost.bundleIdentifier,
+              !(Bundle.main.bundleIdentifier.map { $0 == bundleID } ?? false),
+              !isSensitiveApp(bundleID) else {
+            return nil
+        }
+        let systemWide = AXUIElementCreateSystemWide()
+        guard let appElement: AXUIElement = withDeadline(150, deadline: deadline, work: {
+            copyElement(systemWide, kAXFocusedApplicationAttribute as CFString)
+        }), let fieldElement: AXUIElement = withDeadline(150, deadline: deadline, work: {
+            copyElement(appElement, kAXFocusedUIElementAttribute as CFString)
+        }), let role: String = withDeadline(100, deadline: deadline, work: {
+            copyAttribute(fieldElement, kAXRoleAttribute as CFString) as? String
+        }), textRoles.contains(role), !blockedRoles.contains(role) else {
+            return nil
+        }
+        guard let value = withDeadline(250, deadline: deadline, work: {
+            stringValue(copyAttribute(fieldElement, kAXValueAttribute as CFString))
+        }) else {
+            return nil
+        }
+        return (fieldElement, value, role)
+    }
+
+    /// 把焦點欄位的文字選取範圍移到 (location, length)；定版時要覆寫那一段。
+    static func selectFieldRange(_ element: AXUIElement, location: Int, length: Int) -> Bool {
+        var range = CFRange(location: location, length: length)
+        guard let value = AXValueCreate(.cfRange, &range) else { return false }
+        return AXUIElementSetAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            value
+        ) == .success
+    }
+
     static func capture(deadlineMilliseconds: Int = 800) -> [String: Any] {
         let started = Date()
         let deadline = started.addingTimeInterval(Double(deadlineMilliseconds) / 1000.0)

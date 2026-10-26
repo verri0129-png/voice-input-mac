@@ -17,6 +17,7 @@ import difflib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import unicodedata
@@ -57,6 +58,9 @@ class RewriteConfig:
     project: str = ""
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    # 思考階段會吃掉輸出預算並把單次呼叫拖到 10s 以上（實測：thoughts ~980/1024）。
+    # None = 不送 thinkingConfig；0 = 盡量關掉（這顆模型不一定聽話，所以還要看 finishReason）。
+    thinking_budget: int | None = 0
     adc_path: str = ""
     terms_file: str = "rewrite_terms.json"
     max_terms: int = DEFAULT_MAX_TERMS
@@ -202,22 +206,70 @@ def _insertion_block(original: str, current: str, inserted: str) -> tuple[int, i
     return start, end
 
 
+class _LearnSkip(Exception):
+    """Internal signal: why one manual edit could not become a term rule."""
+
+
+def _snapshot_shape(original: str, current: str) -> str:
+    limit = min(len(original), len(current))
+    prefix = 0
+    while prefix < limit and original[prefix] == current[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < limit - prefix
+        and original[len(original) - 1 - suffix] == current[len(current) - 1 - suffix]
+    ):
+        suffix += 1
+    return (
+        f"prefix={prefix} suffix={suffix} "
+        f"原欄多出={len(original) - prefix - suffix}字 "
+        f"現欄多出={len(current) - prefix - suffix}字"
+    )
+
+
 def infer_term_candidates(payload: dict) -> list[TermRule]:
-    """Infer one context-bound correction from a later manual edit."""
+    """Infer one context-bound correction from a later manual edit.
+
+    Every rejection explains itself on stderr, and the app logs that line:
+    a term that never appeared can then be traced to the guard that stopped
+    it instead of being guessed at.
+    """
+    try:
+        return _infer_term_candidates(payload)
+    except _LearnSkip as skip:
+        shape = " ".join(
+            f"{name}={len(normalize_edit_text(payload.get(key)))}字"
+            for name, key in (
+                ("original", "original_field"),
+                ("current", "current_field"),
+                ("inserted", "inserted_text"),
+                ("before", "text_before"),
+                ("after", "text_after"),
+            )
+        )
+        print(f"[learn] 略過：{skip}（{shape}）", file=sys.stderr)
+        return []
+
+
+def _infer_term_candidates(payload: dict) -> list[TermRule]:
     original = normalize_edit_text(payload.get("original_field"))
     current = normalize_edit_text(payload.get("current_field"))
     inserted = normalize_edit_text(payload.get("inserted_text"))
     before = normalize_edit_text(payload.get("text_before"))
     after = normalize_edit_text(payload.get("text_after"))
     if not current or not inserted or original == current:
-        return []
+        raise _LearnSkip("欄位或注入文字是空的，或者欄位跟貼上時一模一樣（沒有手動修改）")
     span = _insertion_block(original, current, inserted)
     if span is not None:
         index = span[0]
     else:
         index = _insertion_index(original, before, after)
         if index is None:
-            return []
+            raise _LearnSkip(
+                "找不到貼上的那一段：欄位快照 diff 對不上，游標前後文也不能當備援"
+                f"（{_snapshot_shape(original, current)}）"
+            )
     insert_end = index + len(inserted)
     expected = original[:index] + inserted + original[index:]
     if expected == current:
@@ -663,6 +715,16 @@ def _response_text(payload: dict) -> str:
     return text
 
 
+def _finish_reason(payload: dict) -> str:
+    """First candidate's finishReason ("STOP", "MAX_TOKENS", ...); "" when absent."""
+    if not isinstance(payload, dict):
+        return ""
+    candidates = payload.get("candidates") or []
+    if not candidates or not isinstance(candidates[0], dict):
+        return ""
+    return str(candidates[0].get("finishReason") or "").upper()
+
+
 def _declared_replacements(terms: list[TermRule]) -> list[tuple[str, str]]:
     replacements: list[tuple[str, str]] = []
     for rule in terms:
@@ -825,13 +887,16 @@ def rewrite_draft(
         f"{active.location}/publishers/google/models/"
         f"{urllib.parse.quote(active.model, safe='')}:generateContent"
     )
+    generation: dict = {
+        "temperature": 0,
+        "maxOutputTokens": max(256, active.max_output_tokens),
+    }
+    if active.thinking_budget is not None:
+        generation["thinkingConfig"] = {"thinkingBudget": int(active.thinking_budget)}
     payload = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": max(256, active.max_output_tokens),
-        },
+        "generationConfig": generation,
     }
     poster = transport or _post_json
     response = poster(
@@ -840,6 +905,16 @@ def rewrite_draft(
         payload,
         active.timeout_seconds,
     )
+    # 被 MAX_TOKENS 砍掉的輸出是半句話。以前完全沒看 finishReason，半句話會直接
+    # 進守門、甚至被當成結果貼出去；現在一律視為失敗，交給呼叫端退回規則版。
+    finish_reason = _finish_reason(response)
+    if finish_reason == "MAX_TOKENS":
+        usage = response.get("usageMetadata") if isinstance(response, dict) else None
+        thoughts = int((usage or {}).get("thoughtsTokenCount", 0) or 0)
+        raise RuntimeError(
+            f"輸出被截斷（finish=MAX_TOKENS，思考吃掉 {thoughts} token；"
+            f"把 VOICE_CLOUD_MAX_OUTPUT_TOKENS 調高或關掉思考）"
+        )
     text = _response_text(response)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     usage = response.get("usageMetadata") if isinstance(response, dict) else None

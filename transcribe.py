@@ -1,5 +1,5 @@
 """Pipe: record or file -> local Breeze ASR -> cloud rewrite -> clipboard or stdout."""
-import argparse, subprocess, sys, tempfile, os, time, re, unicodedata, json
+import argparse, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
 from pathlib import Path
 
 from rewrite_cloud import (
@@ -60,9 +60,18 @@ REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")
 CLOUD_REWRITE_MODEL = _setting("VOICE_CLOUD_REWRITE_MODEL", "gemini-3.8-flash")
 CLOUD_REWRITE_LOCATION = _setting("VOICE_CLOUD_REWRITE_LOCATION", "global")
 CLOUD_REWRITE_PROJECT = _setting("VOICE_CLOUD_REWRITE_PROJECT", "")
-CLOUD_REWRITE_TIMEOUT = float(_setting("VOICE_CLOUD_REWRITE_TIMEOUT", "20"))
+CLOUD_REWRITE_TIMEOUT = float(_setting("VOICE_CLOUD_REWRITE_TIMEOUT", "8"))
 CLOUD_REWRITE_MAX_OUTPUT_TOKENS = int(_setting("VOICE_CLOUD_REWRITE_MAX_OUTPUT_TOKENS", "1024"))
 CLOUD_REWRITE_MAX_TERMS = int(_setting("VOICE_CLOUD_REWRITE_MAX_TERMS", "60"))
+# 思考階段是延遲的主要來源（實測 thoughts 325–980 token）。0 = 盡量關掉；
+# 設成 none 則完全不送 thinkingConfig。這顆模型不一定聽話，finishReason 仍會檢查。
+_RAW_THINKING = _setting("VOICE_CLOUD_THINKING_BUDGET", "0").strip().lower()
+CLOUD_REWRITE_THINKING = (
+    None if _RAW_THINKING in ("none", "off", "") else int(_RAW_THINKING)
+)
+# Typeless 式定版：先貼規則版，雲端在背景重寫，完成後由 App 原地替換。
+# 這是「貼上之後最多等多久才定版」的上限，不再擋住貼字。
+REFINE_WAIT_SECONDS = float(_setting("VOICE_REFINE_WAIT", "8"))
 REWRITE_TERMS_FILE = _setting(
     "VOICE_REWRITE_TERMS_FILE", str(Path(__file__).with_name("rewrite_terms.json"))
 )
@@ -514,6 +523,7 @@ def rewrite_settings(
     cloud_timeout: float | None = None,
     cloud_max_output_tokens: int | None = None,
     cloud_max_terms: int | None = None,
+    cloud_thinking_budget: int | str | None = None,
 ) -> RewriteConfig:
     return RewriteConfig(
         backend=(backend or REWRITE_BACKEND or "cloud").strip().lower(),
@@ -528,6 +538,11 @@ def rewrite_settings(
         ),
         terms_file=(terms_file or REWRITE_TERMS_FILE).strip(),
         max_terms=int(cloud_max_terms if cloud_max_terms is not None else CLOUD_REWRITE_MAX_TERMS),
+        thinking_budget=(
+            CLOUD_REWRITE_THINKING
+            if cloud_thinking_budget is None
+            else (None if cloud_thinking_budget == "none" else int(cloud_thinking_budget))
+        ),
     )
 
 
@@ -623,7 +638,7 @@ def resolve_input_device(spec):
         raise SystemExit(f"[rec] no input device matching '{spec}'")
     return hits[0][0]
 
-def parse_serve_request(line: str) -> tuple[str, dict]:
+def parse_serve_request(line: str) -> tuple[str, dict, str | None]:
     """Parse one warm-server request.
 
     Backward-compatible inputs:
@@ -631,7 +646,7 @@ def parse_serve_request(line: str) -> tuple[str, dict]:
       partial /path/to.wav
       __quit__
     Typeless-style inputs:
-      {"wav": "/path/to.wav", "context": {...}}
+      {"wav": "/path/to.wav", "context": {...}, "refine": "/tmp/refine.json"}
     """
     text = line.strip()
     if text.startswith("{"):
@@ -646,8 +661,11 @@ def parse_serve_request(line: str) -> tuple[str, dict]:
         context = payload.get("context")
         if context is not None and not isinstance(context, dict):
             raise ValueError("context 必須是物件")
-        return payload["wav"], context or {}
-    return text, {}
+        refine = payload.get("refine")
+        if refine is not None and not isinstance(refine, str):
+            raise ValueError("refine 必須是檔案路徑字串")
+        return payload["wav"], context or {}, refine or None
+    return text, {}, None
 
 
 def process_wav_file(
@@ -657,6 +675,7 @@ def process_wav_file(
     label="",
     context=None,
     config=None,
+    refine_path=None,
 ):
     """單檔處理（一次性 CLI 與 --serve 共用）。
 
@@ -664,6 +683,10 @@ def process_wav_file(
       ok      = 可以貼上
       suspect = exit 4：有文字但疑似不是語音 → app 不自動貼、保留文字
       silence = exit 3：沒有可用語音
+
+    refine_path 給定時走 Typeless 式「先貼再定版」：這裡只做規則標點就回傳，
+    雲端重寫丟到背景執行緒，完成後把定版文字寫進 refine_path，由 App 原地替換。
+    這樣單次雲端呼叫的 2–20 秒不會擋在「停止錄音→看到文字」之間。
     """
     a = wav_samples(path)
     if a is not None and is_silence(a):
@@ -682,7 +705,21 @@ def process_wav_file(
         print("[stt] 沒有辨識到內容（靜音，或麥克風根本沒收到訊號）", file=sys.stderr)
     print(f"[raw] {raw}", file=sys.stderr)
     print(f"[raw-tw] {to_taiwan_traditional(raw)}", file=sys.stderr)
-    final, rewrite = apply_rewrite(raw, enabled=polish, context=context, config=config)
+    settings = config or rewrite_settings()
+    defer_cloud = bool(
+        refine_path
+        and polish
+        and raw
+        and settings.backend not in ("off", "none", "raw", "rules", "local")
+    )
+    if defer_cloud:
+        final, rewrite = apply_rewrite(raw, enabled=True, backend="rules", context=context)
+        rewrite["backend"] = "rules-first"
+        rewrite["refine_pending"] = True
+        print(f"[rewrite] 先貼規則版，雲端在背景重寫（完成後原地定版，最多等 "
+              f"{REFINE_WAIT_SECONDS:.0f}s）", file=sys.stderr)
+    else:
+        final, rewrite = apply_rewrite(raw, enabled=polish, context=context, config=config)
     # 模型或規則可能把英文/數字兩側的空格加回來 → 最終文字再正規化一次
     final = normalize_spacing(final)
     # final hard guarantee: any remaining simplified -> Taiwan traditional
@@ -695,7 +732,89 @@ def process_wav_file(
         print(f"[suspect] 疑似不是語音（{len(votes)} 票：" + "；".join(votes) +
               "）→ 不自動貼上（文字仍在 stdout，可用選單手動貼）", file=sys.stderr)
         return {"status": "suspect", "text": final, "rewrite": rewrite}
+    if defer_cloud:
+        start_refinement(raw, context, settings, refine_path, final)
+        return {"status": "ok", "text": final, "rewrite": rewrite, "refine_pending": True}
     return {"status": "ok", "text": final, "rewrite": rewrite}
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    """原子寫檔：App 端可能正在輪詢，不能讓它讀到半個 JSON。"""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _settle_text(value: str) -> str:
+    """雲端結果的收尾：與 apply_rewrite 成功路徑、process_wav_file 完全相同的鏈。"""
+    text = finalize_punctuation(to_taiwan_traditional(normalize_spacing(value)))
+    return to_taiwan_traditional(normalize_spacing(text))
+
+
+def refine_in_background(raw, context, settings, refine_path, pasted_text):
+    """跑雲端重寫並把定版文字寫進 refine_path（在背景執行緒裡跑）。"""
+    started = time.perf_counter()
+    try:
+        clean_context = sanitize_context(context)
+        rules = load_term_rules(settings.terms_file)
+        result = rewrite_draft(
+            raw,
+            context=clean_context,
+            terms=rules,
+            config=settings,
+            allowed_deletions=_allowed_rewrite_deletions(),
+        )
+        text = _settle_text(result.text)
+        if not text:
+            payload = {"ok": False, "reason": "雲端回空字串"}
+        elif text == pasted_text:
+            payload = {"ok": True, "text": text, "reason": result.reason,
+                       "milliseconds": result.milliseconds, "same_as_pasted": True}
+        elif is_fabrication(raw, text):
+            payload = {"ok": False, "reason": f"定版文字疑似幻覺（{is_fabrication(raw, text)}）"}
+        else:
+            payload = {
+                "ok": True,
+                "text": text,
+                "reason": result.reason,
+                "milliseconds": result.milliseconds,
+                "changed_chars": result.changed_chars,
+                "same_as_pasted": False,
+            }
+    except Exception as exc:  # noqa: BLE001 - 定版失敗就保留規則版，不能影響已貼上的字
+        payload = {"ok": False, "reason": str(exc)[:300]}
+    payload["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+    try:
+        _write_json_atomic(refine_path, payload)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[refine] 寫入精修檔失敗：{exc!r}", file=sys.stderr)
+        return
+    print(
+        f"[refine] 定版 {'成功' if payload.get('ok') else '放棄'} {payload['elapsed_ms']}ms "
+        f"{payload.get('reason', '')[:120]}",
+        file=sys.stderr,
+    )
+
+
+def start_refinement(raw, context, settings, refine_path, pasted_text):
+    """把雲端重寫丟到背景；不 join，貼字不等它。"""
+    worker = threading.Thread(
+        target=refine_in_background,
+        args=(raw, context, settings, refine_path, pasted_text),
+        name="voice-refine",
+        daemon=True,
+    )
+    worker.start()
+    return worker
 
 def partial_text(path, language="zh"):
     """錄音中「即時預覽」用：Whisper ＋ 繁化，**不潤飾**。
@@ -845,7 +964,7 @@ def serve_forever(language="zh", polish=True, config=None):
             print(f"[partial] 偵測到完整請求在排隊 → 丢掉 {len(queued) - len(fulls)} 個過期預覽、"
                   f"跳過 {len(fulls) - 1} 個過期完整請求，直接處理最後一個", file=sys.stderr)
         try:
-            request_path, request_context = parse_serve_request(req)
+            request_path, request_context, request_refine = parse_serve_request(req)
             r = process_wav_file(
                 request_path,
                 language=language,
@@ -853,6 +972,7 @@ def serve_forever(language="zh", polish=True, config=None):
                 label="[serve]",
                 context=request_context,
                 config=active,
+                refine_path=request_refine,
             )
         except ValueError as e:
             r = {"status": "error", "text": "", "detail": str(e)}
@@ -911,6 +1031,8 @@ def main():
     ap.add_argument("--cloud-timeout", type=float, default=None)
     ap.add_argument("--cloud-max-output-tokens", type=int, default=None)
     ap.add_argument("--cloud-max-terms", type=int, default=None)
+    ap.add_argument("--cloud-thinking-budget", type=int, default=None,
+                    help="思考 token 上限（0 = 盡量關掉，預設）；-1 = 不送 thinkingConfig")
     ap.add_argument("--language", default="zh", help="zh / en / auto (empty for auto-detect)")
     ap.add_argument("--record-seconds", type=float, default=5)
     ap.add_argument("--device", default=None, help="input device: index or name substring (default: VOICE_INPUT_DEVICE from local.env, else system default). Not hardcoded — M4/M2 devices differ.")
@@ -933,6 +1055,9 @@ def main():
         cloud_timeout=args.cloud_timeout,
         cloud_max_output_tokens=args.cloud_max_output_tokens,
         cloud_max_terms=args.cloud_max_terms,
+        cloud_thinking_budget=(
+            "none" if args.cloud_thinking_budget == -1 else args.cloud_thinking_budget
+        ),
     )
     context = load_request_context(args.context_json)
 

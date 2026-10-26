@@ -61,5 +61,9 @@ open .build/release/VoiceInputMac.app
 
 ## 設計決策
 
-- 本地 7B 潤飾模型已移除；語意修正改走雲端 `gemini-3.8-flash`，失敗時退回確定性規則標點。
+- 本地 7B 潤飾模型已移除；語意修正改走雲端 `gemini-3.8-flash`。
+- **先貼再定版（Typeless 式）**：停止錄音後先貼「規則標點版」（實測 0.5–1.5s），雲端重寫在背景執行緒跑，完成後由 App 把剛貼的那一段原地換成定版（約 3–5s）。雲端失敗／逾時就保留已貼上的規則版，使用者永遠不用等雲端。
+  - 原地替換有守門：欄位去掉那段之後必須仍等於貼上前的內容（代表你還沒手動改字），而且那段在欄位裡只能出現一次；不成立就不動手。
+  - 定版完成後才排用後學習，並以定版文字記帳，避免把定版本身學成使用者的手改。
+- 思考階段是延遲主因（實測 thoughts 325–980 token、單次 2–13s，長句會吃掉輸出預算而 `finish=MAX_TOKENS` 截斷）。預設送 `thinkingConfig.thinkingBudget=0`，並把 `MAX_TOKENS` 視為失敗。
 - Whisper 靜音幻覺改用 RMS 能量門控過濾（`no_speech_threshold` 對 mlx-whisper 幻覺掩蓋無效）。

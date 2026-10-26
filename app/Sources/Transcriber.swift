@@ -225,13 +225,16 @@ enum Transcriber {
 
     /// 暖機路徑。回傳 nil = 這條路不能走（呼叫端退回一次性）。
     /// 沒有可用語音一樣用 throw code 3 表示（與一次性路徑的 exit 3 同語意）。
-    private static func transcribeWarm(wavURL: URL, contextJSON: String? = nil) throws -> (text: String, suspect: Bool)? {
+    private static func transcribeWarm(wavURL: URL, contextJSON: String? = nil,
+                                       refinePath: String? = nil) throws -> (text: String, suspect: Bool, refinePending: Bool)? {
         var payload: [String: Any] = ["wav": wavURL.path]
         if let contextJSON,
            let data = contextJSON.data(using: .utf8),
            let context = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             payload["context"] = context
         }
+        // Typeless 式定版：告訴 Python 把雲端結果寫到這個檔，貼字不等它。
+        if let refinePath { payload["refine"] = refinePath }
         guard let requestData = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let request = String(data: requestData, encoding: .utf8),
               let raw = serverRequest(request, timeout: 60) else { return nil }
@@ -242,10 +245,11 @@ enum Transcriber {
         }
         let status = (obj["status"] as? String) ?? "error"
         let text = ((obj["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        Transcriber.log("[serve] status=\(status) 文字=\(text)")
+        let refinePending = (obj["refine_pending"] as? Bool) ?? false
+        Transcriber.log("[serve] status=\(status) 文字=\(text)" + (refinePending ? "（等定版）" : ""))
         switch status {
-        case "ok":      return (text, false)
-        case "suspect": return (text, true)
+        case "ok":      return (text, false, refinePending)
+        case "suspect": return (text, true, false)
         case "silence": throw NSError(domain: "Transcriber", code: 3,
                                       userInfo: [NSLocalizedDescriptionKey: "沒有可用語音"])
         default:        return nil   // error → 退回一次性路徑（那條路徑的診斷比較完整）
@@ -253,11 +257,94 @@ enum Transcriber {
     }
 
     /// 對外入口：先走暖機路徑（快），不行才退回一次性路徑（慢但一定通）。
-    static func transcribe(wavURL: URL, contextJSON: String? = nil) throws -> (text: String, suspect: Bool) {
-        if let r = try transcribeWarm(wavURL: wavURL, contextJSON: contextJSON) {
+    static func transcribe(wavURL: URL, contextJSON: String? = nil,
+                           refinePath: String? = nil) throws -> (text: String, suspect: Bool, refinePending: Bool) {
+        if let r = try transcribeWarm(wavURL: wavURL, contextJSON: contextJSON,
+                                      refinePath: refinePath) {
             return r
         }
-        return try transcribeOneShot(wavURL: wavURL, contextJSON: contextJSON)
+        let (text, suspect) = try transcribeOneShot(wavURL: wavURL, contextJSON: contextJSON)
+        return (text, suspect, false)   // 一次性路徑不走定版（那條路徑沒有回應通道）
+    }
+
+    /// 等 Python 背景把定版文字寫進 refine 檔（Typeless 式）。
+    /// 回傳定版文字；逾時、失敗、ok=false 一律回 nil（呼叫端就保留已貼上的規則版）。
+    static func awaitRefinement(_ url: URL, timeout: TimeInterval) -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let data = try? Data(contentsOf: url),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let reason = (obj["reason"] as? String) ?? "未載明"
+                if (obj["ok"] as? Bool) == true,
+                   let text = obj["text"] as? String, !text.isEmpty {
+                    log("[refine] 收到定版（\(reason)）")
+                    return text
+                }
+                log("[refine] 雲端放棄定版：\(reason)")
+                return nil
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        log("[refine] 等 \(String(format: "%.1f", timeout))s 沒等到定版 → 保留規則版")
+        return nil
+    }
+
+    /// 原地定版：把剛注入的那一段換成雲端版本。
+    /// 只有在「欄位去掉那段之後仍等於貼上前的內容」時才動手 —— 你已經改過字就不碰。
+    @discardableResult
+    static func refineInsertedBlock(
+        originalField: String?,
+        inserted: String,
+        refined: String
+    ) -> Bool {
+        guard let originalField, !inserted.isEmpty, !refined.isEmpty, inserted != refined else {
+            if originalField == nil {
+                log("[refine] 不動手：貼上前抓不到欄位快照（無法確認你有沒有改過字）")
+            }
+            return false
+        }
+        guard let field = ContextCapture.focusedTextField() else {
+            log("[refine] 不動手：讀不到前景文字欄位")
+            return false
+        }
+        let current = field.text as NSString
+        let first = current.range(of: inserted)
+        guard first.location != NSNotFound else {
+            log("[refine] 不動手：欄位裡找不到剛貼上的那段")
+            return false
+        }
+        // 必須唯一出現，否則可能換錯位置（同一個詞在一段文字裡重複很常見）
+        let searchStart = first.location + max(1, first.length)
+        if searchStart < current.length,
+           current.range(
+               of: inserted, options: [],
+               range: NSRange(location: searchStart, length: current.length - searchStart)
+           ).location != NSNotFound {
+            log("[refine] 不動手：剛貼上的那段在欄位裡出現多次")
+            return false
+        }
+        // 欄位其餘部分必須與貼上前一模一樣（代表使用者還沒手動改字）
+        let stripped = current.replacingCharacters(in: first, with: "")
+        guard stripped == originalField else {
+            log("[refine] 不動手：欄位已被改動（現 \(current.length) 字、貼上前 \(originalField.count) 字）")
+            return false
+        }
+        guard ContextCapture.selectFieldRange(field.element, location: first.location, length: first.length) else {
+            log("[refine] 不動手：這個 App 不支援 AX 選取，無法原地替換")
+            return false
+        }
+        _ = insertText(refined)
+        let expected = current.replacingCharacters(in: first, with: refined)
+        guard let readback = ContextCapture.focusedTextField()?.text else {
+            log("[refine] 定版後讀不回欄位，無法確認是否成功")
+            return false
+        }
+        guard readback == expected else {
+            log("[refine] 定版後回讀不符（預期 \(expected.count) 字、實際 \(readback.count) 字）")
+            return false
+        }
+        log("[refine] ✅ 原地定版（\(inserted.count) → \(refined.count) 字）")
+        return true
     }
 
     /// 錄音中的即時預覽（partial 請求）。只走暖機路徑：沒有暖機程序就沒有預覽 ——

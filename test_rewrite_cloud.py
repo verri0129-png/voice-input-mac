@@ -290,14 +290,21 @@ class RewriteCloudTests(unittest.TestCase):
         )
 
     def test_parse_serve_request_supports_plain_and_context_forms(self):
-        path, context = transcribe.parse_serve_request("/tmp/a.wav")
-        self.assertEqual((path, context), ("/tmp/a.wav", {}))
-        path, context = transcribe.parse_serve_request(
+        path, context, refine = transcribe.parse_serve_request("/tmp/a.wav")
+        self.assertEqual((path, context, refine), ("/tmp/a.wav", {}, None))
+        path, context, refine = transcribe.parse_serve_request(
             json.dumps({"wav": "/tmp/b.wav", "context": {"app_name": "Slack"}})
         )
-        self.assertEqual((path, context), ("/tmp/b.wav", {"app_name": "Slack"}))
+        self.assertEqual((path, context, refine), ("/tmp/b.wav", {"app_name": "Slack"}, None))
+        # Typeless 式定版：多一個 refine 檔案路徑
+        path, context, refine = transcribe.parse_serve_request(
+            json.dumps({"wav": "/tmp/c.wav", "refine": "/tmp/refine.json"})
+        )
+        self.assertEqual((path, context, refine), ("/tmp/c.wav", {}, "/tmp/refine.json"))
         with self.assertRaises(ValueError):
             transcribe.parse_serve_request('{"wav": 1}')
+        with self.assertRaises(ValueError):
+            transcribe.parse_serve_request(json.dumps({"wav": "/tmp/d.wav", "refine": 3}))
 
 
 if __name__ == "__main__":
