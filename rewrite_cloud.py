@@ -36,6 +36,10 @@ DEFAULT_MAX_TERMS = 60
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_OUTPUT_TOKENS = 1024
 MAX_CHANGED_RATIO = 0.25
+# 用後學習的門檻：中文逐字修正最多 2 個字；英文專有名詞允許整詞替換
+# （含長度改變，例如 Sony → Sonia），但一次只能換一個詞、且不得超長。
+MAX_LEARN_CHANGED_CHARS = 2
+MAX_LEARN_WORD_CHARS = 16
 
 _TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 
@@ -92,9 +96,35 @@ def _content_chars(value: str) -> str:
     return "".join(out)
 
 
+PROTECTED_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[._\-/][A-Za-z0-9]+)*")
+
+
 def _protected_spans(value: str) -> list[str]:
     """Identifiers, model numbers, dates, URLs and other ASCII tokens, in order."""
-    return re.findall(r"[A-Za-z0-9]+(?:[._\-/][A-Za-z0-9]+)*", value)
+    return PROTECTED_TOKEN_RE.findall(value)
+
+
+WORD_FRAGMENT_RE = re.compile(r"^[A-Za-z]+(?:['\-][A-Za-z]+)*$")
+
+
+def _is_word_swap(source: str, revised: str) -> bool:
+    """True when a manual edit replaced one English word (or a fragment of it).
+
+    Users fix English names by hand far more often than Chinese characters
+    (Sony → Sonia, Sketcher → Skecher), and those edits change the token and
+    its length.  Only letters are allowed here: digits, symbols and mixed
+    content still have to keep their exact shape.
+    """
+    return bool(WORD_FRAGMENT_RE.match(source)) and bool(WORD_FRAGMENT_RE.match(revised))
+
+
+def _word_bounds(text: str, start: int, end: int, low: int, high: int) -> tuple[int, int]:
+    """Widen [start, end) to the whole ASCII word it belongs to, within [low, high)."""
+    while start > low and text[start - 1].isascii() and text[start - 1].isalpha():
+        start -= 1
+    while end < high and text[end].isascii() and text[end].isalpha():
+        end += 1
+    return start, end
 
 
 def _collapse_whitespace(value: str) -> str:
@@ -195,7 +225,9 @@ def infer_term_candidates(payload: dict) -> list[TermRule]:
 
     matcher = difflib.SequenceMatcher(None, expected, current, autojunk=False)
     candidates: list[TermRule] = []
-    changed = 0
+    char_changed = 0
+    word_changed = 0
+    word_swaps = 0
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if i2 <= index or i1 >= insert_end:
             continue
@@ -203,7 +235,6 @@ def infer_term_candidates(payload: dict) -> list[TermRule]:
             continue
         if i1 < index or i2 > insert_end:
             return []
-        changed += max(i2 - i1, j2 - j1)
         source = expected[i1:i2]
         revised = current[j1:j2]
         if tag == "insert":
@@ -214,16 +245,30 @@ def infer_term_candidates(payload: dict) -> list[TermRule]:
             if _content_chars(source):
                 return []
             continue
-        if (i2 - i1) != (j2 - j1):
+        word_swap = _is_word_swap(source, revised)
+        if (i2 - i1) != (j2 - j1) and not word_swap:
             return []
         if _content_chars(source) == _content_chars(revised):
             continue
-        if _protected_spans(source) != _protected_spans(revised):
+        if _protected_spans(source) != _protected_spans(revised) and not word_swap:
             return []
-        start = max(index, i1 - 2)
-        end = min(insert_end, i2 + 2)
-        source_phrase = expected[start:end]
-        revised_phrase = current[start:end]
+        if word_swap:
+            word_swaps += 1
+            word_changed += max(i2 - i1, j2 - j1)
+            source_start, source_end = _word_bounds(expected, i1, i2, index, insert_end)
+            revised_start, revised_end = _word_bounds(current, j1, j2, 0, len(current))
+            start = max(index, source_start - 2)
+            end = min(insert_end, source_end + 2)
+            source_phrase = expected[start:end]
+            revised_phrase = current[
+                max(0, revised_start - (source_start - start)) : revised_end + (end - source_end)
+            ]
+        else:
+            char_changed += max(i2 - i1, j2 - j1)
+            start = max(index, i1 - 2)
+            end = min(insert_end, i2 + 2)
+            source_phrase = expected[start:end]
+            revised_phrase = current[(start + j1 - i1) : (end + j2 - i2)]
         if (
             len(source_phrase) < 2
             or len(source_phrase) > 16
@@ -233,7 +278,9 @@ def infer_term_candidates(payload: dict) -> list[TermRule]:
         candidates.append(TermRule(text=revised_phrase, variants=(source_phrase,)))
     if not candidates:
         return []
-    if changed > 2:
+    if char_changed > MAX_LEARN_CHANGED_CHARS:
+        return []
+    if word_swaps > 1 or word_changed > MAX_LEARN_WORD_CHARS:
         return []
     return candidates
 
@@ -476,6 +523,8 @@ def build_prompt(draft: str, context: dict, terms: list[TermRule]) -> tuple[str,
         "4. 依語意補上正確的中文標點。",
         "嚴格禁止改寫句子、調整語序、翻譯、摘要、舉例、補充背景、",
         "增刪數字、英文代號、日期、網址，也不要把上下文裡的字塞進逐字稿。",
+        "英文廠商名、英文人名與英文代號一律原樣輸出，即使你覺得拼法有誤"
+        "（例如 Sketcher 不可以寫成 Skechers、nvy 不可以寫成 NVY）。",
         "不確定就保留原文用字。只輸出修正後的整段文字，不要解釋或加引號。",
     ]
     if _clean_text(clean_context.get("app_name")):
@@ -638,6 +687,68 @@ def _describe_protected_change(draft: str, candidate: str) -> str:
     return ""
 
 
+def validate_and_repair_rewrite(
+    draft: str,
+    candidate: str,
+    *,
+    allowed_deletions: set[str] | frozenset[str] = frozenset(),
+    declared_terms: list[TermRule] | tuple[TermRule, ...] = (),
+) -> tuple[bool, str, int, str]:
+    """Validate, but put identifiers back instead of dropping the whole rewrite.
+
+    Dropping a 100-character rewrite because the model "corrected" Sketcher to
+    Skechers costs the user several seconds and gains nothing.  Stricter still:
+    when the token sequences cannot be aligned, reject as before.
+
+    Returns (ok, reason, changed_chars, text_to_use).
+    """
+    repaired = candidate
+    fixes: list[tuple[str, str]] = []
+    if _protected_spans(canonical_draft(draft)) != _protected_spans(canonical_draft(candidate)):
+        repaired, maybe_fixes = _repair_protected_tokens(canonical_draft(draft), candidate)
+        if maybe_fixes is None:
+            detail = _describe_protected_change(draft, candidate)
+            return False, f"英文代號或數字被改動且無法對齊（{detail}）", 0, candidate
+        fixes = maybe_fixes
+    ok, reason, changed = validate_rewrite(
+        draft,
+        repaired,
+        allowed_deletions=allowed_deletions,
+        declared_terms=declared_terms,
+    )
+    if ok and fixes:
+        detail = "、".join(f"{current}→{original}" for current, original in fixes[:3])
+        reason = f"{reason}；代號已還原（{detail}）"
+    return ok, reason, changed, repaired
+
+
+def _repair_protected_tokens(draft: str, candidate: str) -> tuple[str, list[tuple[str, str]] | None]:
+    """Restore each identifier/number to the way the draft said it.
+
+    Returns (repaired_text, fixes); fixes is None when the two texts do not
+    carry the same tokens in the same order, i.e. the model restructured the
+    sentence and the rewrite must be rejected.
+    """
+    original_tokens = _protected_spans(draft)
+    matches = list(PROTECTED_TOKEN_RE.finditer(candidate))
+    if len(original_tokens) != len(matches):
+        return candidate, None
+    pieces: list[str] = []
+    fixes: list[tuple[str, str]] = []
+    cursor = 0
+    for match, original_token in zip(matches, original_tokens):
+        pieces.append(candidate[cursor:match.start()])
+        token = match.group(0)
+        if token == original_token:
+            pieces.append(token)
+        else:
+            pieces.append(original_token)
+            fixes.append((token, original_token))
+        cursor = match.end()
+    pieces.append(candidate[cursor:])
+    return "".join(pieces), fixes
+
+
 def validate_rewrite(
     draft: str,
     candidate: str,
@@ -734,7 +845,7 @@ def rewrite_draft(
     usage = response.get("usageMetadata") if isinstance(response, dict) else None
     input_tokens = int((usage or {}).get("promptTokenCount", 0) or 0)
     output_tokens = int((usage or {}).get("candidatesTokenCount", 0) or 0)
-    ok, reason, changed = validate_rewrite(
+    ok, reason, changed, final_text = validate_and_repair_rewrite(
         draft,
         text,
         allowed_deletions=allowed_deletions,
@@ -744,7 +855,7 @@ def rewrite_draft(
     if not ok:
         raise RuntimeError(reason)
     return RewriteResult(
-        text=text,
+        text=final_text,
         backend=f"cloud:{active.model}",
         changed_chars=changed,
         checked_chars=checked,

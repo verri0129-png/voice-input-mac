@@ -188,6 +188,48 @@ class RewriteCloudTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("nvy → NVY", reason)
 
+    def test_learned_edit_allows_english_word_swap(self):
+        # A1：英文專有名詞的修正（含長度改變）要學得到，例如 Sony → Sonia。
+        inserted = "Sony在10月26號早上也通知生產要把那29卷的C級布自己挑片出來用"
+        payload = {
+            "original_field": "備忘錄",
+            "inserted_text": inserted,
+            "text_before": "備忘錄",
+            "text_after": "",
+            "current_field": "備忘錄" + inserted.replace("Sony", "Sonia"),
+        }
+        candidates = transcribe.infer_term_candidates(payload)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("Sonia", candidates[0].text)
+        self.assertIn("Sony", candidates[0].variants[0])
+
+    def test_learned_edit_still_rejects_digit_changes(self):
+        inserted = "29卷的C級布"
+        payload = {
+            "original_field": "備忘錄",
+            "inserted_text": inserted,
+            "text_before": "備忘錄",
+            "text_after": "",
+            "current_field": "備忘錄" + inserted.replace("29", "39"),
+        }
+        self.assertEqual(transcribe.infer_term_candidates(payload), [])
+
+    def test_rewrite_repairs_disturbed_identifier(self):
+        draft = "Sketcher的Barry要求工廠把29卷C級布挑出來用"
+        candidate = "Sketcher的Barry要求工廠把29捲C級布挑出來用".replace("Sketcher", "Skechers")
+        ok, reason, _, text = rewrite_cloud.validate_and_repair_rewrite(draft, candidate)
+        self.assertTrue(ok, reason)
+        self.assertIn("Sketcher", text)
+        self.assertNotIn("Skechers", text)
+        self.assertIn("代號已還原", reason)
+
+    def test_rewrite_rejects_when_identifiers_cannot_be_aligned(self):
+        draft = "Sketcher要求工廠挑布"
+        candidate = "Sketcher與Barry要求工廠挑布"
+        ok, reason, _, _ = rewrite_cloud.validate_and_repair_rewrite(draft, candidate)
+        self.assertFalse(ok)
+        self.assertIn("無法對齊", reason)
+
     def test_learned_edit_merges_into_personal_terms(self):
         with tempfile.TemporaryDirectory() as tmp:
             terms_path = Path(tmp) / "terms.json"
