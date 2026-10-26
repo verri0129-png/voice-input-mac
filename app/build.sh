@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 OUT=".build/release"
 mkdir -p "$OUT"
-SOURCES=(Sources/App.swift Sources/Recorder.swift Sources/Transcriber.swift Sources/RecordingIndicator.swift)
+SOURCES=(Sources/App.swift Sources/Recorder.swift Sources/ContextCapture.swift Sources/EditLearning.swift Sources/Transcriber.swift Sources/RecordingIndicator.swift)
 
 # Candidate SDKs: default first, then older CLT SDKs as fallback.
 SDKS=("$(xcrun --show-sdk-path 2>/dev/null || echo /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk)")
@@ -24,7 +24,7 @@ built=0
 for sdk in "${SDKS[@]}"; do
   [ -d "$sdk" ] || continue
   if swiftc -sdk "$sdk" -O \
-       -framework AppKit -framework AVFoundation -framework Carbon \
+       -framework AppKit -framework ApplicationServices -framework AVFoundation -framework Carbon \
        -o "$OUT/VoiceInputMac" "${SOURCES[@]}" 2>"$OUT/.build.err"; then
     echo "[build] compiled with SDK: $sdk"
     built=1

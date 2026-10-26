@@ -6,5 +6,6 @@ __pycache__/
 *.wav
 HANDOFF-*.md
 local.env
+rewrite_terms.json
 .run.log
 models/

@@ -1,6 +1,17 @@
-"""Pipe: record or file -> mlx-whisper -> qwen polish -> clipboard or stdout."""
-import argparse, subprocess, sys, tempfile, os, time, re, unicodedata
+"""Pipe: record or file -> local Breeze ASR -> cloud rewrite -> clipboard or stdout."""
+import argparse, subprocess, sys, tempfile, os, time, re, unicodedata, json
 from pathlib import Path
+
+from rewrite_cloud import (
+    RewriteConfig,
+    RewriteResult,
+    infer_term_candidates,
+    learn_insertion_edits,
+    load_term_rules,
+    merge_term_candidates,
+    rewrite_draft,
+    sanitize_context,
+)
 
 # Ensure Homebrew ffmpeg is found under non-interactive ssh (PATH is /usr/bin:/bin only)
 for _p in ("/opt/homebrew/bin", "/usr/local/bin"):
@@ -15,8 +26,10 @@ for _p in ("/opt/homebrew/bin", "/usr/local/bin"):
 # of the same names). Never copy local.env between machines.
 #
 #   local.env example:
-#       VOICE_STT_REPO=mlx-community/whisper-large-v3-turbo
-#       VOICE_POLISH_REPO=mlx-community/Qwen2.5-7B-Instruct-4bit
+#       VOICE_STT_REPO=/Users/hunghanchu/orca/voice-input-mac/models/breeze-asr-25-mlx-4bit
+#       VOICE_REWRITE_BACKEND=cloud
+#       VOICE_CLOUD_REWRITE_MODEL=gemini-3.8-flash
+#       VOICE_CLOUD_REWRITE_LOCATION=global
 #       VOICE_INPUT_DEVICE=SOUNDPEATS        # optional; default = system default
 #
 def _local_env():
@@ -43,7 +56,16 @@ STT_INITIAL_PROMPT = _setting(
     "以下是台灣中文的語音轉文字。標點符號：逗號、句號、問號、驚嘆號、頓號、引號、分號。"
     "常見詞：錄音、音波震動、語音轉文字、麥克風、快捷鍵、標點、潤飾。",
 )
-POLISH_REPO = _setting("VOICE_POLISH_REPO", "mlx-community/Qwen2.5-7B-Instruct-4bit")
+REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")
+CLOUD_REWRITE_MODEL = _setting("VOICE_CLOUD_REWRITE_MODEL", "gemini-3.8-flash")
+CLOUD_REWRITE_LOCATION = _setting("VOICE_CLOUD_REWRITE_LOCATION", "global")
+CLOUD_REWRITE_PROJECT = _setting("VOICE_CLOUD_REWRITE_PROJECT", "")
+CLOUD_REWRITE_TIMEOUT = float(_setting("VOICE_CLOUD_REWRITE_TIMEOUT", "20"))
+CLOUD_REWRITE_MAX_OUTPUT_TOKENS = int(_setting("VOICE_CLOUD_REWRITE_MAX_OUTPUT_TOKENS", "1024"))
+CLOUD_REWRITE_MAX_TERMS = int(_setting("VOICE_CLOUD_REWRITE_MAX_TERMS", "60"))
+REWRITE_TERMS_FILE = _setting(
+    "VOICE_REWRITE_TERMS_FILE", str(Path(__file__).with_name("rewrite_terms.json"))
+)
 DEFAULT_INPUT_DEVICE = _setting("VOICE_INPUT_DEVICE", None)
 SAMPLE_RATE = 16000
 
@@ -483,67 +505,107 @@ def finalize_punctuation(s: str) -> str:
         print("[polish] 模型沒斷句（0 個逗號）→ 用連接詞規則補上", file=sys.stderr)
     return patched
 
-POLISH_SYSTEM_PROMPT = (
-    "你是中文標點符號處理器。任務只有一個：把使用者給的文字標上正確的標點符號，"
-    "並確保輸出是繁體中文（台灣用語）。\n"
-    "標點要依說話者的語意決定，該用什麼就用什麼：\n"
-    "- 「，」語氣停頓、子句之間。一句話很長時務必在停頓處斷開，不要整段擠成一句。\n"
-    "- 「。」陳述句結束。\n"
-    "- 「？」疑問句（嗎、呢、吧、是不是、要不要、可不可以、對不對、為什麼、怎麼辦…等疑問語氣）。\n"
-    "- 「！」感嘆、強調、情緒強烈的句子。\n"
-    "- 「、」並列詞語之間；「：」列舉或說明之前；「；」對等的分句之間。\n"
-    "- 「」引述或強調的詞語。\n"
-    "嚴禁（做了就算失敗）：\n"
-    "- 不可以增加、刪除、改寫、合併或重排任何字。重複的字是原話，不是錯字：\n"
-    "  「會不會」「看看」「非常非常」「好好」都要原樣保留。\n"
-    "- 不可以刪掉口語詞（呃、嗯、那個、然後、就是…一律保留）。\n"
-    "- 不可以把問句改成直述句，也不可以把直述句改成問句。\n"
-    "- 不可以翻譯、摘要、順稿。\n"
-    "- 標點不可以疊在一起（不要出現「，？」「，。」「，，」這種）。\n"
-    "只輸出處理後的文字，不要解釋、不要加引號。"
-)
+def rewrite_settings(
+    backend: str | None = None,
+    terms_file: str | None = None,
+    cloud_model: str | None = None,
+    cloud_location: str | None = None,
+    cloud_project: str | None = None,
+    cloud_timeout: float | None = None,
+    cloud_max_output_tokens: int | None = None,
+    cloud_max_terms: int | None = None,
+) -> RewriteConfig:
+    return RewriteConfig(
+        backend=(backend or REWRITE_BACKEND or "cloud").strip().lower(),
+        model=(cloud_model or CLOUD_REWRITE_MODEL).strip(),
+        location=(cloud_location or CLOUD_REWRITE_LOCATION).strip() or "global",
+        project=(cloud_project if cloud_project is not None else CLOUD_REWRITE_PROJECT).strip(),
+        timeout_seconds=float(cloud_timeout if cloud_timeout is not None else CLOUD_REWRITE_TIMEOUT),
+        max_output_tokens=int(
+            cloud_max_output_tokens
+            if cloud_max_output_tokens is not None
+            else CLOUD_REWRITE_MAX_OUTPUT_TOKENS
+        ),
+        terms_file=(terms_file or REWRITE_TERMS_FILE).strip(),
+        max_terms=int(cloud_max_terms if cloud_max_terms is not None else CLOUD_REWRITE_MAX_TERMS),
+    )
 
-def polish_text(text: str) -> str:
-    if not text or not text.strip():
-        return ""
-    from mlx_lm import load, generate
-    # cache model in module
-    if not hasattr(polish_text, "_model"):
-        print(f"[polish] loading {POLISH_REPO} ...", file=sys.stderr)
-        polish_text._model, polish_text._tok = load(POLISH_REPO)
-    model, tok = polish_text._model, polish_text._tok
-    want = _text_only(to_taiwan_traditional(text))
-    for attempt in (1, 2):
-        user = text if attempt == 1 else (
-            text + "\n\n（注意：上一次的輸出動到了文字。這次務必逐字保留，只加標點。）")
-        messages = [{"role": "system", "content": POLISH_SYSTEM_PROMPT},
-                    {"role": "user", "content": user}]
-        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        out = generate(model, tok, prompt=prompt, max_tokens=512, verbose=False)
-        # mlx_lm.generate(prompt=...) 只回傳新生成的部分；只有它真的把 prompt 一起吐回來才需要切掉
-        if prompt[:40] in out:
-            print(f"[polish] 警告：模型輸出夾帶 prompt（out={len(out)}字）", file=sys.stderr)
-        polished = out[len(prompt):] if out.startswith(prompt) else out
-        # hard fallback: 模型常吐簡體；s2twp 會連用詞一起轉（软件→軟體、数据→資料）
-        polished = to_taiwan_traditional(polished.strip())
-        got = _text_only(polished)
-        if polished and got == want:
-            return finalize_punctuation(polished)
-        # 模型動到字了。它通常只是想「順」掉一個語助詞（實測：句尾「的」被吃掉），
-        # 這種情況不該整句丟掉：把它的標點搬到原文，字一個都不動。
-        if len(got) >= len(want) * 3 // 4:
-            merged = transfer_punctuation(text, polished)
-            if _text_only(to_taiwan_traditional(merged)) == want:
-                print(f"[polish] 第 {attempt} 次輸出動到文字（原 {len(want)} 字 → 結果 {len(got)} 字）"
-                      f"→ 只採用它的標點，字保留原文", file=sys.stderr)
-                print(f"[polish]   模型版本：{polished}", file=sys.stderr)
-                return finalize_punctuation(merged)
-        print(f"[polish] 第 {attempt} 次輸出偏離原文（原 {len(want)} 字 → 結果 {len(got)} 字）→ "
-              + ("重試並加強提示" if attempt == 1 else "放棄潤飾，退回原文＋標點正規化"),
-              file=sys.stderr)
-        if polished:
-            print(f"[polish]   模型版本：{polished}", file=sys.stderr)
+
+def _allowed_rewrite_deletions() -> set[str]:
+    return set(_REPEAT_WORDS) | set(_STUTTER_CHARS) | set(_FILLERS)
+
+
+def rules_rewrite_text(text: str) -> str:
+    """Deterministic fallback: punctuation only, never touch wording."""
     return finalize_punctuation(normalize_punct_only(text))
+
+
+def apply_rewrite(
+    text: str,
+    *,
+    enabled: bool = True,
+    backend: str | None = None,
+    context: dict | None = None,
+    config: RewriteConfig | None = None,
+) -> tuple[str, dict]:
+    """Run Typeless-style rewriting, with deterministic rules as the floor."""
+    settings = config or rewrite_settings(backend=backend)
+    clean_context = sanitize_context(context)
+    rules = load_term_rules(settings.terms_file)
+    info: dict = {
+        "backend": settings.backend,
+        "model": settings.model,
+        "terms": len(rules),
+        "context_fields": sorted(clean_context.keys()),
+    }
+    if not enabled:
+        info["backend"] = "off"
+        return text, info
+    if not text or not text.strip():
+        return "", info
+    if settings.backend in ("off", "none", "raw"):
+        info["backend"] = "off"
+        return text, info
+    if settings.backend in ("rules", "local"):
+        if settings.backend == "local":
+            print("[rewrite] 本地 LLM 已移除（改走雲端或規則）→ 用規則標點", file=sys.stderr)
+        info["backend"] = "rules"
+        return rules_rewrite_text(text), info
+
+    try:
+        result = rewrite_draft(
+            text,
+            context=clean_context,
+            terms=rules,
+            config=settings,
+            allowed_deletions=_allowed_rewrite_deletions(),
+        )
+    except Exception as exc:  # noqa: BLE001 - transcription must survive rewrite failures
+        print(f"[rewrite] 雲端重寫退回規則（{exc}）", file=sys.stderr)
+        info["backend"] = "rules-fallback"
+        info["reason"] = str(exc)[:300]
+        return rules_rewrite_text(text), info
+
+    print(
+        "[rewrite] 雲端通過："
+        f"{result.backend} {result.milliseconds}ms {result.reason} "
+        f"token in/out={result.input_tokens}/{result.output_tokens}",
+        file=sys.stderr,
+    )
+    final = finalize_punctuation(to_taiwan_traditional(normalize_spacing(result.text)))
+    info.update(
+        {
+            "backend": result.backend,
+            "milliseconds": result.milliseconds,
+            "changed_chars": result.changed_chars,
+            "checked_chars": result.checked_chars,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "reason": result.reason,
+        }
+    )
+    return final, info
+
 
 
 def resolve_input_device(spec):
@@ -561,7 +623,41 @@ def resolve_input_device(spec):
         raise SystemExit(f"[rec] no input device matching '{spec}'")
     return hits[0][0]
 
-def process_wav_file(path, language="zh", polish=True, label=""):
+def parse_serve_request(line: str) -> tuple[str, dict]:
+    """Parse one warm-server request.
+
+    Backward-compatible inputs:
+      /path/to.wav
+      partial /path/to.wav
+      __quit__
+    Typeless-style inputs:
+      {"wav": "/path/to.wav", "context": {...}}
+    """
+    text = line.strip()
+    if text.startswith("{"):
+        try:
+            import json
+
+            payload = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"請求不是合法 JSON：{exc}") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("wav"), str):
+            raise ValueError("JSON 請求必須包含 wav 路徑")
+        context = payload.get("context")
+        if context is not None and not isinstance(context, dict):
+            raise ValueError("context 必須是物件")
+        return payload["wav"], context or {}
+    return text, {}
+
+
+def process_wav_file(
+    path,
+    language="zh",
+    polish=True,
+    label="",
+    context=None,
+    config=None,
+):
     """單檔處理（一次性 CLI 與 --serve 共用）。
 
     回傳 {"status": ..., "text": ...}：
@@ -586,8 +682,8 @@ def process_wav_file(path, language="zh", polish=True, label=""):
         print("[stt] 沒有辨識到內容（靜音，或麥克風根本沒收到訊號）", file=sys.stderr)
     print(f"[raw] {raw}", file=sys.stderr)
     print(f"[raw-tw] {to_taiwan_traditional(raw)}", file=sys.stderr)
-    final = raw if not polish else (polish_text(raw) if raw else "")
-    # 潤飾模型會把英文/數字兩側的空格加回來（Breeze 原文也可能有）→ 最終文字再正規化一次
+    final, rewrite = apply_rewrite(raw, enabled=polish, context=context, config=config)
+    # 模型或規則可能把英文/數字兩側的空格加回來 → 最終文字再正規化一次
     final = normalize_spacing(final)
     # final hard guarantee: any remaining simplified -> Taiwan traditional
     final = to_taiwan_traditional(final)
@@ -598,14 +694,14 @@ def process_wav_file(path, language="zh", polish=True, label=""):
     if final and (len(votes) >= SUSPECT_VOTES_REQUIRED or fabricated):
         print(f"[suspect] 疑似不是語音（{len(votes)} 票：" + "；".join(votes) +
               "）→ 不自動貼上（文字仍在 stdout，可用選單手動貼）", file=sys.stderr)
-        return {"status": "suspect", "text": final}
-    return {"status": "ok", "text": final}
+        return {"status": "suspect", "text": final, "rewrite": rewrite}
+    return {"status": "ok", "text": final, "rewrite": rewrite}
 
 def partial_text(path, language="zh"):
     """錄音中「即時預覽」用：Whisper ＋ 繁化，**不潤飾**。
 
     刻意與 process_wav_file 不同：
-      - 不潤飾：Qwen 一次 0.6s，預覽要跟著講話更新，等不起（而且預覽不是最終文字）
+      - 不重寫：最終文字才走雲端校正（而且預覽不是最終文字）
       - 不做 suspect／fabrication 投票：那是「要不要自動貼」的判斷，與預覽無關
       - 靜音直接回空字串：不跑 Whisper（每次停頓都燒一次推論沒有意義）
 
@@ -690,29 +786,29 @@ class _RequestReader:
         return out
 
 
-def serve_forever(language="zh", polish=True):
-    """暖機伺服器：模型只載入一次，之後每個請求只做推論。
+def serve_forever(language="zh", polish=True, config=None):
+    """暖機伺服器：本地 ASR 模型只載入一次，之後每個請求只做推論。
 
-    動機（實測）：一次性路徑每次都要重載 Whisper(1.6GB)+Qwen(4GB) → 冷 4.26s；
-    模型還在記憶體時只要 0.88s。所以在「開始錄音」時就把這個程序拉起來暖機，
-    使用者講話的時間剛好拿來載模型；按下停止後只剩推論。
+    動機（實測）：一次性路徑每次都要重載 Breeze ASR → 冷啟動數秒；
+    模型還在記憶體時只要不到 1s。所以在「開始錄音」時就把這個程序拉起來暖機，
+    使用者講話的時間剛好拿來載模型；按下停止後只剩推論加雲端重寫。
 
-    協定：stdin 每行一個 wav 絕對路徑 → stdout 每行一個 JSON 結果（診斷一律走 stderr）。
+    協定：stdin 每行一個 wav 絕對路徑，或 {"wav": ..., "context": {...}} →
+    stdout 每行一個 JSON 結果（診斷一律走 stderr）。
     app 端關閉時 stdin 會 EOF，這裡就跟著結束，不會留孤兒程序。
     """
     import json
-    print("[serve] 暖機中（OpenCC + Whisper + Qwen）…", file=sys.stderr)
+    active = config or rewrite_settings()
+    print(f"[serve] 暖機中（OpenCC + 本地 ASR；重寫={active.backend}）…", file=sys.stderr)
     # 把實際載入的模型寫進 log：改 local.env 之後要一眼看出「現在是哪一顆」
     # （踩過：改完設定，舊的暖機程序還在跑，log 只看得到「已有暖機程序，不重啟」）
-    print(f"[serve] STT={STT_REPO} POLISH={POLISH_REPO}", file=sys.stderr)
+    print(f"[serve] STT={STT_REPO} REWRITE={active.backend}:{active.model}", file=sys.stderr)
     try:
         to_taiwan_traditional("暖機")
         import numpy as np
         # 必須「不是靜音」才會真的觸發 Whisper 載入（is_silence 會提早 return）
         warm = (np.random.default_rng(0).standard_normal(SAMPLE_RATE).astype("float32") * 0.02)
         transcribe_audio(warm, language=language)
-        if polish:
-            polish_text("暖機。")
         print("[serve] 暖機完成，等待請求", file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         print(f"[serve] 暖機失敗（不致命：第一次請求會慢一點）: {e!r}", file=sys.stderr)
@@ -727,6 +823,9 @@ def serve_forever(language="zh", polish=True):
             break
         if req == "__quit__":
             break
+        if not isinstance(req, str):
+            print(f"[serve] 忽略非文字請求：{type(req).__name__}", file=sys.stderr)
+            continue
         if req.startswith("partial "):
             # 錄音中的即時預覽。優先權最低：先看不阻塞地是不是已經有「完整請求」在排隊，
             # 有就直接放棄這次預覽去處理它 —— 使用者按下停止後不該再等一個過期的預覽跑完。
@@ -746,17 +845,72 @@ def serve_forever(language="zh", polish=True):
             print(f"[partial] 偵測到完整請求在排隊 → 丢掉 {len(queued) - len(fulls)} 個過期預覽、"
                   f"跳過 {len(fulls) - 1} 個過期完整請求，直接處理最後一個", file=sys.stderr)
         try:
-            r = process_wav_file(req, language=language, polish=polish, label="[serve]")
+            request_path, request_context = parse_serve_request(req)
+            r = process_wav_file(
+                request_path,
+                language=language,
+                polish=polish,
+                label="[serve]",
+                context=request_context,
+                config=active,
+            )
+        except ValueError as e:
+            r = {"status": "error", "text": "", "detail": str(e)}
+            print(f"[serve] 請求格式錯誤: {e!r}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             r = {"status": "error", "text": "", "detail": repr(e)}
             print(f"[serve] 處理失敗: {e!r}", file=sys.stderr)
         print(json.dumps(r, ensure_ascii=False), flush=True)
     print("[serve] 結束（stdin EOF 或收到 __quit__）", file=sys.stderr)
 
+def load_request_context(path: str | None) -> dict:
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"[context] 無法讀取 {path}（{exc}），本次不用上下文", file=sys.stderr)
+        return {}
+    if not isinstance(payload, dict):
+        print(f"[context] {path} 不是物件，本次不用上下文", file=sys.stderr)
+        return {}
+    return payload
+
+
+def learn_edit_file(path: str, terms_file: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        summary = learn_insertion_edits(payload, terms_file)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SystemExit(f"[learn] 無法從手動修正學到詞庫：{exc}") from exc
+    print(
+        "learned={learned} candidates={candidates} "
+        "existing={existing} conflicts={conflicts}".format(**summary)
+    )
+    return summary
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Transcribe + polish (local, no network)")
+    ap = argparse.ArgumentParser(description="Transcribe locally, rewrite with cloud context")
     ap.add_argument("wav", nargs="?", help="wav file (16kHz mono). If omitted, records from mic.")
-    ap.add_argument("--no-polish", action="store_true")
+    ap.add_argument("--no-polish", action="store_true", help="只做 ASR，不做任何重寫")
+    ap.add_argument(
+        "--rewrite-backend",
+        choices=["cloud", "rules", "off"],
+        default=None,
+        help="預設走 VOICE_REWRITE_BACKEND，一般不用加",
+    )
+    ap.add_argument("--context-json", default=None, help="Typeless-style context JSON 檔案")
+    ap.add_argument("--terms-file", default=None, help="個人專有名詞 JSON 檔案")
+    ap.add_argument("--learn-edit-json", default=None, help="從一次手動修正學到個人詞庫")
+    ap.add_argument("--cloud-model", default=None)
+    ap.add_argument("--cloud-location", default=None)
+    ap.add_argument("--cloud-project", default=None)
+    ap.add_argument("--cloud-timeout", type=float, default=None)
+    ap.add_argument("--cloud-max-output-tokens", type=int, default=None)
+    ap.add_argument("--cloud-max-terms", type=int, default=None)
     ap.add_argument("--language", default="zh", help="zh / en / auto (empty for auto-detect)")
     ap.add_argument("--record-seconds", type=float, default=5)
     ap.add_argument("--device", default=None, help="input device: index or name substring (default: VOICE_INPUT_DEVICE from local.env, else system default). Not hardcoded — M4/M2 devices differ.")
@@ -766,9 +920,24 @@ def main():
     ap.add_argument("--serve", action="store_true",
                     help="暖機伺服器：stdin 每行一個 wav 路徑，stdout 每行一個 JSON 結果（模型只載入一次）")
     args = ap.parse_args()
+    if args.learn_edit_json:
+        terms_file = args.terms_file or REWRITE_TERMS_FILE
+        learn_edit_file(args.learn_edit_json, terms_file)
+        return
+    settings = rewrite_settings(
+        backend=args.rewrite_backend,
+        terms_file=args.terms_file,
+        cloud_model=args.cloud_model,
+        cloud_location=args.cloud_location,
+        cloud_project=args.cloud_project,
+        cloud_timeout=args.cloud_timeout,
+        cloud_max_output_tokens=args.cloud_max_output_tokens,
+        cloud_max_terms=args.cloud_max_terms,
+    )
+    context = load_request_context(args.context_json)
 
     if args.serve:
-        serve_forever(language=args.language, polish=not args.no_polish)
+        serve_forever(language=args.language, polish=not args.no_polish, config=settings)
         return
 
     if args.list_devices:
@@ -779,7 +948,13 @@ def main():
         return
 
     if args.wav:
-        r = process_wav_file(args.wav, language=args.language, polish=not args.no_polish)
+        r = process_wav_file(
+            args.wav,
+            language=args.language,
+            polish=not args.no_polish,
+            context=context,
+            config=settings,
+        )
         # stdout 只放最終文字：app 整份取用，不可能再誤取診斷行（以前的 "[raw] …" 洩漏）
         if r["text"]:
             print(r["text"])
@@ -815,10 +990,12 @@ def main():
         print("[stt] 沒有辨識到內容（靜音，或麥克風根本沒收到訊號）", file=sys.stderr)
     print(f"[raw] {raw}", file=sys.stderr)
     print(f"[raw-tw] {to_taiwan_traditional(raw)}", file=sys.stderr)
-    if args.no_polish:
-        final = raw
-    else:
-        final = polish_text(raw) if raw else ""
+    final, _ = apply_rewrite(
+        raw,
+        enabled=not args.no_polish,
+        context=context,
+        config=settings,
+    )
     final = normalize_spacing(final)
     final = to_taiwan_traditional(final)
     print(f"[final] {final}", file=sys.stderr)

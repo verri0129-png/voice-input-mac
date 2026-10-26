@@ -189,7 +189,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Transcriber.log("[app] recording stop -> \(url.path)")
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let (text, suspect) = try Transcriber.transcribe(wavURL: url)
+                let context = ContextCapture.capture()
+                Transcriber.log("[context] \(ContextCapture.describe(context))")
+                let (text, suspect) = try Transcriber.transcribe(
+                    wavURL: url,
+                    contextJSON: ContextCapture.encode(context)
+                )
                 DispatchQueue.main.async {
                     Transcriber.log("[app] 結果（停止→文字 \(String(format: "%.2f", Date().timeIntervalSince(tStop)))s）：\(text)")
                     self.statusItem.button?.title = "🎙️"
@@ -213,7 +218,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     // 等 0.15s 讓焦點穩定，再於背景注入文字（TCC 對話框可能阻塞，不能卡主執行緒）
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        DispatchQueue.global(qos: .userInitiated).async { Transcriber.insertText(text) }
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let originalField = ContextCapture.learningSnapshot()?["field_text"]
+                            let inserted = Transcriber.insertText(text)
+                            EditLearning.schedule(
+                                originalField: originalField,
+                                insertedText: inserted,
+                                context: context,
+                                termsFile: EditLearning.termsFileURL()
+                            )
+                        }
                     }
                 }
             } catch {

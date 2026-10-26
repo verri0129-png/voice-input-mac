@@ -41,10 +41,22 @@ enum Transcriber {
 
     /// 回傳 (final 文字, suspect)。suspect = transcribe.py exit 4：有文字但疑似不是語音，
     /// app 端必須「不自動貼上」但保留文字（可手動貼）。
-    static func transcribeOneShot(wavURL: URL) throws -> (text: String, suspect: Bool) {
+    static func transcribeOneShot(wavURL: URL, contextJSON: String? = nil) throws -> (text: String, suspect: Bool) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pythonBin)
-        proc.arguments = [scriptPath, wavURL.path, "--copy"]
+        var arguments = [scriptPath, wavURL.path, "--copy"]
+        var contextURL: URL?
+        defer {
+            if let contextURL { try? FileManager.default.removeItem(at: contextURL) }
+        }
+        if let contextJSON, !contextJSON.isEmpty {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("voice-context-\(UUID().uuidString).json")
+            try contextJSON.write(to: url, atomically: true, encoding: .utf8)
+            arguments += ["--context-json", url.path]
+            contextURL = url
+        }
+        proc.arguments = arguments
         let outPipe = Pipe()
         let errPipe = Pipe()
         proc.standardOutput = outPipe
@@ -213,8 +225,16 @@ enum Transcriber {
 
     /// 暖機路徑。回傳 nil = 這條路不能走（呼叫端退回一次性）。
     /// 沒有可用語音一樣用 throw code 3 表示（與一次性路徑的 exit 3 同語意）。
-    private static func transcribeWarm(wavURL: URL) throws -> (text: String, suspect: Bool)? {
-        guard let raw = serverRequest(wavURL.path, timeout: 30) else { return nil }
+    private static func transcribeWarm(wavURL: URL, contextJSON: String? = nil) throws -> (text: String, suspect: Bool)? {
+        var payload: [String: Any] = ["wav": wavURL.path]
+        if let contextJSON,
+           let data = contextJSON.data(using: .utf8),
+           let context = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            payload["context"] = context
+        }
+        guard let requestData = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let request = String(data: requestData, encoding: .utf8),
+              let raw = serverRequest(request, timeout: 60) else { return nil }
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             Transcriber.log("[serve] 回應不是 JSON，退回一次性路徑：\(raw.prefix(120))")
@@ -233,11 +253,11 @@ enum Transcriber {
     }
 
     /// 對外入口：先走暖機路徑（快），不行才退回一次性路徑（慢但一定通）。
-    static func transcribe(wavURL: URL) throws -> (text: String, suspect: Bool) {
-        if let r = try transcribeWarm(wavURL: wavURL) {
+    static func transcribe(wavURL: URL, contextJSON: String? = nil) throws -> (text: String, suspect: Bool) {
+        if let r = try transcribeWarm(wavURL: wavURL, contextJSON: contextJSON) {
             return r
         }
-        return try transcribeOneShot(wavURL: wavURL)
+        return try transcribeOneShot(wavURL: wavURL, contextJSON: contextJSON)
     }
 
     /// 錄音中的即時預覽（partial 請求）。只走暖機路徑：沒有暖機程序就沒有預覽 ——
@@ -283,8 +303,9 @@ enum Transcriber {
     /// 機器上裝了一堆事件工具：Karabiner / WindowsShortcuts / 各家 computer-use）。
     /// 所以主要路徑改成 CGEvent unicode 注入（等同使用者打字），⌘V 只當保底。
     /// 剪貼簿一定也放一份，使用者手動 ⌘V 隨時可用。
-    static func insertText(_ text: String) {
-        guard !text.isEmpty else { return }
+    @discardableResult
+    static func insertText(_ text: String) -> String {
+        guard !text.isEmpty else { return "" }
         // TUI／終端機會把換行當成「送出」：逐字稿不需要換行，一律換成空格
         let safe = text
             .replacingOccurrences(of: "\r\n", with: " ")
@@ -293,10 +314,11 @@ enum Transcriber {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(safe, forType: .string)
         log("[insert] 文字已放進剪貼簿（\(safe.count) 字），開始注入")
-        if typeViaCGEvent(safe) { return }
-        if pasteViaAppleScript() { return }
-        if pasteViaCGEvent() { return }
+        if typeViaCGEvent(safe) { return safe }
+        if pasteViaAppleScript() { return safe }
+        if pasteViaCGEvent() { return safe }
         log("[insert] ❌ 三條路都不通 → 文字只在剪貼簿裡（手動按 ⌘V 可以貼）")
+        return safe
     }
 
     /// CGEvent unicode 注入：把字串當成鍵盤輸入打進最前面的 app。
