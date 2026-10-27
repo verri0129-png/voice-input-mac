@@ -455,6 +455,15 @@ log 可以直接確認載入的是哪一顆。
 `--second-opinion` 實打 Vertex 回 `[2nd] 不一致 1 處：端→斷（1280ms）`；真 serve 協定下 JSON
 結果**先**印、`[2nd]` 後印，代表貼字沒被擋。
 
+**標點另外算一個維度**（使用者要求，2026-10-27 追加）：`punctuation` 記本地 raw 與雲端的標點
+個數與分布；半形 `,` 與全形 `，` 先統一（那是編碼不是斷句，不統一會讓每句都算不一致）。定版檔
+8 秒內出現就多記 `punctuation_refined_vs_cloud`——那是「你真正看到的那一版」跟雲端的標點比對。
+等定版放在**放掉併發名額之後**，不會因為等檔擋住下一句。
+
+實測一筆（`/tmp/p2.wav`，8.4s）：`[refine] 定版 成功 3116ms pass（換字 1/36）`，定版把
+「裁剪**端地**」修成「裁剪**的問題**」，標點 3 個與雲端完全相同。**兩個 ASR 都聽錯同一個詞、
+反而是 `gemini-3.8-flash` 用上下文修對**——所以「用轉錄模型取代 rewrite」目前不成立，先別動。
+
 **還沒驗**：真人按 ⌘E 累積一週樣本後的「誰常對」。判準＝
-`./.venv/bin/python transcribe.py --second-opinion-report` 的一致率與最常不一致清單。
+`./.venv/bin/python transcribe.py --second-opinion-report` 的一致率、最常不一致清單、標點分布。
 

@@ -123,6 +123,8 @@ SECOND_OPINION_MAX_SECONDS = float(_setting("VOICE_SECOND_OPINION_MAX_SECONDS", 
 SECOND_OPINION_LOG = _setting(
     "VOICE_SECOND_OPINION_LOG", str(Path(__file__).with_name(".second-opinion.jsonl"))
 )
+# 等定版檔多久（只為了「標點比對」有第三個對象；等不到就只比本地與雲端）。
+SECOND_OPINION_REFINE_WAIT = float(_setting("VOICE_SECOND_OPINION_REFINE_WAIT", "8"))
 DEFAULT_INPUT_DEVICE = _setting("VOICE_INPUT_DEVICE", None)
 SAMPLE_RATE = 16000
 
@@ -854,7 +856,10 @@ def process_wav_file(
                 print(f"[2nd] 跳過：讀不到音檔（{exc}）", file=sys.stderr)
                 audio = None
             if audio is not None:
-                record = second_opinion_record(audio, raw, settings, seconds=seconds)
+                record = second_opinion_record(
+                    audio, raw, settings, seconds=seconds,
+                    refine_path=refine_path, refine_wait=0,
+                )
                 print(f"[2nd] {describe_second_opinion(record)}", file=sys.stderr)
                 try:
                     _append_jsonl(SECOND_OPINION_LOG, record)
@@ -862,7 +867,9 @@ def process_wav_file(
                     print(f"[2nd] 寫入記錄失敗：{exc!r}", file=sys.stderr)
                 extra["second_opinion"] = record
         else:
-            start_second_opinion(path, raw, settings, seconds=seconds)
+            start_second_opinion(
+                path, raw, settings, seconds=seconds, refine_path=refine_path
+            )
     if defer_cloud:
         start_refinement(raw, context, settings, refine_path, final)
         return {"status": "ok", "text": final, "rewrite": rewrite,
@@ -1084,6 +1091,54 @@ def compare_transcripts(local: str, cloud: str, max_spans: int = 6) -> dict:
     }
 
 
+def punctuation_profile(text: str) -> dict:
+    """數一段文字裡的標點（只看 Unicode 類別 P，壞字元不算）。"""
+    marks = _puncts_only(text)
+    counts: dict[str, int] = {}
+    for ch in marks:
+        counts[ch] = counts.get(ch, 0) + 1
+    return {"marks": marks, "counts": counts, "total": len(marks)}
+
+
+def compare_punctuation(local: str, cloud: str) -> dict:
+    """標點**另外**算一個維度：不能併進「一致率」，否則每句都算不一致。
+
+    本地 ASR 幾乎不給標點（Breeze raw 沒有），雲端轉錄模型會自己補逗號與句尾——
+    這正是我們現在靠規則版＋gemini-3.8-flash 補的那一段，所以值得單獨量。
+    """
+    # 先統一全形：本地/Whisper 常給半形「,」，雲端給「，」——那是編碼差異，不是斷句差異。
+    left = punctuation_profile(normalize_punct_only(local))
+    right = punctuation_profile(normalize_punct_only(cloud))
+    return {
+        "local_total": left["total"],
+        "cloud_total": right["total"],
+        "local_counts": left["counts"],
+        "cloud_counts": right["counts"],
+        "same": left["marks"] == right["marks"],
+    }
+
+
+def read_refined_text(refine_path: str | None, wait_seconds: float = 0.0) -> str | None:
+    """等並讀定版檔（`{"ok":true,"text":…}`）。等不到或不是 ok 就回 None。
+
+    refine 檔是每次錄音一個 UUID 路徑（App 端產生），所以不必擔心讀到上一句。
+    """
+    if not refine_path:
+        return None
+    path = Path(refine_path)
+    deadline = time.perf_counter() + max(0.0, wait_seconds)
+    while True:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("ok") and payload.get("text"):
+            return str(payload["text"])
+        if time.perf_counter() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
 def second_opinion_record(
     audio: bytes,
     local_text: str,
@@ -1092,6 +1147,8 @@ def second_opinion_record(
     seconds: float | None = None,
     transport=None,
     token: str | None = None,
+    refine_path: str | None = None,
+    refine_wait: float | None = None,
 ) -> dict:
     record = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -1115,8 +1172,17 @@ def second_opinion_record(
             "input_tokens": result["input_tokens"],
             "output_tokens": result["output_tokens"],
             **compare_transcripts(local_text, result["text"]),
+            "punctuation": compare_punctuation(local_text, result["text"]),
         }
     )
+    # 定版（你真正看到的那一版）晚幾秒才寫檔；等得到就多一個「定版 vs 雲端標點」。
+    refined = read_refined_text(
+        refine_path,
+        SECOND_OPINION_REFINE_WAIT if refine_wait is None else refine_wait,
+    )
+    record["refined"] = refined
+    if refined:
+        record["punctuation_refined_vs_cloud"] = compare_punctuation(refined, result["text"])
     return record
 
 
@@ -1137,6 +1203,9 @@ def describe_second_opinion(record: dict) -> str:
             extra = "、數字格式 " + "；".join(
                 f"{s.get('local') or '∅'}→{s.get('cloud') or '∅'}" for s in formatting
             )
+        punctuation = record.get("punctuation") or {}
+        if punctuation and punctuation.get("local_total") != punctuation.get("cloud_total"):
+            extra += f"、標點 {punctuation.get('local_total', 0)}→{punctuation.get('cloud_total', 0)}"
         return f"一致{extra}（{record.get('elapsed_ms', 0)}ms）"
     spans = "；".join(
         f"{s.get('local') or '∅'}→{s.get('cloud') or '∅'}" for s in record.get("spans") or []
@@ -1144,23 +1213,39 @@ def describe_second_opinion(record: dict) -> str:
     return f"不一致 {len(record.get('spans') or [])} 處：{spans}（{record.get('elapsed_ms', 0)}ms）"
 
 
-def second_opinion_in_background(audio: bytes, local_text: str, settings, seconds=None):
+def second_opinion_in_background(
+    audio: bytes, local_text: str, settings, seconds=None, refine_path=None
+):
     if not _SECOND_OPINION_SLOTS.acquire(blocking=False):
         print("[2nd] 跳過：已經有兩個第二意見在跑", file=sys.stderr)
         return None
+    record = None
     try:
-        record = second_opinion_record(audio, local_text, settings, seconds=seconds)
-        try:
-            _append_jsonl(SECOND_OPINION_LOG, record)
-        except OSError as exc:
-            print(f"[2nd] 寫入記錄失敗：{exc!r}", file=sys.stderr)
-        print(f"[2nd] {describe_second_opinion(record)}", file=sys.stderr)
-        return record
+        # 等定版放在放掉併發名額之後：等檔可能 8 秒，不該擋住下一句的第二意見。
+        record = second_opinion_record(
+            audio, local_text, settings, seconds=seconds, refine_path=refine_path,
+            refine_wait=0,
+        )
     finally:
         _SECOND_OPINION_SLOTS.release()
+    if record is None:
+        return None
+    if record.get("status") == "ok" and refine_path and not record.get("refined"):
+        refined = read_refined_text(refine_path, SECOND_OPINION_REFINE_WAIT)
+        if refined:
+            record["refined"] = refined
+            record["punctuation_refined_vs_cloud"] = compare_punctuation(
+                refined, record.get("cloud_raw") or ""
+            )
+    try:
+        _append_jsonl(SECOND_OPINION_LOG, record)
+    except OSError as exc:
+        print(f"[2nd] 寫入記錄失敗：{exc!r}", file=sys.stderr)
+    print(f"[2nd] {describe_second_opinion(record)}", file=sys.stderr)
+    return record
 
 
-def start_second_opinion(path, local_text, settings, seconds=None):
+def start_second_opinion(path, local_text, settings, seconds=None, refine_path=None):
     """把第二意見丟到背景。音訊在這裡（同步）讀進記憶體，之後 App 刪檔也不影響。"""
     if not (SECOND_OPINION and local_text):
         return None
@@ -1177,7 +1262,7 @@ def start_second_opinion(path, local_text, settings, seconds=None):
         return None
     worker = threading.Thread(
         target=second_opinion_in_background,
-        args=(audio, local_text, settings, seconds),
+        args=(audio, local_text, settings, seconds, refine_path),
         name="voice-2nd",
         daemon=True,
     )
@@ -1228,6 +1313,44 @@ def second_opinion_report(path: str | None = None) -> str:
             f"token 輸入 {sum(int(r.get('input_tokens', 0) or 0) for r in ok)}、"
             f"輸出 {sum(int(r.get('output_tokens', 0) or 0) for r in ok)}"
         )
+    punctuation = [r.get("punctuation") or {} for r in ok]
+    if punctuation:
+        local_totals = [int(p.get("local_total", 0) or 0) for p in punctuation]
+        cloud_totals = [int(p.get("cloud_total", 0) or 0) for p in punctuation]
+        with_local = sum(1 for n in local_totals if n)
+        lines.append(
+            f"標點：本地(ASR raw) 有標點 {with_local}/{len(punctuation)}、"
+            f"平均 {sum(local_totals) / len(punctuation):.1f} 個；"
+            f"雲端平均 {sum(cloud_totals) / len(punctuation):.1f} 個"
+        )
+        cloud_counts: dict[str, int] = {}
+        for profile in punctuation:
+            for mark, count in (profile.get("cloud_counts") or {}).items():
+                cloud_counts[mark] = cloud_counts.get(mark, 0) + count
+        if cloud_counts:
+            lines.append(
+                "雲端標點分布："
+                + "、".join(
+                    f"{mark}×{count}"
+                    for mark, count in sorted(cloud_counts.items(), key=lambda kv: -kv[1])
+                )
+            )
+        word_agree = [r for r in ok if r.get("agree")]
+        punct_differs = [
+            r for r in word_agree if (r.get("punctuation") or {}).get("same") is False
+        ]
+        if word_agree:
+            lines.append(f"字一致但標點不同：{len(punct_differs)}/{len(word_agree)}")
+        refined = [r for r in ok if r.get("refined")]
+        if refined:
+            same_punct = sum(
+                1
+                for r in refined
+                if (r.get("punctuation_refined_vs_cloud") or {}).get("same")
+            )
+            lines.append(
+                f"定版可用 {len(refined)} 筆，其中定版標點與雲端相同 {same_punct} 筆"
+            )
     if pairs:
         lines.append("最常不一致（本地→雲端）：")
         for (local, cloud), count in sorted(pairs.items(), key=lambda kv: -kv[1])[:10]:

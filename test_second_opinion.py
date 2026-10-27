@@ -74,6 +74,84 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(out["cloud_chars"], 0)
 
 
+class PunctuationTests(unittest.TestCase):
+    def test_profile_counts_marks(self):
+        profile = transcribe.punctuation_profile("先確認，再說。")
+        self.assertEqual(profile["total"], 2)
+        self.assertEqual(profile["counts"], {"，": 1, "。": 1})
+        self.assertEqual(profile["marks"], "，。")
+
+    def test_local_without_marks_vs_cloud_with_marks(self):
+        out = transcribe.compare_punctuation("操作方法有一樣嗎", "操作方法有一樣嗎？")
+        self.assertFalse(out["same"])
+        self.assertEqual((out["local_total"], out["cloud_total"]), (0, 1))
+        self.assertEqual(out["cloud_counts"], {"？": 1})
+
+    def test_identical_punctuation(self):
+        out = transcribe.compare_punctuation("先確認。", "先確認。")
+        self.assertTrue(out["same"])
+
+    def test_halfwidth_comma_is_not_a_punctuation_difference(self):
+        # 本地（Whisper）常給半形逗號、雲端給全形；那是編碼差異，不是斷句差異。
+        out = transcribe.compare_punctuation("先確認,再說。", "先確認，再說。")
+        self.assertTrue(out["same"], out)
+
+    def test_describe_mentions_punctuation_delta(self):
+        line = transcribe.describe_second_opinion(
+            {
+                "status": "ok",
+                "agree": True,
+                "elapsed_ms": 1000,
+                "spans": [],
+                "punctuation": {"local_total": 0, "cloud_total": 2},
+            }
+        )
+        self.assertIn("標點 0→2", line)
+
+
+class RefinedTests(unittest.TestCase):
+    def test_reads_refined_file_when_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "refine.json"
+            path.write_text(
+                json.dumps({"ok": True, "text": "操作方法有一樣嗎？"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                transcribe.read_refined_text(str(path), 0), "操作方法有一樣嗎？"
+            )
+
+    def test_missing_or_failed_refine_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "refine.json"
+            path.write_text(json.dumps({"ok": False, "text": "x"}), encoding="utf-8")
+            self.assertIsNone(transcribe.read_refined_text(str(path), 0))
+            self.assertIsNone(transcribe.read_refined_text(None, 0))
+
+    def test_record_carries_refined_punctuation_comparison(self):
+        def fake(*_args, **_kwargs):
+            return _response("操作方法有一樣嗎？")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "refine.json"
+            path.write_text(
+                json.dumps({"ok": True, "text": "操作方法有一樣嗎。"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            record = transcribe.second_opinion_record(
+                b"RIFF",
+                "操作方法有一樣嗎",
+                SETTINGS,
+                transport=fake,
+                token="t",
+                refine_path=str(path),
+                refine_wait=0,
+            )
+        self.assertEqual(record["refined"], "操作方法有一樣嗎。")
+        self.assertFalse(record["punctuation_refined_vs_cloud"]["same"])
+        self.assertTrue(record["punctuation"]["same"] is False)
+
+
 class RequestTests(unittest.TestCase):
     def test_request_targets_transcribe_model_with_inline_audio(self):
         url, headers, payload = transcribe.build_cloud_transcribe_request(
