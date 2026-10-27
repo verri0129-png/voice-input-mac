@@ -392,6 +392,24 @@ class RewriteCloudTests(unittest.TestCase):
             transcribe.handle_terms_cli(path, remove="詞庫")
             self.assertEqual(rewrite_cloud.load_term_rules(path), [])
 
+    def test_stt_initial_prompt_includes_dictionary_words(self):
+        # 詞庫也要餵給本地 ASR：Whisper 的 initial_prompt 是熱詞通道
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "terms.json")
+            Path(path).write_text(json.dumps({"version": 1, "terms": [
+                {"text": "詞庫", "match": ["瓷庫", "磁庫"]},
+                {"text": "Sketcher", "match": []},
+            ]}), encoding="utf-8")
+            prompt = transcribe.stt_initial_prompt(path)
+            self.assertIn("詞庫", prompt)
+            self.assertIn("Sketcher", prompt)
+            self.assertNotIn("瓷庫", prompt)          # 只放正字，不放誤聽變體
+            self.assertLessEqual(len(prompt), transcribe.WHISPER_PROMPT_CHARS)
+            # 沒有詞庫檔時就是原本那句固定提示
+            empty = transcribe.stt_initial_prompt(str(Path(tmp) / "missing.json"))
+            self.assertNotIn("專有名詞", empty)
+            self.assertEqual(empty, transcribe.STT_INITIAL_PROMPT.strip())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,36 @@ STT_INITIAL_PROMPT = _setting(
     "以下是台灣中文的語音轉文字。標點符號：逗號、句號、問號、驚嘆號、頓號、引號、分號。"
     "常見詞：錄音、音波震動、語音轉文字、麥克風、快捷鍵、標點、潤飾。",
 )
+# Whisper 的 initial_prompt 就是它的熱詞通道（同一個音「瓷庫／詞庫」，prompt 裡出現過
+# 正確寫法就傾向寫對）。但它的上下文只有 ~224 token，塞太多會擠掉音訊本身，
+# 所以這裡硬性截在 200 字以內，只放詞庫的「正字」（不放變體）。
+WHISPER_PROMPT_CHARS = 200
+
+
+def stt_initial_prompt(terms_file: str | None = None) -> str:
+    """固定提示 + 個人詞庫正字。詞庫為空或讀不到時回傳原本的固定提示。"""
+    base = STT_INITIAL_PROMPT.strip()
+    try:
+        rules = load_term_rules(terms_file or REWRITE_TERMS_FILE)
+    except Exception:  # noqa: BLE001 - 提示字串壞掉不該擋住辨識
+        return base
+    words = list(dict.fromkeys(rule.text.strip() for rule in rules if rule.text.strip()))
+    if not words:
+        return base
+    head = "專有名詞："
+    room = WHISPER_PROMPT_CHARS - len(base) - len(head)
+    if room <= 2:
+        return base
+    picked: list[str] = []
+    used = 0
+    for word in words:
+        if used + len(word) + 1 > room:
+            break
+        picked.append(word)
+        used += len(word) + 1
+    return base + head + "、".join(picked) if picked else base
+
+
 REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")
 CLOUD_REWRITE_MODEL = _setting("VOICE_CLOUD_REWRITE_MODEL", "gemini-3.8-flash")
 CLOUD_REWRITE_LOCATION = _setting("VOICE_CLOUD_REWRITE_LOCATION", "global")
@@ -281,7 +311,7 @@ def transcribe_audio(audio, language="zh"):
         path_or_hf_repo=STT_REPO,
         language=language if language else None,
         verbose=False,
-        initial_prompt=STT_INITIAL_PROMPT,
+        initial_prompt=stt_initial_prompt(),
     )
     text = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
@@ -758,7 +788,7 @@ def process_wav_file(
     import mlx_whisper
     lang = None if language == "auto" else language
     result = mlx_whisper.transcribe(path, path_or_hf_repo=STT_REPO, language=lang, verbose=False,
-                                    initial_prompt=STT_INITIAL_PROMPT)
+                                    initial_prompt=stt_initial_prompt())
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
     raw = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
