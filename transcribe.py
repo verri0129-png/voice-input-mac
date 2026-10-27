@@ -101,6 +101,14 @@ _RAW_THINKING = _setting("VOICE_CLOUD_THINKING_BUDGET", "0").strip().lower()
 CLOUD_REWRITE_THINKING = (
     None if _RAW_THINKING in ("none", "off", "") else int(_RAW_THINKING)
 )
+# Priority PayGo：預設開（使用者 2026-10-27 決定），設 0 就回標準池。
+CLOUD_REWRITE_PRIORITY = _setting("VOICE_CLOUD_PRIORITY", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+)
 # Typeless 式定版：先貼規則版，雲端在背景重寫，完成後由 App 原地替換。
 # 這是「貼上之後最多等多久才定版」的上限，不再擋住貼字。
 REFINE_WAIT_SECONDS = float(_setting("VOICE_REFINE_WAIT", "8"))
@@ -604,6 +612,7 @@ def rewrite_settings(
     cloud_max_output_tokens: int | None = None,
     cloud_max_terms: int | None = None,
     cloud_thinking_budget: int | str | None = None,
+    cloud_priority: bool | None = None,
 ) -> RewriteConfig:
     return RewriteConfig(
         backend=(backend or REWRITE_BACKEND or "cloud").strip().lower(),
@@ -623,6 +632,7 @@ def rewrite_settings(
             if cloud_thinking_budget is None
             else (None if cloud_thinking_budget == "none" else int(cloud_thinking_budget))
         ),
+        priority=CLOUD_REWRITE_PRIORITY if cloud_priority is None else bool(cloud_priority),
     )
 
 
@@ -715,9 +725,15 @@ def apply_rewrite(
     print(
         "[rewrite] 雲端通過："
         f"{result.backend} {result.milliseconds}ms {result.reason} "
-        f"token in/out={result.input_tokens}/{result.output_tokens}",
+        f"token in/out={result.input_tokens}/{result.output_tokens}"
+        + (f" traffic={result.traffic_type}" if result.traffic_type else ""),
         file=sys.stderr,
     )
+    if settings.priority and result.traffic_type and result.traffic_type != "ON_DEMAND_PRIORITY":
+        print(
+            f"[rewrite] priority 被降級（traffic={result.traffic_type}）→ 這次算標準價",
+            file=sys.stderr,
+        )
     final = finalize_punctuation(to_taiwan_traditional(normalize_spacing(result.text)))
     info.update(
         {

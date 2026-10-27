@@ -65,6 +65,9 @@ class RewriteConfig:
     adc_path: str = ""
     terms_file: str = "rewrite_terms.json"
     max_terms: int = DEFAULT_MAX_TERMS
+    # Priority PayGo：加兩個 header 走優先池（單價較高，沒有最低消費、隨時可關）。
+    # 回應的 usageMetadata.trafficType 會是 ON_DEMAND_PRIORITY；被降級則是 ON_DEMAND。
+    priority: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,7 @@ class RewriteResult:
     input_tokens: int = 0
     output_tokens: int = 0
     reason: str = ""
+    traffic_type: str = ""
 
 
 def _content_chars(value: str) -> str:
@@ -908,9 +912,14 @@ def rewrite_draft(
         "generationConfig": generation,
     }
     poster = transport or _post_json
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if active.priority:
+        # 「只用 Priority PayGo」模式（沒有 PT 配額）：兩個 header 都要送。
+        headers["X-Vertex-AI-LLM-Request-Type"] = "shared"
+        headers["X-Vertex-AI-LLM-Shared-Request-Type"] = "priority"
     response = poster(
         url,
-        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers,
         payload,
         active.timeout_seconds,
     )
@@ -929,6 +938,7 @@ def rewrite_draft(
     usage = response.get("usageMetadata") if isinstance(response, dict) else None
     input_tokens = int((usage or {}).get("promptTokenCount", 0) or 0)
     output_tokens = int((usage or {}).get("candidatesTokenCount", 0) or 0)
+    traffic_type = str((usage or {}).get("trafficType", "") or "")
     ok, reason, changed, final_text = validate_and_repair_rewrite(
         draft,
         text,
@@ -947,6 +957,7 @@ def rewrite_draft(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         reason=reason,
+        traffic_type=traffic_type,
     )
 
 
