@@ -409,3 +409,13 @@ log 可以直接確認載入的是哪一顆。
 - 模型沒有備援：這個 project 只叫得動 `gemini-3.8-flash`，其餘全 404；換供應商（例如 DeepSeek）等於新 provider＋新憑證＋逐字稿離開 GCP＋守門重驗，**評估後決定不換**。
 
 **還沒做（使用者指定日後再處理）**：辨識錯誤遇到再修；詞庫（`rewrite_terms.json`）等碰到新專有名詞再加，不主動擴充。M4 的 `~/orca/voice-input-mac/voice-input-mac/`（10/26 21:10 多餘巢狀 clone）仍在，未刪。
+
+## 2026-10-27 規則版也套詞庫（`apply_terms`）
+
+**問題**：詞庫（`rewrite_terms.json`）原本只進雲端 prompt（`select_terms`）。雲端 TimeoutError 是常態，而使用者實際看到的就是規則版 → 詞庫等於不存在。實例：兩次把「**詞庫**」聽成「瓷庫」「磁庫」，加了對照表也不會修好。
+
+**改法**：新增 `apply_terms(text, rules)`——純字串替換、長的變體先換、`[terms] 詞庫套用：…` 寫 stderr。接在三個地方：`rules_rewrite_text`（規則版，含雲端失敗的 fallback）、`_settle_text`（雲端結果收尾，最後一道攔截）。沒給規則時行為與舊版完全相同。
+
+**風險（刻意接受）**：字串替換不看上下文，真的在講「磁庫」也會被改成「詞庫」。要看上下文只有雲端那條路，而它常常 timeout。
+
+**第一條詞庫**：`詞庫 ← 瓷庫／磁庫`（`rewrite_terms.json` 不進版控，M2／M4 各一份）。

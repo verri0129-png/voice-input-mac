@@ -580,9 +580,40 @@ def _allowed_rewrite_deletions() -> set[str]:
     return set(_REPEAT_WORDS) | set(_STUTTER_CHARS) | set(_FILLERS)
 
 
-def rules_rewrite_text(text: str) -> str:
-    """Deterministic fallback: punctuation only, never touch wording."""
-    return finalize_punctuation(normalize_punct_only(text))
+def apply_terms(text: str, rules=()) -> str:
+    """在本地套用使用者詞庫（變體 → 正字）。零模型、零延遲、零網路。
+
+    詞庫原本只進雲端 prompt（`select_terms`），雲端一 timeout 就等於沒有；
+    而使用者實際先看到、也常常只看到的是規則版。所以規則版也要套：
+    只做整段字串替換，不判斷上下文（要看上下文的那條路是雲端）。
+    """
+    if not text or not rules:
+        return text
+    pairs: list[tuple[str, str]] = []
+    for rule in rules:
+        for variant in getattr(rule, "variants", ()) or ():
+            if variant and variant != rule.text and variant in text:
+                pairs.append((variant, rule.text))
+    if not pairs:
+        return text
+    # 長的先換：避免短變體先吃掉長變體的一部分（例如「磁庫房」→「詞庫房」）
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    out = text
+    applied: list[str] = []
+    for variant, target in pairs:
+        hits = out.count(variant)
+        if not hits:
+            continue
+        out = out.replace(variant, target)
+        applied.append(f"{variant}→{target}×{hits}")
+    if applied:
+        print(f"[terms] 詞庫套用：{'、'.join(applied)}", file=sys.stderr)
+    return out
+
+
+def rules_rewrite_text(text: str, rules=()) -> str:
+    """Deterministic fallback: 詞庫替換 + punctuation only, never touch other wording."""
+    return finalize_punctuation(normalize_punct_only(apply_terms(text, rules)))
 
 
 def apply_rewrite(
@@ -615,7 +646,7 @@ def apply_rewrite(
         if settings.backend == "local":
             print("[rewrite] 本地 LLM 已移除（改走雲端或規則）→ 用規則標點", file=sys.stderr)
         info["backend"] = "rules"
-        return rules_rewrite_text(text), info
+        return rules_rewrite_text(text, rules), info
 
     try:
         result = rewrite_draft(
@@ -629,7 +660,7 @@ def apply_rewrite(
         print(f"[rewrite] 雲端重寫退回規則（{exc}）", file=sys.stderr)
         info["backend"] = "rules-fallback"
         info["reason"] = str(exc)[:300]
-        return rules_rewrite_text(text), info
+        return rules_rewrite_text(text, rules), info
 
     print(
         "[rewrite] 雲端通過："
@@ -784,9 +815,13 @@ def _write_json_atomic(path: str, payload: dict) -> None:
         raise
 
 
-def _settle_text(value: str) -> str:
-    """雲端結果的收尾：與 apply_rewrite 成功路徑、process_wav_file 完全相同的鏈。"""
-    text = finalize_punctuation(to_taiwan_traditional(normalize_spacing(value)))
+def _settle_text(value: str, rules=()) -> str:
+    """雲端結果的收尾：與 apply_rewrite 成功路徑、process_wav_file 完全相同的鏈。
+
+    `rules` 有值時先套詞庫——雲端被 prompt 告知正字卻仍寫錯時，這是最後一道
+    零成本的攔截；沒有規則時行為與舊版完全相同。
+    """
+    text = finalize_punctuation(to_taiwan_traditional(normalize_spacing(apply_terms(value, rules))))
     return to_taiwan_traditional(normalize_spacing(text))
 
 
@@ -803,7 +838,7 @@ def refine_in_background(raw, context, settings, refine_path, pasted_text):
             config=settings,
             allowed_deletions=_allowed_rewrite_deletions(),
         )
-        text = _settle_text(result.text)
+        text = _settle_text(result.text, rules)
         if not text:
             payload = {"ok": False, "reason": "雲端回空字串"}
         elif text == pasted_text:

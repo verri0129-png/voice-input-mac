@@ -340,5 +340,36 @@ class RewriteCloudTests(unittest.TestCase):
         )
 
 
+    def test_rules_path_applies_term_library(self):
+        # 詞庫原本只進雲端 prompt，雲端 timeout 就等於沒有；規則版是使用者最常看到的那份
+        rules = [rewrite_cloud.TermRule(text="詞庫", variants=("瓷庫", "磁庫"))]
+        self.assertEqual(
+            transcribe.rules_rewrite_text("幫我把瓷庫的檔案整理好嗎", rules),
+            "幫我把詞庫的檔案整理好嗎？",
+        )
+        # 沒給規則時行為與舊版完全相同（純標點）
+        self.assertEqual(
+            transcribe.rules_rewrite_text("幫我把瓷庫的檔案整理好嗎"),
+            "幫我把瓷庫的檔案整理好嗎？",
+        )
+
+    def test_apply_terms_is_noop_without_rules(self):
+        self.assertEqual(transcribe.apply_terms("把瓷庫跟磁庫都同步", ()), "把瓷庫跟磁庫都同步")
+        self.assertEqual(transcribe.apply_terms("把瓷庫跟磁庫都同步", None), "把瓷庫跟磁庫都同步")
+
+    def test_apply_terms_prefers_longest_variant(self):
+        # 短的先換會把「磁庫房」變成「詞庫房」，長變體就再也對不上
+        rules = [
+            rewrite_cloud.TermRule(text="詞庫", variants=("磁庫",)),
+            rewrite_cloud.TermRule(text="倉庫", variants=("磁庫房",)),
+        ]
+        self.assertEqual(transcribe.apply_terms("磁庫房有兩間", rules), "倉庫有兩間")
+
+    def test_settle_text_applies_term_library(self):
+        rules = [rewrite_cloud.TermRule(text="詞庫", variants=("瓷庫",))]
+        self.assertIn("詞庫", transcribe._settle_text("請更新瓷庫的說明文件", rules))
+        self.assertIn("瓷庫", transcribe._settle_text("請更新瓷庫的說明文件"))
+
+
 if __name__ == "__main__":
     unittest.main()
