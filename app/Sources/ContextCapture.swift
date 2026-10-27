@@ -84,6 +84,56 @@ enum ContextCapture {
             "reason=\(reason) capture_ms=\(ms)"
     }
 
+    /// 取輸入框內容。先讀 `kAXValue`；讀不到時（Apple Notes 的 `AXTextArea` 就是這樣——
+    /// 實測 `learningSnapshot` 直接回 nil、定版也因此一次都貼不回去）改用子節點把文字拼回來。
+    ///
+    /// 拼接用空字串而不是換行：Notes 會把同一段文字拆成多個 `AXStaticText` run，
+    /// 插換行等於在句中插字，會讓「剛貼上的那一段」搜不到。只用於快照比對，不用於注入。
+    private static func fieldText(
+        in element: AXUIElement,
+        deadline: Date,
+        limit: Int
+    ) -> String? {
+        if let value = withDeadline(250, deadline: deadline, work: {
+            stringValue(copyAttribute(element, kAXValueAttribute as CFString))
+        }), !value.isEmpty, value.count <= limit {
+            return value
+        }
+        var pieces: [String] = []
+        var nodes = 0
+        collectFieldText(in: element, depth: 0, deadline: deadline, nodes: &nodes, pieces: &pieces)
+        let joined = pieces.joined()
+        guard !joined.isEmpty else { return nil }
+        Transcriber.log("[ax] kAXValue 讀不到 → 用子節點拼回 \(joined.count) 字（\(pieces.count) 段）")
+        return joined.count <= limit ? joined : String(joined.prefix(limit))
+    }
+
+    private static func collectFieldText(
+        in element: AXUIElement,
+        depth: Int,
+        deadline: Date,
+        nodes: inout Int,
+        pieces: inout [String]
+    ) {
+        if Date() >= deadline || nodes >= 400 || depth > 8 { return }
+        nodes += 1
+        let role = copyAttribute(element, kAXRoleAttribute as CFString) as? String ?? ""
+        if blockedRoles.contains(role) { return }
+        if role == "AXStaticText" || role == "AXTextField" || role == "AXTextArea" {
+            if let text = stringValue(copyAttribute(element, kAXValueAttribute as CFString)), !text.isEmpty {
+                pieces.append(text)
+                return
+            }
+        }
+        guard let children = copyAttribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] else {
+            return
+        }
+        for child in children {
+            collectFieldText(in: child, depth: depth + 1, deadline: deadline, nodes: &nodes, pieces: &pieces)
+            if Date() >= deadline || nodes >= 400 { return }
+        }
+    }
+
     static func learningSnapshot(
         limit: Int = 5_000,
         deadlineMilliseconds: Int = 500
@@ -116,9 +166,8 @@ enum ContextCapture {
         }), characters > limit {
             return nil
         }
-        guard let value = withDeadline(250, deadline: deadline, work: {
-            stringValue(copyAttribute(fieldElement, kAXValueAttribute as CFString))
-        }), !value.isEmpty, value.count <= limit else {
+        guard let value = fieldText(in: fieldElement, deadline: deadline, limit: limit),
+              !value.isEmpty else {
             return nil
         }
         return [
@@ -152,9 +201,7 @@ enum ContextCapture {
         }), textRoles.contains(role), !blockedRoles.contains(role) else {
             return nil
         }
-        guard let value = withDeadline(250, deadline: deadline, work: {
-            stringValue(copyAttribute(fieldElement, kAXValueAttribute as CFString))
-        }) else {
+        guard let value = fieldText(in: fieldElement, deadline: deadline, limit: maxFieldCharacters) else {
             return nil
         }
         return (fieldElement, value, role)
