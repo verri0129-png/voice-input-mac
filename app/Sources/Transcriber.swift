@@ -310,7 +310,11 @@ enum Transcriber {
         let current = field.text as NSString
         let first = current.range(of: inserted)
         guard first.location != NSNotFound else {
-            log("[refine] 不動手：欄位裡找不到剛貼上的那段")
+            // 沒有這行線索時「找不到」完全無法追：AX 讀到的內容可能被目標 app 正規化、
+            // 也可能根本是別的欄位。只記長度與最前面一小段（log 本來就含逐字稿）。
+            let head = current.length > 12 ? current.substring(to: 12) : (current as String)
+            log("[refine] 不動手：欄位裡找不到剛貼上的那段（欄位 \(current.length) 字、"
+                + "貼上段 \(inserted.count) 字、欄位前 12 字「\(head)」）")
             return false
         }
         // 必須唯一出現，否則可能換錯位置（同一個詞在一段文字裡重複很常見）
@@ -335,7 +339,17 @@ enum Transcriber {
         }
         _ = insertText(refined)
         let expected = current.replacingCharacters(in: first, with: refined)
-        guard let readback = ContextCapture.focusedTextField()?.text else {
+        // 注入是 CGEvent 分塊送出的（20 字一塊、塊間隔 8ms），立刻回讀會讀到「只打了一半」：
+        // 實測定版 28 字時馬上回讀只看到 20 字（30+20=50 ≠ 58），成功被誤判成失敗。
+        // 改成輪詢到相符或逾時，才不會把已經貼上的定版當成沒貼。
+        var readback: String?
+        let readbackDeadline = Date().addingTimeInterval(0.6)
+        repeat {
+            readback = ContextCapture.focusedTextField()?.text
+            if readback == expected { break }
+            usleep(60_000)
+        } while Date() < readbackDeadline
+        guard let readback else {
             log("[refine] 定版後讀不回欄位，無法確認是否成功")
             return false
         }

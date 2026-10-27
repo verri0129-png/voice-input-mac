@@ -502,17 +502,34 @@ def sanitize_punctuation(s: str) -> str:
         result = result[:-1] + "。"
     return result
 
+def _ensure_terminal_punct(s: str) -> str:
+    """整段沒有句末標點時補一個「。」。只加標點，一個字都不動。
+
+    Breeze 的 raw 完全沒有標點，規則路徑遇到沒有連接詞的句子（「…也都正確」）
+    會一個標點都沒有，貼上去像一坨字——雲端 timeout 時使用者看到的就是這版。
+    """
+    text = s.rstrip()
+    if len(_text_only(text)) < 8:
+        return s
+    if text and text[-1] in _ALL_PUNCT:
+        return s
+    print("[polish] 整段沒有結尾標點 → 補句號", file=sys.stderr)
+    return text + "。"
+
 def finalize_punctuation(s: str) -> str:
-    """輸出前最後一道：疊字標點收乾淨；整段沒有逗號又是長句時，才動用連接詞規則補斷句。"""
+    """輸出前最後一道：疊字標點收乾淨；整段沒有逗號又是長句時，才動用連接詞規則補斷句。
+
+    最後一律確認有結尾標點（見 `_ensure_terminal_punct`），規則版與雲端版都走這道。
+    """
     if not s:
         return s
     cleaned = sanitize_punctuation(_strip_invisible(normalize_punct_only(s)))
     if "，" in cleaned or len(_text_only(cleaned)) < 24:
-        return cleaned
+        return _ensure_terminal_punct(cleaned)
     patched = insert_clause_commas(cleaned)
     if patched != cleaned:
         print("[polish] 模型沒斷句（0 個逗號）→ 用連接詞規則補上", file=sys.stderr)
-    return patched
+    return _ensure_terminal_punct(patched)
 
 def rewrite_settings(
     backend: str | None = None,

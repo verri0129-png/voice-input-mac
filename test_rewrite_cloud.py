@@ -306,6 +306,23 @@ class RewriteCloudTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             transcribe.parse_serve_request(json.dumps({"wav": "/tmp/d.wav", "refine": 3}))
 
+    def test_rules_path_always_ends_with_terminal_punct(self):
+        # Breeze 的 raw 沒有標點，規則版是雲端失敗時使用者看到的唯一版本
+        self.assertEqual(
+            transcribe.rules_rewrite_text("因為我剛剛連續錄了兩次都沒問題中文字幕辨識的也都正確"),
+            "因為我剛剛連續錄了兩次都沒問題中文字幕辨識的也都正確。",
+        )
+        # 已經有結尾標點就不再加
+        self.assertEqual(transcribe.rules_rewrite_text("這樣可以嗎？"), "這樣可以嗎？")
+        # 太短的不補（嘆詞、單字）
+        self.assertEqual(transcribe.rules_rewrite_text("好"), "好")
+
+    def test_rules_path_keeps_clause_commas_and_adds_period(self):
+        self.assertEqual(
+            transcribe.rules_rewrite_text("然後我進去之後才發現這個問題沒有那麼簡單而且還需要再確認一次細節"),
+            "然後我進去之後，才發現這個問題沒有那麼簡單，而且還需要再確認一次細節。",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
