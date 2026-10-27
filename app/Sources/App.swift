@@ -227,7 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             let inserted = Transcriber.insertText(text)
                             var settled = inserted
                             if refinePending {
-                                if let refined = Transcriber.awaitRefinement(refineURL, timeout: 10),
+                                if let refined = Transcriber.awaitRefinement(refineURL, timeout: 15),
                                    refined != inserted,
                                    Transcriber.refineInsertedBlock(
                                        originalField: originalField,
