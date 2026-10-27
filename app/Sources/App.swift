@@ -225,12 +225,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         DispatchQueue.global(qos: .userInitiated).async {
                             let originalField = ContextCapture.learningSnapshot()?["field_text"]
                             let inserted = Transcriber.insertText(text)
+                            // 貼完立刻抓「欄位現在的樣子」（原本內容 + 剛貼的這段）。
+                            // 定版守門以它為基準：3 秒後欄位只要還是這個樣子，
+                            // 就代表使用者沒動過，可以安全替換。
+                            let afterInsert = refinePending ? Transcriber.fieldAfterInsert(inserted) : nil
                             var settled = inserted
                             if refinePending {
                                 if let refined = Transcriber.awaitRefinement(refineURL, timeout: 15),
                                    refined != inserted,
                                    Transcriber.refineInsertedBlock(
                                        originalField: originalField,
+                                       fieldAfterInsert: afterInsert,
                                        inserted: inserted,
                                        refined: refined
                                    ) {

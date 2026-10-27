@@ -294,17 +294,27 @@ enum Transcriber {
     @discardableResult
     static func refineInsertedBlock(
         originalField: String?,
+        fieldAfterInsert: String? = nil,
         inserted: String,
         refined: String
     ) -> Bool {
-        guard let originalField, !inserted.isEmpty, !refined.isEmpty, inserted != refined else {
-            if originalField == nil {
-                log("[refine] 不動手：貼上前抓不到欄位快照（無法確認你有沒有改過字）")
-            }
+        guard !inserted.isEmpty, !refined.isEmpty, inserted != refined else {
+            log("[refine] 不動手：沒有可替換的內容")
             return false
         }
         guard let field = ContextCapture.focusedTextField() else {
             log("[refine] 不動手：讀不到前景文字欄位")
+            return false
+        }
+        // 首選基準：貼完當下的欄位快照。使用者只要沒動過，它必須一字不差。
+        // 舊版拿「貼上前」的快照去比，AX 在貼上那一刻只要讀錯（實測少 8 字），
+        // 就永遠對不上、定版一次都貼不回去。
+        if let baseline = fieldAfterInsert {
+            return refineWithBaseline(field: field, baseline: baseline,
+                                      inserted: inserted, refined: refined)
+        }
+        guard let originalField else {
+            log("[refine] 不動手：貼上前抓不到欄位快照（無法確認你有沒有改過字）")
             return false
         }
         let current = field.text as NSString
@@ -349,16 +359,69 @@ enum Transcriber {
         }
         _ = insertText(refined)
         let expected = current.replacingCharacters(in: first, with: refined)
-        // 注入是 CGEvent 分塊送出的（20 字一塊、塊間隔 8ms），立刻回讀會讀到「只打了一半」：
-        // 實測定版 28 字時馬上回讀只看到 20 字（30+20=50 ≠ 58），成功被誤判成失敗。
-        // 改成輪詢到相符或逾時，才不會把已經貼上的定版當成沒貼。
+        return confirmReadback(expected)
+    }
+
+    /// 用「貼完當下的欄位內容」當基準替換定版。
+    ///
+    /// 這樣就不必回頭信任「貼上前」的快照：只要欄位現在和貼完時一字不差，
+    /// 就代表使用者還沒動過，可以安全換掉剛貼的那一段。
+    private static func refineWithBaseline(
+        field: (element: AXUIElement, text: String, role: String),
+        baseline: String,
+        inserted: String,
+        refined: String
+    ) -> Bool {
+        guard field.text == baseline else {
+            log("[refine] 不動手：貼上後欄位被改動（現 \(field.text.count) 字、貼完時 \(baseline.count) 字）")
+            return false
+        }
+        let base = baseline as NSString
+        let block = base.range(of: inserted)
+        guard block.location != NSNotFound else {
+            log("[refine] 不動手：貼完的快照裡找不到那段（快照 \(base.length) 字、貼上段 \(inserted.count) 字）")
+            return false
+        }
+        let searchStart = block.location + max(1, block.length)
+        if searchStart < base.length,
+           base.range(of: inserted, options: [],
+                      range: NSRange(location: searchStart, length: base.length - searchStart))
+               .location != NSNotFound {
+            log("[refine] 不動手：剛貼上的那段在欄位裡出現多次")
+            return false
+        }
+        guard ContextCapture.selectFieldRange(field.element, location: block.location, length: block.length) else {
+            log("[refine] 不動手：這個 App 不支援 AX 選取，無法原地替換")
+            return false
+        }
+        _ = insertText(refined)
+        let expected = base.replacingCharacters(in: block, with: refined)
+        return confirmReadback(expected)
+    }
+
+    /// 貼完後輪詢抓一次欄位內容（AX 有時比 CGEvent 慢一步）。
+    static func fieldAfterInsert(_ inserted: String, timeout: TimeInterval = 1.2) -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: String?
+        repeat {
+            if let text = ContextCapture.focusedTextField()?.text {
+                last = text
+                if text.contains(inserted) { return text }
+            }
+            usleep(80_000)
+        } while Date() < deadline
+        return last
+    }
+
+    /// 定版注入後回讀確認：CGEvent 是分塊送出的，立刻讀會看到「只打了一半」。
+    private static func confirmReadback(_ expected: String, timeout: TimeInterval = 0.6) -> Bool {
         var readback: String?
-        let readbackDeadline = Date().addingTimeInterval(0.6)
+        let deadline = Date().addingTimeInterval(timeout)
         repeat {
             readback = ContextCapture.focusedTextField()?.text
             if readback == expected { break }
             usleep(60_000)
-        } while Date() < readbackDeadline
+        } while Date() < deadline
         guard let readback else {
             log("[refine] 定版後讀不回欄位，無法確認是否成功")
             return false
@@ -367,7 +430,7 @@ enum Transcriber {
             log("[refine] 定版後回讀不符（預期 \(expected.count) 字、實際 \(readback.count) 字）")
             return false
         }
-        log("[refine] ✅ 原地定版（\(inserted.count) → \(refined.count) 字）")
+        log("[refine] ✅ 原地定版完成（\(readback.count) 字）")
         return true
     }
 
