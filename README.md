@@ -52,6 +52,22 @@ open .build/release/VoiceInputMac.app
 
 操作：`⌘E` 按一次開始錄音、再按一次結束並轉寫貼到當前游標（任意 App；左右 Cmd 都可）。結果進剪貼簿並自動 `Cmd+V`，中文一律繁體。
 
+## 第二意見（背景量測，不影響貼字）
+
+貼完字之後，python 端會把**同一段音訊**再送一次 Vertex `gemini-3.5-transcribe`，比對它跟本地
+Breeze 聽到的哪裡不一樣，寫進 `.second-opinion.jsonl`（gitignored）。它**不會改任何已貼上的字**，
+也不進定版流程——存在的目的只有一個：累積樣本回答「本地跟雲端誰常對」。
+
+**代價：音訊會離開這台機器**（上傳到自己的 Vertex 專案；原本只有文字會送）。`VOICE_SECOND_OPINION=0` 可整條關掉，serve 啟動時會印出 `[serve] 第二意見=on/off`。
+
+```bash
+./.venv/bin/python transcribe.py --second-opinion-report     # 一致率、常見不一致、延遲、token
+./.venv/bin/python transcribe.py /tmp/x.wav --second-opinion # 單檔同步跑一次並印出比對
+```
+
+比對只比「字」：兩邊都先繁化（雲端回簡體，`s2twp` 後才比）、再去掉標點；`10 → 十` 這種整段
+數字的差異記成「數字格式差異」，不算不一致。
+
 ## 模型來源
 
 - STT: 本地 `models/breeze-asr-25-mlx-4bit`

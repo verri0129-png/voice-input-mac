@@ -419,3 +419,42 @@ log 可以直接確認載入的是哪一顆。
 **風險（刻意接受）**：字串替換不看上下文，真的在講「磁庫」也會被改成「詞庫」。要看上下文只有雲端那條路，而它常常 timeout。
 
 **第一條詞庫**：`詞庫 ← 瓷庫／磁庫`（`rewrite_terms.json` 不進版控，M2／M4 各一份）。
+
+## 2026-10-27 第二意見：同一段音訊再送一次 Vertex 專用轉錄模型（量測用）
+
+**起點**：使用者問 `google-gemini/jot-gemini-transcribe-macOS` 是否比我們成熟。讀完 repo 的結論
+是「工程結構比我們成熟、但對這個用途不成熟」（沒有台灣繁中、音訊要上雲、Jot 只吃 AI Studio key）。
+真正的問題只剩一個：**`gemini-3.5-transcribe` 到底有沒有比本地 Breeze 準？** 沒資料不能亂換。
+
+**可用性（真機，不是文件推論）**：
+
+| 通路 | 結果 |
+|---|---|
+| Vertex `project-057ecfa1-…`／global，`generateContent` | **通**，8.4s 音檔 1.77s 回來，210 audio tokens |
+| 同一顆走 AI Studio key | 通，但 2.87s（比 Vertex 慢），而且要多一支 key |
+| `gemini-3.5-transcribe-live` 走 generateContent | 400：不支援，要走 Live API WebSocket |
+
+注意 **Vertex 專案 id 有 `project-` 前綴**（ADC 的 `quota_project_id`），填錯會回
+`403 CONSUMER_INVALID`——這個錯誤看起來像權限，其實是專案名寫錯。
+
+**同一句對照（`/tmp/p2.wav`）**：本地 `我們明天早上10點開會…裁剪端地…`／雲端
+`我们明天早上十点开会…裁剪断地…`——**兩邊錯的地方不一樣，字面其餘一字不差**。所以「雲端一定
+比較準」在這句上是假的，要樣本。
+
+**作法（`9e5bd48` 之後的第一條新支線）**：貼字路徑完全不動。`process_wav_file` 在「確定要貼」
+之後把音訊讀進記憶體，丟 `voice-2nd` 背景執行緒送 Vertex，比對後 append 到
+`.second-opinion.jsonl`（gitignored），`.run.log` 留一行 `[2nd] 一致／不一致 …`。
+
+- 比對只比字：兩邊先 `s2twp` 繁化（雲端回簡體）再去標點。
+- **數字格式不算錯**：`10 → 十` 記成 `formatting`，不進不一致率（同一句就會出現，會污染統計）。
+- 併發上限 2、超過 180s 的音訊不送；失敗只寫一筆 `status=error`，不影響任何看得到的東西。
+- **隱私邊界變了**：原本只有文字上雲，現在音訊也上雲（送自己的 Vertex 專案）。
+  `VOICE_SECOND_OPINION=0` 可關，serve 啟動固定印 `[serve] 第二意見=on/off`。
+
+**驗證（不是真人講話）**：單元測試 35 條全綠（新增 `test_second_opinion.py` 16 條）；單檔同步
+`--second-opinion` 實打 Vertex 回 `[2nd] 不一致 1 處：端→斷（1280ms）`；真 serve 協定下 JSON
+結果**先**印、`[2nd]` 後印，代表貼字沒被擋。
+
+**還沒驗**：真人按 ⌘E 累積一週樣本後的「誰常對」。判準＝
+`./.venv/bin/python transcribe.py --second-opinion-report` 的一致率與最常不一致清單。
+

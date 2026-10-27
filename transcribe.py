@@ -1,5 +1,7 @@
 """Pipe: record or file -> local Breeze ASR -> cloud rewrite -> clipboard or stdout."""
-import argparse, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
+import argparse, base64, difflib, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
+import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rewrite_cloud import (
@@ -104,6 +106,22 @@ CLOUD_REWRITE_THINKING = (
 REFINE_WAIT_SECONDS = float(_setting("VOICE_REFINE_WAIT", "8"))
 REWRITE_TERMS_FILE = _setting(
     "VOICE_REWRITE_TERMS_FILE", str(Path(__file__).with_name("rewrite_terms.json"))
+)
+# --- 背景第二意見（second opinion）------------------------------------------
+# 停止後貼上的路徑完全不變；這裡只是把同一段音訊**再**送一次 Vertex 的專用轉錄模型
+# （gemini-3.5-transcribe），比對它跟本地 Breeze 聽到的哪裡不一樣，寫進 JSONL。
+# 只記錄、不覆蓋任何已貼上的字（第一版只量不一致率，還不是決策依據）。
+# 代價：**音訊會離開這台機器**（上傳到使用者的 Vertex 專案）；文字原本就會送。
+# VOICE_SECOND_OPINION=0 可整條關掉。
+SECOND_OPINION = _setting("VOICE_SECOND_OPINION", "1").strip().lower() not in (
+    "0", "off", "no", "false", "",
+)
+SECOND_OPINION_MODEL = _setting("VOICE_SECOND_OPINION_MODEL", "gemini-3.5-transcribe")
+SECOND_OPINION_TIMEOUT = float(_setting("VOICE_SECOND_OPINION_TIMEOUT", "20"))
+# 太長的不送：轉錄模型音檔上限 1 小時，但「口述」沒必要上傳十分鐘的音訊。
+SECOND_OPINION_MAX_SECONDS = float(_setting("VOICE_SECOND_OPINION_MAX_SECONDS", "180"))
+SECOND_OPINION_LOG = _setting(
+    "VOICE_SECOND_OPINION_LOG", str(Path(__file__).with_name(".second-opinion.jsonl"))
 )
 DEFAULT_INPUT_DEVICE = _setting("VOICE_INPUT_DEVICE", None)
 SAMPLE_RATE = 16000
@@ -767,6 +785,7 @@ def process_wav_file(
     context=None,
     config=None,
     refine_path=None,
+    second_opinion_sync=False,
 ):
     """單檔處理（一次性 CLI 與 --serve 共用）。
 
@@ -823,10 +842,32 @@ def process_wav_file(
         print(f"[suspect] 疑似不是語音（{len(votes)} 票：" + "；".join(votes) +
               "）→ 不自動貼上（文字仍在 stdout，可用選單手動貼）", file=sys.stderr)
         return {"status": "suspect", "text": final, "rewrite": rewrite}
+    # 第二意見：同一段音訊再送一次 Vertex 轉錄模型，只記錄、不改字。
+    # 放在「確定要貼」之後、回傳之前；背景執行緒，貼字不等它。
+    extra = {}
+    if raw and (SECOND_OPINION or second_opinion_sync):
+        seconds = (len(a) / float(SAMPLE_RATE)) if a is not None else None
+        if second_opinion_sync:
+            try:
+                audio = Path(path).read_bytes()
+            except OSError as exc:
+                print(f"[2nd] 跳過：讀不到音檔（{exc}）", file=sys.stderr)
+                audio = None
+            if audio is not None:
+                record = second_opinion_record(audio, raw, settings, seconds=seconds)
+                print(f"[2nd] {describe_second_opinion(record)}", file=sys.stderr)
+                try:
+                    _append_jsonl(SECOND_OPINION_LOG, record)
+                except OSError as exc:
+                    print(f"[2nd] 寫入記錄失敗：{exc!r}", file=sys.stderr)
+                extra["second_opinion"] = record
+        else:
+            start_second_opinion(path, raw, settings, seconds=seconds)
     if defer_cloud:
         start_refinement(raw, context, settings, refine_path, final)
-        return {"status": "ok", "text": final, "rewrite": rewrite, "refine_pending": True}
-    return {"status": "ok", "text": final, "rewrite": rewrite}
+        return {"status": "ok", "text": final, "rewrite": rewrite,
+                "refine_pending": True, **extra}
+    return {"status": "ok", "text": final, "rewrite": rewrite, **extra}
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -910,6 +951,291 @@ def start_refinement(raw, context, settings, refine_path, pasted_text):
     )
     worker.start()
     return worker
+
+# --- 第二意見（second opinion）：同一段音訊再送一次 Vertex 專用轉錄模型 -----
+# 目的只有一個：量「本地 Breeze 跟雲端 gemini-3.5-transcribe 誰常對、錯在哪」。
+# 它**不碰**已貼上的字，也不進定版流程；寫 JSONL 供 `--second-opinion-report` 統計。
+_SECOND_OPINION_SLOTS = threading.Semaphore(
+    max(1, int(_setting("VOICE_SECOND_OPINION_PARALLEL", "2") or 2))
+)
+
+
+def build_cloud_transcribe_request(audio: bytes, settings, model: str | None = None):
+    """組出 Vertex generateContent 請求（純函式：測試不碰網路、不碰 ADC）。"""
+    from rewrite_cloud import _project_id
+
+    active_model = (model or SECOND_OPINION_MODEL).strip()
+    url = (
+        f"https://aiplatform.googleapis.com/v1/projects/{_project_id(settings)}"
+        f"/locations/{settings.location}/publishers/google/models/"
+        f"{urllib.parse.quote(active_model, safe='')}:generateContent"
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"inline_data": {
+            "mime_type": "audio/wav",
+            "data": base64.b64encode(audio).decode("ascii"),
+        }}]}],
+        # 只要「它聽到什麼字」：不加 smart 模式、不要求標點。
+        # 修正與標點仍是原本那條 gemini-3.8-flash 的事。
+        "generationConfig": {"temperature": 0},
+    }
+    return url, {"Content-Type": "application/json"}, payload
+
+
+def parse_cloud_transcript(response: dict) -> tuple[str, int, int]:
+    """從 Vertex 回應取出逐字稿與 token 數。
+
+    轉錄模型把文字放在 `parts[].audioTranscription.text`（實測 v1beta
+    generateContent 同時也放了 `parts[].text`），兩邊都讀、去重後串起來。
+    """
+    chunks: list[str] = []
+    for candidate in response.get("candidates") or []:
+        for part in (candidate.get("content") or {}).get("parts") or []:
+            chunk = ((part.get("audioTranscription") or {}).get("text") or part.get("text") or "")
+            chunk = chunk.strip()
+            if chunk and chunk not in chunks:
+                chunks.append(chunk)
+    usage = response.get("usageMetadata") or {}
+    return (
+        "".join(chunks),
+        int(usage.get("promptTokenCount", 0) or 0),
+        int(usage.get("candidatesTokenCount", 0) or 0),
+    )
+
+
+def cloud_transcribe_audio(
+    audio: bytes,
+    settings,
+    *,
+    model: str | None = None,
+    timeout: float | None = None,
+    transport=None,
+    token: str | None = None,
+) -> dict:
+    """送整段音訊到 Vertex 轉錄模型，回 {"text","input_tokens","output_tokens","elapsed_ms"}。"""
+    from rewrite_cloud import _post_json, mint_access_token
+
+    url, headers, payload = build_cloud_transcribe_request(audio, settings, model)
+    headers = dict(headers)
+    headers["Authorization"] = f"Bearer {token or mint_access_token(settings)}"
+    poster = transport or _post_json
+    started = time.perf_counter()
+    response = poster(url, headers, payload, float(timeout or SECOND_OPINION_TIMEOUT))
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    text, input_tokens, output_tokens = parse_cloud_transcript(response)
+    return {
+        "text": text,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+_ARABIC_DIGITS = set("0123456789.")
+_CN_NUMERALS = set("〇零一二三四五六七八九十百千萬萬億兩两")
+
+
+def _is_numeral_only(text: str) -> bool:
+    """整段都是數字（阿拉伯或中文數字）。用來把「10 → 十」歸成格式差異。"""
+    compact = "".join(ch for ch in text if not ch.isspace())
+    if not compact:
+        return False
+    if all(ch in _ARABIC_DIGITS for ch in compact):
+        return True
+    return all(ch in _CN_NUMERALS or ch in _ARABIC_DIGITS for ch in compact)
+
+
+def compare_transcripts(local: str, cloud: str, max_spans: int = 6) -> dict:
+    """比「字」不比標點：兩邊都先繁化再只留文字，才不會把「，」算成錯。
+
+    「10 → 十」這種整段都是數字的差異算**格式差異**，不算聽錯：實測同一句就會出現，
+    混進不一致率會讓「誰比較準」的統計失真。
+    """
+    local_chars = _text_only(to_taiwan_traditional(local))
+    cloud_chars = _text_only(to_taiwan_traditional(cloud))
+    if local_chars == cloud_chars:
+        return {
+            "agree": True,
+            "spans": [],
+            "formatting": [],
+            "local_chars": len(local_chars),
+            "cloud_chars": len(cloud_chars),
+            "diff_chars": 0,
+        }
+    matcher = difflib.SequenceMatcher(None, local_chars, cloud_chars, autojunk=False)
+    spans = []
+    formatting = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        local_part, cloud_part = local_chars[i1:i2], cloud_chars[j1:j2]
+        if _is_numeral_only(local_part) and _is_numeral_only(cloud_part):
+            formatting.append({"local": local_part, "cloud": cloud_part, "at": i1})
+            continue
+        if len(spans) < max_spans:
+            spans.append({"local": local_part, "cloud": cloud_part, "at": i1})
+    return {
+        "agree": not spans,
+        "spans": spans,
+        "formatting": formatting,
+        "local_chars": len(local_chars),
+        "cloud_chars": len(cloud_chars),
+        "diff_chars": sum(max(len(s["local"]), len(s["cloud"])) for s in spans),
+    }
+
+
+def second_opinion_record(
+    audio: bytes,
+    local_text: str,
+    settings,
+    *,
+    seconds: float | None = None,
+    transport=None,
+    token: str | None = None,
+) -> dict:
+    record = {
+        "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "model": SECOND_OPINION_MODEL,
+        "seconds": round(float(seconds), 2) if seconds else None,
+        "local": local_text,
+    }
+    try:
+        result = cloud_transcribe_audio(
+            audio, settings, transport=transport, token=token
+        )
+    except Exception as exc:  # noqa: BLE001 - 第二意見失敗不能影響任何看得到的東西
+        record.update({"status": "error", "error": str(exc)[:200]})
+        return record
+    record.update(
+        {
+            "status": "ok",
+            "cloud": to_taiwan_traditional(result["text"]),
+            "cloud_raw": result["text"],
+            "elapsed_ms": result["elapsed_ms"],
+            "input_tokens": result["input_tokens"],
+            "output_tokens": result["output_tokens"],
+            **compare_transcripts(local_text, result["text"]),
+        }
+    )
+    return record
+
+
+def _append_jsonl(path: str, record: dict) -> None:
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def describe_second_opinion(record: dict) -> str:
+    if record.get("status") != "ok":
+        return f"失敗（{str(record.get('error', ''))[:80]}）"
+    if record.get("agree"):
+        formatting = record.get("formatting") or []
+        extra = ""
+        if formatting:
+            extra = "、數字格式 " + "；".join(
+                f"{s.get('local') or '∅'}→{s.get('cloud') or '∅'}" for s in formatting
+            )
+        return f"一致{extra}（{record.get('elapsed_ms', 0)}ms）"
+    spans = "；".join(
+        f"{s.get('local') or '∅'}→{s.get('cloud') or '∅'}" for s in record.get("spans") or []
+    )
+    return f"不一致 {len(record.get('spans') or [])} 處：{spans}（{record.get('elapsed_ms', 0)}ms）"
+
+
+def second_opinion_in_background(audio: bytes, local_text: str, settings, seconds=None):
+    if not _SECOND_OPINION_SLOTS.acquire(blocking=False):
+        print("[2nd] 跳過：已經有兩個第二意見在跑", file=sys.stderr)
+        return None
+    try:
+        record = second_opinion_record(audio, local_text, settings, seconds=seconds)
+        try:
+            _append_jsonl(SECOND_OPINION_LOG, record)
+        except OSError as exc:
+            print(f"[2nd] 寫入記錄失敗：{exc!r}", file=sys.stderr)
+        print(f"[2nd] {describe_second_opinion(record)}", file=sys.stderr)
+        return record
+    finally:
+        _SECOND_OPINION_SLOTS.release()
+
+
+def start_second_opinion(path, local_text, settings, seconds=None):
+    """把第二意見丟到背景。音訊在這裡（同步）讀進記憶體，之後 App 刪檔也不影響。"""
+    if not (SECOND_OPINION and local_text):
+        return None
+    if seconds is not None and seconds > SECOND_OPINION_MAX_SECONDS:
+        print(
+            f"[2nd] 跳過：{seconds:.0f}s 超過上限 {SECOND_OPINION_MAX_SECONDS:.0f}s",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        audio = Path(path).read_bytes()
+    except OSError as exc:
+        print(f"[2nd] 跳過：讀不到音檔（{exc}）", file=sys.stderr)
+        return None
+    worker = threading.Thread(
+        target=second_opinion_in_background,
+        args=(audio, local_text, settings, seconds),
+        name="voice-2nd",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def second_opinion_report(path: str | None = None) -> str:
+    """統計 JSONL：一致率、常見不一致、延遲與 token。"""
+    target = Path(path or SECOND_OPINION_LOG)
+    if not target.exists():
+        return f"[2nd] 還沒有任何記錄（{target}）"
+    records = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    ok = [r for r in records if r.get("status") == "ok"]
+    errors = [r for r in records if r.get("status") == "error"]
+    agree = [r for r in ok if r.get("agree")]
+    pairs: dict[tuple[str, str], int] = {}
+    for record in ok:
+        for span in record.get("spans") or []:
+            key = (span.get("local", ""), span.get("cloud", ""))
+            pairs[key] = pairs.get(key, 0) + 1
+    lines = [
+        f"樣本 {len(records)}（成功 {len(ok)}、失敗 {len(errors)}），"
+        f"一致 {len(agree)}、不一致 {len(ok) - len(agree)}"
+    ]
+    formatting_total = sum(len(r.get("formatting") or []) for r in ok)
+    if formatting_total:
+        lines.append(f"數字格式差異 {formatting_total} 處（10→十 這類，不算不一致）")
+    if ok:
+        elapsed = sorted(int(r.get("elapsed_ms", 0) or 0) for r in ok)
+        mid = len(elapsed) // 2
+        median = (
+            elapsed[mid]
+            if len(elapsed) % 2
+            else int((elapsed[mid - 1] + elapsed[mid]) / 2)
+        )
+        lines.append(f"一致率 {len(agree) / len(ok):.0%}")
+        lines.append(f"延遲 中位 {median}ms、最大 {elapsed[-1]}ms")
+        lines.append(
+            f"token 輸入 {sum(int(r.get('input_tokens', 0) or 0) for r in ok)}、"
+            f"輸出 {sum(int(r.get('output_tokens', 0) or 0) for r in ok)}"
+        )
+    if pairs:
+        lines.append("最常不一致（本地→雲端）：")
+        for (local, cloud), count in sorted(pairs.items(), key=lambda kv: -kv[1])[:10]:
+            lines.append(f"  {local or '∅'} → {cloud or '∅'}  ×{count}")
+    for record in errors[:5]:
+        lines.append(f"  失敗樣本 {record.get('ts')}：{str(record.get('error', ''))[:80]}")
+    return "\n".join(lines)
+
 
 def partial_text(path, language="zh"):
     """錄音中「即時預覽」用：Whisper ＋ 繁化，**不潤飾**。
@@ -1017,6 +1343,14 @@ def serve_forever(language="zh", polish=True, config=None):
     # 把實際載入的模型寫進 log：改 local.env 之後要一眼看出「現在是哪一顆」
     # （踩過：改完設定，舊的暖機程序還在跑，log 只看得到「已有暖機程序，不重啟」）
     print(f"[serve] STT={STT_REPO} REWRITE={active.backend}:{active.model}", file=sys.stderr)
+    # 第二意見會把音訊送出機器：這行是每次啟動的「你正在上傳音訊」提示，
+    # 不像 rewrite 那樣只送文字。要看狀態就從這裡看，不要猜。
+    print(
+        f"[serve] 第二意見={'on' if SECOND_OPINION else 'off'} "
+        f"model={SECOND_OPINION_MODEL} log={SECOND_OPINION_LOG}"
+        + ("" if SECOND_OPINION else "（VOICE_SECOND_OPINION=0）"),
+        file=sys.stderr,
+    )
     try:
         to_taiwan_traditional("暖機")
         import numpy as np
@@ -1200,6 +1534,10 @@ def main():
     ap.add_argument("--paste", action="store_true", help="paste via clipboard+ AppleScript Cmd+V")
     ap.add_argument("--serve", action="store_true",
                     help="暖機伺服器：stdin 每行一個 wav 路徑，stdout 每行一個 JSON 結果（模型只載入一次）")
+    ap.add_argument("--second-opinion", action="store_true",
+                    help="同一段音訊再送一次 Vertex 轉錄模型並印出比對（同步，供驗證用）")
+    ap.add_argument("--second-opinion-report", action="store_true",
+                    help="統計第二意見記錄：一致率、常見不一致、延遲與 token")
     args = ap.parse_args()
     if args.learn_edit_json:
         terms_file = args.terms_file or REWRITE_TERMS_FILE
@@ -1213,6 +1551,9 @@ def main():
             variants=args.terms_variant,
             remove=args.terms_remove,
         )
+        return
+    if args.second_opinion_report:
+        print(second_opinion_report())
         return
     settings = rewrite_settings(
         backend=args.rewrite_backend,
@@ -1247,7 +1588,10 @@ def main():
             polish=not args.no_polish,
             context=context,
             config=settings,
+            second_opinion_sync=args.second_opinion,
         )
+        if r.get("second_opinion"):
+            print(json.dumps(r["second_opinion"], ensure_ascii=False), file=sys.stderr)
         # stdout 只放最終文字：app 整份取用，不可能再誤取診斷行（以前的 "[raw] …" 洩漏）
         if r["text"]:
             print(r["text"])
