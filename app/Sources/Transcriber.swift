@@ -313,8 +313,18 @@ enum Transcriber {
             // 沒有這行線索時「找不到」完全無法追：AX 讀到的內容可能被目標 app 正規化、
             // 也可能根本是別的欄位。只記長度與最前面一小段（log 本來就含逐字稿）。
             let head = current.length > 12 ? current.substring(to: 12) : (current as String)
+            let ins = inserted as NSString
+            let tailCurrent = current.length > 12 ? current.substring(from: current.length - 12) : ""
+            let tailInserted = ins.length > 12 ? ins.substring(from: ins.length - 12) : inserted
+            var diffIndex = -1
+            let common = min(current.length, ins.length)
+            for i in 0..<common where current.character(at: i) != ins.character(at: i) {
+                diffIndex = i
+                break
+            }
             log("[refine] 不動手：欄位裡找不到剛貼上的那段（欄位 \(current.length) 字、"
-                + "貼上段 \(inserted.count) 字、欄位前 12 字「\(head)」）")
+                + "貼上段 \(inserted.count) 字、首個不同處 \(diffIndex)、"
+                + "欄位「\(head)…\(tailCurrent)」、貼上段「\(inserted.prefix(12))…\(tailInserted)」）")
             return false
         }
         // 必須唯一出現，否則可能換錯位置（同一個詞在一段文字裡重複很常見）
