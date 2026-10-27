@@ -471,6 +471,18 @@ _TERMINAL_PUNCT = "。？！"
 _CLAUSE_PUNCT = "，、：；"
 _ALL_PUNCT = _TERMINAL_PUNCT + _CLAUSE_PUNCT + "「」『』（）【】…—～"
 
+# 疑問語氣判斷：10/19 的 M2 純規則版就有（`origin/wip/m2-voice-input-20261020`
+# 的 `_QUESTION_TAIL`／`punctuate_deterministic`），改成「先貼再定版」時被雲端路徑
+# 取代、整條規則跟著消失，結果規則版一律收「。」，問句也是句號。
+# 只認明確的正反問與句末語氣詞，避免把「我不知道他為什麼沒來」這種直述句判成問句。
+_QUESTION_TAIL = re.compile(
+    r"(嗎|呢|好不好|對不對|是不是|要不要|可不可以|有沒有|行不行|能不能|會不會|對吧|是吧)$"
+)
+
+def _terminal_mark(base: str) -> str:
+    """句尾該用「？」還是「。」：只有明確疑問語氣才用問號。只決定標點，不動字。"""
+    return "？" if _QUESTION_TAIL.search(base.rstrip(_CLAUSE_PUNCT + " 　")) else "。"
+
 def sanitize_punctuation(s: str) -> str:
     """把疊在一起的標點收乾淨（「吧，？」→「吧？」、「，，」→「，」）。
 
@@ -497,13 +509,13 @@ def sanitize_punctuation(s: str) -> str:
         out.append("".join(c for k, c in enumerate(keep) if k == 0 or c != keep[k - 1]))
         i = j
     result = "".join(out)
-    # 結尾吊著逗號類很難看（「…是在錄音的，」）→ 收成句號
+    # 結尾吊著逗號類很難看（「…是在錄音的，」）→ 收成句號或問號
     if result and result[-1] in _CLAUSE_PUNCT:
-        result = result[:-1] + "。"
+        result = result[:-1] + _terminal_mark(result[:-1])
     return result
 
 def _ensure_terminal_punct(s: str) -> str:
-    """整段沒有句末標點時補一個「。」。只加標點，一個字都不動。
+    """整段沒有句末標點時補一個結尾標點：問句「？」、其餘「。」。只加標點，一個字都不動。
 
     Breeze 的 raw 完全沒有標點，規則路徑遇到沒有連接詞的句子（「…也都正確」）
     會一個標點都沒有，貼上去像一坨字——雲端 timeout 時使用者看到的就是這版。
@@ -513,8 +525,9 @@ def _ensure_terminal_punct(s: str) -> str:
         return s
     if text and text[-1] in _ALL_PUNCT:
         return s
-    print("[polish] 整段沒有結尾標點 → 補句號", file=sys.stderr)
-    return text + "。"
+    mark = _terminal_mark(text)
+    print(f"[polish] 整段沒有結尾標點 → 補「{mark}」", file=sys.stderr)
+    return text + mark
 
 def finalize_punctuation(s: str) -> str:
     """輸出前最後一道：疊字標點收乾淨；整段沒有逗號又是長句時，才動用連接詞規則補斷句。

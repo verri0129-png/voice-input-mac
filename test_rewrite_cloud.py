@@ -323,6 +323,22 @@ class RewriteCloudTests(unittest.TestCase):
             "然後我進去之後，才發現這個問題沒有那麼簡單，而且還需要再確認一次細節。",
         )
 
+    def test_rules_path_uses_question_mark_for_questions(self):
+        # 10/19 M2 純規則版就有的疑問尾規則，改成先貼再定版時掉了
+        self.assertEqual(
+            transcribe.rules_rewrite_text("但是我錄了兩次當中那個字幕好像會先跑出來這是正常的對不對"),
+            "但是我錄了兩次當中那個字幕好像會先跑出來這是正常的對不對？",
+        )
+        self.assertEqual(transcribe.rules_rewrite_text("這個尺寸還有庫存嗎"), "這個尺寸還有庫存嗎？")
+        # 直述句不可以被誤判成問句
+        self.assertEqual(
+            transcribe.rules_rewrite_text("我不知道他為什麼沒來開會"),
+            "我不知道他為什麼沒來開會。",
+        )
+        self.assertEqual(
+            transcribe.rules_rewrite_text("這批布料今天下午會到廠"), "這批布料今天下午會到廠。"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
