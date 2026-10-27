@@ -33,6 +33,7 @@ VERTEX_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 DEFAULT_CONTEXT_CHARS = 100
 DEFAULT_SELECTED_CHARS = 300
 DEFAULT_VISIBLE_CHARS = 1000
+DEFAULT_FULL_FIELD_CHARS = 1200
 DEFAULT_MAX_TERMS = 60
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_OUTPUT_TOKENS = 1024
@@ -536,6 +537,8 @@ def sanitize_context(context: dict | None) -> dict:
         "text_before": text("text_before", DEFAULT_CONTEXT_CHARS),
         "text_after": text("text_after", DEFAULT_CONTEXT_CHARS),
         "visible_text": text("visible_text", DEFAULT_VISIBLE_CHARS),
+        # Typeless 的 `full_field_content`：整個輸入框內容。同音字靠它才分得出來。
+        "full_field_text": text("full_field_text", DEFAULT_FULL_FIELD_CHARS),
     }
     if context.get("blocked") is True:
         reason = context.get("reason")
@@ -583,6 +586,12 @@ def build_prompt(draft: str, context: dict, terms: list[TermRule]) -> tuple[str,
         lines.append(f"當前 App：{_clean_text(clean_context['app_name'])}")
     if _clean_text(clean_context.get("window_title")):
         lines.append(f"視窗標題：{_clean_text(clean_context['window_title'])}")
+    full_field = _clean_text(clean_context.get("full_field_text"))
+    if full_field:
+        lines.append(
+            "輸入框現有內容（使用者原本打的字；只用來判斷同音字與領域用詞，"
+            f"絕對不要複製、改寫或刪掉它）：\n{full_field}"
+        )
     if _clean_text(clean_context.get("selected_text")):
         lines.append(f"已選取文字：{_clean_text(clean_context['selected_text'])}")
     before = _clean_text(clean_context.get("text_before"))

@@ -369,6 +369,28 @@ class RewriteCloudTests(unittest.TestCase):
         rules = [rewrite_cloud.TermRule(text="詞庫", variants=("瓷庫",))]
         self.assertIn("詞庫", transcribe._settle_text("請更新瓷庫的說明文件", rules))
         self.assertIn("瓷庫", transcribe._settle_text("請更新瓷庫的說明文件"))
+    def test_prompt_includes_full_field_content_for_homophones(self):
+        # 照抄 Typeless 的 full_field_content：欄位裡已出現的寫法要讓模型看得到
+        system, _user = rewrite_cloud.build_prompt(
+            "剛剛那個詞庫怪怪的",
+            {"app_name": "備忘錄", "full_field_text": "今天要把瓷庫的檔案整理好"},
+            [],
+        )
+        self.assertIn("輸入框現有內容", system)
+        self.assertIn("今天要把瓷庫的檔案整理好", system)
+
+    def test_terms_cli_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "terms.json")
+            transcribe.handle_terms_cli(path, add="詞庫", variants="瓷庫,磁庫")
+            rules = rewrite_cloud.load_term_rules(path)
+            self.assertEqual([(r.text, r.variants) for r in rules], [("詞庫", ("瓷庫", "磁庫"))])
+            # 再補一個變體：合併而不是覆蓋（loader 會依長度排序，所以比集合）
+            transcribe.handle_terms_cli(path, add="詞庫", variants="此褲")
+            rules = rewrite_cloud.load_term_rules(path)
+            self.assertEqual(set(rules[0].variants), {"瓷庫", "磁庫", "此褲"})
+            transcribe.handle_terms_cli(path, remove="詞庫")
+            self.assertEqual(rewrite_cloud.load_term_rules(path), [])
 
 
 if __name__ == "__main__":

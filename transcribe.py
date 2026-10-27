@@ -1063,6 +1063,66 @@ def load_request_context(path: str | None) -> dict:
     return payload
 
 
+def handle_terms_cli(path: str, *, list_: bool = False, add: str | None = None,
+                     variants: str = "", remove: str | None = None) -> None:
+    """本機版「個人詞庫」管理，對等 Typeless 的 /user/dictionary/{add,list,delete}。
+
+    他們把詞庫放伺服器（add/list/update/delete/bulk-import）；我們放
+    `rewrite_terms.json`（不進版控），形狀相容於 `load_term_rules()`。
+    """
+    doc_path = Path(path)
+    document: dict = {"version": 1, "terms": []}
+    if doc_path.exists():
+        try:
+            loaded = json.loads(doc_path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise SystemExit(f"[terms] {path} 不是合法 JSON，未變更：{exc}") from exc
+        if isinstance(loaded, list):
+            document = {"version": 1, "terms": loaded}
+        elif isinstance(loaded, dict):
+            document = loaded
+            document.setdefault("terms", [])
+        else:
+            raise SystemExit(f"[terms] {path} 形狀不認得（既不是物件也不是陣列）")
+    rows = document.setdefault("terms", [])
+
+    if list_ or (add is None and remove is None):
+        if not rows:
+            print("(詞庫是空的)")
+            return
+        for row in rows:
+            if isinstance(row, str):
+                print(f"{row}\t-")
+            elif isinstance(row, dict):
+                variants_list = row.get("match") or row.get("variants") or []
+                print(f"{row.get('text', '')}\t{'、'.join(variants_list) if variants_list else '-'}")
+        return
+
+    if add:
+        new_variants = [v.strip() for v in variants.replace("，", ",").split(",") if v.strip()]
+        for row in rows:
+            if isinstance(row, dict) and row.get("text") == add:
+                merged = list(dict.fromkeys(list(row.get("match") or []) + new_variants))
+                row["match"] = merged
+                break
+        else:
+            rows.append({"text": add, "match": new_variants})
+        doc_path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8")
+        print(f"[terms] 已寫入「{add}」（變體：{'、'.join(new_variants) or '無'}）→ {path}")
+        return
+
+    if remove:
+        before = len(rows)
+        rows[:] = [
+            row for row in rows
+            if not (isinstance(row, dict) and row.get("text") == remove) and row != remove
+        ]
+        doc_path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8")
+        print(f"[terms] 已刪除「{remove}」（{before - len(rows)} 筆）→ {path}")
+
+
 def learn_edit_file(path: str, terms_file: str) -> dict:
     try:
         with open(path, encoding="utf-8") as handle:
@@ -1090,6 +1150,10 @@ def main():
     ap.add_argument("--context-json", default=None, help="Typeless-style context JSON 檔案")
     ap.add_argument("--terms-file", default=None, help="個人專有名詞 JSON 檔案")
     ap.add_argument("--learn-edit-json", default=None, help="從一次手動修正學到個人詞庫")
+    ap.add_argument("--terms-list", action="store_true", help="列出個人詞庫（對等 Typeless 的 dictionary list）")
+    ap.add_argument("--terms-add", default=None, help="新增/更新詞庫條目：--terms-add 詞庫 --terms-variant 瓷庫,磁庫")
+    ap.add_argument("--terms-variant", default="", help="搭配 --terms-add：可能被聽錯的寫法，逗號分隔")
+    ap.add_argument("--terms-remove", default=None, help="從詞庫刪除一個詞")
     ap.add_argument("--cloud-model", default=None)
     ap.add_argument("--cloud-location", default=None)
     ap.add_argument("--cloud-project", default=None)
@@ -1110,6 +1174,15 @@ def main():
     if args.learn_edit_json:
         terms_file = args.terms_file or REWRITE_TERMS_FILE
         learn_edit_file(args.learn_edit_json, terms_file)
+        return
+    if args.terms_list or args.terms_add or args.terms_remove:
+        handle_terms_cli(
+            args.terms_file or REWRITE_TERMS_FILE,
+            list_=args.terms_list,
+            add=args.terms_add,
+            variants=args.terms_variant,
+            remove=args.terms_remove,
+        )
         return
     settings = rewrite_settings(
         backend=args.rewrite_backend,

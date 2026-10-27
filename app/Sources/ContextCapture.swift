@@ -17,6 +17,7 @@ enum ContextCapture {
     static let selectedLimit = 300
     static let unrangedFieldLimit = 500
     static let maxFieldCharacters = 20_000
+    static let fullFieldLimit = 3_000
     static let visibleCharacterLimit = 1_000
     static let visibleNodeLimit = 250
     static let visibleDepthLimit = 3
@@ -375,9 +376,14 @@ enum ContextCapture {
             let length = max(0, min(range.length, ns.length - location))
             let beforeStart = max(0, location - beforeLimit)
             let afterEnd = min(ns.length, location + length + afterLimit)
+            // 整份輸入框內容：Typeless 的做法（他們的 `full_field_content`）。
+            // 同音字光靠聲音分不出來，欄位裡已經出現過的寫法才是最強的線索。
+            let fieldStart = max(0, location + length - fullFieldLimit)
             return [
                 "text_before": ns.substring(with: NSRange(location: beforeStart, length: location - beforeStart)),
-                "text_after": ns.substring(with: NSRange(location: location + length, length: afterEnd - location - length))
+                "text_after": ns.substring(with: NSRange(location: location + length, length: afterEnd - location - length)),
+                "cursor_position": String(location),
+                "full_field_text": ns.substring(with: NSRange(location: fieldStart, length: location + length - fieldStart))
             ]
         }
         if ns.length <= unrangedFieldLimit {
