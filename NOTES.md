@@ -1,3 +1,17 @@
+## 2026-10-27 Priority PayGo：header 送得出去，但目前幾乎都被算成標準價
+
+- 目的：語音重寫（`gemini-3.8-flash`，global）走優先池，避開 DSQ 的 429／排隊。
+- 做法：`RewriteConfig.priority`（預設由 `VOICE_CLOUD_PRIORITY` 控制，預設 `1`）→ 送
+  `X-Vertex-AI-LLM-Request-Type: shared` + `X-Vertex-AI-LLM-Shared-Request-Type: priority`；
+  `RewriteResult.traffic_type` 讀回 `usageMetadata.trafficType`，`[rewrite]` log 會印 `traffic=...`。
+- 判準（官方）：`ON_DEMAND_PRIORITY` = 真的走優先池；`ON_DEMAND` = 被降級、按標準價計費。
+- 實測（同一個 project，M2/M4 都試）：大多回 `ON_DEMAND`，只有一次回 `ON_DEMAND_PRIORITY`（1.8s）。
+  同一時段小請求延遲 2–26 秒、偶爾 12 秒 timeout → 共享池當下很擠。
+- 結論：**開關已就緒但尚未真的生效**。不會多收錢（降級就按標準價），但也還沒買到優先權。
+  下一步只能：問 Google 開資格，或改買 Provisioned Throughput（要簽承諾）。
+- 陷阱：`urllib` 會把 header 名 `.capitalize()` 成 `X-vertex-ai-llm-...`；Google 這邊實測兩種大小寫都吃，
+  但要用 `http.client` 驗證原始大小寫時，**記得補 `Content-Length`**，否則回 411。
+
 
 ## 2026-10-17 全域快捷鍵（⌘E）按了沒反應 → 真正原因與修法
 
