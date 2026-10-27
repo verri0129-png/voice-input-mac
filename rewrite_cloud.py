@@ -77,6 +77,19 @@ class TermRule:
     note: str = ""
 
 
+class RewriteRejected(RuntimeError):
+    """守門拒絕雲端結果，但把模型原文一起帶出來。
+
+    呼叫端（transcribe）可以用它做「只搬標點」：字一律用原話，只採用模型的標點。
+    以前這裡直接 RuntimeError，整段定版就沒了，使用者只看到沒有標點的規則版。
+    """
+
+    def __init__(self, reason: str, model_text: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.model_text = model_text
+
+
 @dataclass(frozen=True)
 class RewriteResult:
     text: str
@@ -947,7 +960,8 @@ def rewrite_draft(
     )
     checked = len(_content_chars(canonical_draft(draft)))
     if not ok:
-        raise RuntimeError(reason)
+        # 帶上模型原文，讓呼叫端可以退成「只搬標點」而不是整段放棄。
+        raise RewriteRejected(reason, model_text=text)
     return RewriteResult(
         text=final_text,
         backend=f"cloud:{active.model}",
@@ -968,6 +982,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_VISIBLE_CHARS",
     "RewriteConfig",
+    "RewriteRejected",
     "RewriteResult",
     "TermRule",
     "build_prompt",

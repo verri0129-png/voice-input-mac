@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rewrite_cloud import (
     RewriteConfig,
+    RewriteRejected,
     RewriteResult,
     infer_term_candidates,
     learn_insertion_edits,
@@ -536,10 +537,28 @@ _ALL_PUNCT = _TERMINAL_PUNCT + _CLAUSE_PUNCT + "「」『』（）【】…—�
 _QUESTION_TAIL = re.compile(
     r"(嗎|呢|好不好|對不對|是不是|要不要|可不可以|有沒有|行不行|能不能|會不會|對吧|是吧)$"
 )
+# 句尾語氣詞：先剝掉再判斷（「…要怎麼解啊」）
+_TAIL_PARTICLES = "啊啦嘛呀喔哦耶"
+# 疑問詞（wh-）：只認「同一子句裡、疑問詞前面沒有否定」的情況，
+# 避免把「我不知道他為什麼沒來」「我沒有說誰要來」判成問句。
+_WH_WORDS = ("什麼時候", "什麼", "怎麼", "為什麼", "哪裡", "哪一個", "哪個", "哪邊",
+             "誰", "多少", "幾個", "幾點", "多久")
+_NEGATIONS = ("不", "沒", "別", "無")
 
 def _terminal_mark(base: str) -> str:
     """句尾該用「？」還是「。」：只有明確疑問語氣才用問號。只決定標點，不動字。"""
-    return "？" if _QUESTION_TAIL.search(base.rstrip(_CLAUSE_PUNCT + " 　")) else "。"
+    core = base.rstrip(_CLAUSE_PUNCT + " 　").rstrip(_TAIL_PARTICLES)
+    if _QUESTION_TAIL.search(core):
+        return "？"
+    clause = core.split("，")[-1]
+    for word in _WH_WORDS:
+        i = clause.rfind(word)
+        if i < 0:
+            continue
+        if any(neg in clause[:i] for neg in _NEGATIONS):
+            return "。"
+        return "？"
+    return "。"
 
 def sanitize_punctuation(s: str) -> str:
     """把疊在一起的標點收乾淨（「吧，？」→「吧？」、「，，」→「，」）。
@@ -716,6 +735,27 @@ def apply_rewrite(
             config=settings,
             allowed_deletions=_allowed_rewrite_deletions(),
         )
+    except RewriteRejected as exc:
+        # 守門拒絕：模型改了字／刪了不該刪的。以前整段放棄 → 使用者只看到沒有標點的
+        # 規則版。現在退成「只搬標點」：字一律用原話，只採用模型標的標點。
+        model_text = str(getattr(exc, "model_text", "") or "")
+        if model_text.strip():
+            moved = transfer_punctuation(text, model_text)
+            if moved and moved != text:
+                print(
+                    f"[rewrite] 雲端被守門拒絕（{exc.reason}）→ 只搬標點，字不動",
+                    file=sys.stderr,
+                )
+                info["backend"] = "cloud:punct-only"
+                info["reason"] = str(exc.reason)[:300]
+                info["traffic_type"] = str(getattr(exc, "traffic_type", "") or "")
+                return finalize_punctuation(
+                    to_taiwan_traditional(normalize_spacing(moved))
+                ), info
+        print(f"[rewrite] 雲端重寫退回規則（{exc.reason}）", file=sys.stderr)
+        info["backend"] = "rules-fallback"
+        info["reason"] = str(exc.reason)[:300]
+        return rules_rewrite_text(text, rules), info
     except Exception as exc:  # noqa: BLE001 - transcription must survive rewrite failures
         print(f"[rewrite] 雲端重寫退回規則（{exc}）", file=sys.stderr)
         info["backend"] = "rules-fallback"

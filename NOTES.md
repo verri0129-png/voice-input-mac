@@ -1,3 +1,17 @@
+## 2026-10-27 標點問題：定版放棄率 54%，主因 timeout 與守門誤殺
+
+- M2 實跑 121 次聽寫：定版成功 56、放棄 65（TimeoutError 56、守門誤殺 7、英文代號 2）。
+  放棄就等於使用者只看到規則版 → 標點弱、問句沒問號。
+- 修 1（守門誤殺）：`rewrite_cloud.RewriteRejected` 帶出模型原文，`transcribe.apply_rewrite`
+  改成退「只搬標點」（`transfer_punctuation`）：字一律用原話，只採用模型的標點。
+  實測那句「好啦…要怎麼解」以前整段放棄，現在 `backend=cloud:punct-only`、字沒被改、問號有了。
+- 修 2（問號）：`_terminal_mark` 原本只認「嗎/呢/正反問」。加上疑問詞（什麼/怎麼/為什麼/哪裡/
+  哪一個/誰/多少…），但同一子句疑問詞前面有否定（不/沒/別/無）就維持句號，
+  避免「我不知道他為什麼沒來。」被判成問句。句尾語氣詞（啊/啦/嘛…）先剝掉再判斷。
+- 修 3（timeout）：Priority PayGo 生效後實測 1.2–3.0s（先前 2–26s），先觀察一天再決定
+  要不要把 `VOICE_CLOUD_REWRITE_TIMEOUT` 從 12 拉到 15（App 端等待也要一起調）。
+- 回歸測試：新增 `test_punctuation.py`（8 條）；`test_punctuation + test_rewrite_cloud +
+  test_second_opinion` 共 61 條全綠。
 ## 2026-10-27 Priority PayGo：header 送得出去，但目前幾乎都被算成標準價
 
 - 目的：語音重寫（`gemini-3.8-flash`，global）走優先池，避開 DSQ 的 429／排隊。
