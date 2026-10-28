@@ -245,8 +245,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             }
                             // 用「定版後」的文字記帳，否則 20 秒後的比對會把定版本身
                             // 當成使用者手改，學到錯誤的詞。
+                            // 基準＝此刻整份欄位內容；空欄位（開新備忘錄直接講）就靠它，
+                            // 貼上前那份快照本來就是空的，不能拿來比。
+                            let baselineField = (ContextCapture.learningSnapshot()?["field_text"] as? String)
+                                ?? afterInsert
+                                ?? originalField.map { $0 + settled }
                             EditLearning.schedule(
                                 originalField: originalField,
+                                baselineField: baselineField,
                                 insertedText: settled,
                                 context: context,
                                 termsFile: EditLearning.termsFileURL()
