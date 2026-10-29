@@ -256,15 +256,78 @@ enum Transcriber {
         }
     }
 
-    /// 對外入口：先走暖機路徑（快），不行才退回一次性路徑（慢但一定通）。
+    /// 對外入口：Soniox 模式先拿串流結果；其餘照舊（暖機路徑 → 一次性路徑）。
     static func transcribe(wavURL: URL, contextJSON: String? = nil,
                            refinePath: String? = nil) throws -> (text: String, suspect: Bool, refinePending: Bool) {
+        if SonioxCoordinator.enabled {
+            if let sonioxText = SonioxCoordinator.finishAndTakeText(), !sonioxText.isEmpty {
+                let (text, suspect) = try postprocess(text: sonioxText, contextJSON: contextJSON)
+                // 文字回來就是最終版：沒有「等定版」這一段（refinePending=false）
+                return (text, suspect, false)
+            }
+            log("[app] Soniox 沒回文字 → 退回原本路徑（同一段音檔再送一次）")
+        }
         if let r = try transcribeWarm(wavURL: wavURL, contextJSON: contextJSON,
                                       refinePath: refinePath) {
             return r
         }
         let (text, suspect) = try transcribeOneShot(wavURL: wavURL, contextJSON: contextJSON)
         return (text, suspect, false)   // 一次性路徑不走定版（那條路徑沒有回應通道）
+    }
+
+    /// Soniox 模式：文字已經有了，交回 python 做繁化＋詞庫＋收尾。
+    /// 走暖機程序（一次請求一行回應）；它不在就退回一次性 CLI。
+    static func postprocess(text: String, contextJSON: String? = nil) throws -> (text: String, suspect: Bool) {
+        var payload: [String: Any] = ["text": text]
+        if let contextJSON,
+           let data = contextJSON.data(using: .utf8),
+           let context = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            payload["context"] = context
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let request = String(data: data, encoding: .utf8),
+           let raw = serverRequest(request, timeout: 20),
+           let responseData = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] {
+            let status = (obj["status"] as? String) ?? "error"
+            let result = ((obj["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            log("[post] status=\(status) 文字=\(result)")
+            switch status {
+            case "ok":      return (result, false)
+            case "silence": throw NSError(domain: "Transcriber", code: 3,
+                                          userInfo: [NSLocalizedDescriptionKey: "沒有可用語音"])
+            default:        break
+            }
+        }
+        // 暖機程序不在（或回應壞掉）→ 一次性跑同一支 python
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice-post-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        guard (try? JSONSerialization.data(withJSONObject: ["text": text]).write(to: tmp)) != nil else {
+            throw NSError(domain: "Transcriber", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "後處理失敗：寫不出暫存檔"])
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pythonBin)
+        proc.arguments = [scriptPath, "--postprocess-json", tmp.path]
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = FileHandle.nullDevice
+        try proc.run()
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        let result = (String(data: outData, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        log("[post] 一次性 exit=\(proc.terminationStatus) 文字=\(result)")
+        if proc.terminationStatus == 3 {
+            throw NSError(domain: "Transcriber", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "沒有可用語音"])
+        }
+        guard proc.terminationStatus == 0, !result.isEmpty else {
+            throw NSError(domain: "Transcriber", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "後處理失敗（exit \(proc.terminationStatus)）"])
+        }
+        return (result, false)
     }
 
     /// 等 Python 背景把定版文字寫進 refine 檔（Typeless 式）。

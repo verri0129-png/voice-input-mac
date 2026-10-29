@@ -3,3 +3,4 @@ sounddevice
 huggingface_hub
 numpy
 opencc-python-reimplemented
+websockets

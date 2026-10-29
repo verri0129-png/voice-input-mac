@@ -52,6 +52,15 @@ def _setting(name, default):
     return os.environ.get(name) or _LOCAL.get(name) or default
 
 STT_REPO = _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
+
+# ── STT provider ──────────────────────────────────────────────────────────────
+# breeze（預設）：本地 Breeze-ASR-25，完全離線。
+# soniox        ：Soniox 即時 API（雲端），自帶標點，停止後幾乎不用等；
+#                 代價是每句音訊離機、斷網不能用。切回只要把 local.env 的
+#                 VOICE_STT 改回 breeze（兩條路線的程式都保留）。
+STT_PROVIDER = (_setting("VOICE_STT", "breeze") or "breeze").strip().lower()
+# Soniox 認得幾個詞就吃幾個（context 上限 8000 token，比 Whisper 的 224 token 寬鬆）
+SONIOX_MAX_TERMS = int(_setting("VOICE_SONIOX_MAX_TERMS", "120"))
 # Whisper 的 initial_prompt：實測能修掉同音字誤判（「逗號」被聽成「痘号」），
 # 而且因為寫了「台灣中文」，輸出傾向繁體（OpenCC 那道仍然保留當保險）。
 STT_INITIAL_PROMPT = _setting(
@@ -835,6 +844,95 @@ def parse_serve_request(line: str) -> tuple[str, dict, str | None]:
     return text, {}, None
 
 
+# ── Soniox 路線（VOICE_STT=soniox）────────────────────────────────────────────
+#
+# 和 Breeze 路線的差別：Soniox 自己吐標點、自己定案，所以沒有「先貼規則版、
+# 雲端在背景定版」那一段；停止後拿到的文字就是最終版。Breeze 路線的程式一行都
+# 沒動，切回只要把 local.env 的 VOICE_STT 改回 breeze。
+
+
+def soniox_terms(terms_file: str | None = None) -> list[str]:
+    """Soniox 的 context 熱詞：只放「正字」，長詞先放。
+
+    不放誤聽變體：Whisper 的 initial_prompt 曾把變體一起塞進去，結果模型更常寫錯；
+    Soniox 的 context 是「你要的寫法」清單，混進變體等於教它寫錯字。
+    """
+    rules = load_term_rules(terms_file or REWRITE_TERMS_FILE)
+    terms: list[str] = []
+    for rule in rules:
+        text = rule.get("text") if isinstance(rule, dict) else getattr(rule, "text", None)
+        if isinstance(text, str) and text and text not in terms:
+            terms.append(text)
+    extra = _setting("VOICE_SONIOX_TERMS", "") or ""
+    for word in re.split(r"[,，、]", extra):
+        word = word.strip()
+        if word and word not in terms:
+            terms.append(word)
+    terms.sort(key=len, reverse=True)   # 長詞優先，短詞不會先吃掉
+    return terms[:SONIOX_MAX_TERMS]
+
+
+def postprocess_transcript(text: str, *, rules=None) -> dict:
+    """把 Soniox 的文字收成可以貼的樣子。
+
+    Soniox 給的是「簡體＋標點」，所以順序和 Breeze 路線不同：
+      1. 先繁化（詞庫是繁體，先套詞庫永遠不命中）
+      2. 再套詞庫字串替換
+      3. 最後才補結尾標點（Soniox 通常已經有，這步只是保險）
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {"status": "silence", "text": ""}
+    # 保險：Soniox 的控制標記（<end>、<fin> 之類）不該出現在貼出去的文字裡
+    raw = re.sub(r"<[a-zA-Z_]+>", "", raw).strip()
+    if not raw:
+        return {"status": "silence", "text": ""}
+    text = cleanup_disfluencies(normalize_spacing(raw))
+    text = to_taiwan_traditional(text)
+    if rules:
+        text = apply_terms(text, rules)
+    text = normalize_spacing(text)
+    text = _ensure_terminal_punct(text)
+    return {"status": "ok", "text": text}
+
+
+def process_wav_file_soniox(path, *, language="zh", label="", config=None) -> dict:
+    """單檔走 Soniox（CLI 驗證、Swift 端失敗時的後備）。"""
+    a = wav_samples(path)
+    if a is not None and is_silence(a):
+        peak_db, window_db = audio_levels(a)
+        print(f"[gate]{label} 沒收到聲音（peak {peak_db:.1f} dB、最大 0.5s 窗 rms {window_db:.1f} dB）"
+              f" → 不送 Soniox（避免花錢換幻覺）", file=sys.stderr)
+        return {"status": "silence", "text": ""}
+    settings = config or rewrite_settings()
+    rules = load_term_rules(settings.terms_file)
+    terms = soniox_terms(settings.terms_file)
+    from soniox_stt import transcribe_wav
+
+    try:
+        result = transcribe_wav(path, terms=terms, language=language)
+    except Exception as exc:  # noqa: BLE001 - 對外回錯誤，App 會退回 Breeze 路徑
+        print(f"[soniox] 失敗：{exc!r}", file=sys.stderr)
+        return {"status": "error", "text": "", "detail": repr(exc)}
+    raw = (result.get("text") or "").strip()
+    print(f"[soniox] 轉錄 {result.get('elapsed_ms')}ms 音訊 {result.get('audio_s')}s "
+          f"信心 {result.get('confidence')} 熱詞 {len(terms)}", file=sys.stderr)
+    print(f"[raw] {raw}", file=sys.stderr)
+    out = postprocess_transcript(raw, rules=rules)
+    if out["status"] == "silence":
+        print("[stt] Soniox 沒有辨識到內容（靜音或麥克風沒收到訊號）", file=sys.stderr)
+    else:
+        print(f"[final] {out['text']}", file=sys.stderr)
+    out["rewrite"] = {
+        "backend": "soniox",
+        "stt": "soniox",
+        "terms": len(terms),
+        "confidence": result.get("confidence"),
+        "milliseconds": result.get("elapsed_ms"),
+    }
+    return out
+
+
 def process_wav_file(
     path,
     language="zh",
@@ -856,6 +954,10 @@ def process_wav_file(
     雲端重寫丟到背景執行緒，完成後把定版文字寫進 refine_path，由 App 原地替換。
     這樣單次雲端呼叫的 2–20 秒不會擋在「停止錄音→看到文字」之間。
     """
+    if STT_PROVIDER == "soniox":
+        # Soniox 模式：完全不碰本地模型。refine_path 也用不到——回來的文字
+        # 已經是最終版，App 不會進入「等定版」那一段。
+        return process_wav_file_soniox(path, language=language, label=label, config=config)
     a = wav_samples(path)
     if a is not None and is_silence(a):
         peak_db, window_db = audio_levels(a)
@@ -1518,10 +1620,13 @@ def serve_forever(language="zh", polish=True, config=None):
     """
     import json
     active = config or rewrite_settings()
-    print(f"[serve] 暖機中（OpenCC + 本地 ASR；重寫={active.backend}）…", file=sys.stderr)
+    soniox_mode = STT_PROVIDER == "soniox"
+    print(f"[serve] 暖機中（OpenCC{' + 本地 ASR' if not soniox_mode else '；STT=Soniox 雲端，不載本地模型'}；"
+          f"重寫={active.backend}）…", file=sys.stderr)
     # 把實際載入的模型寫進 log：改 local.env 之後要一眼看出「現在是哪一顆」
     # （踩過：改完設定，舊的暖機程序還在跑，log 只看得到「已有暖機程序，不重啟」）
-    print(f"[serve] STT={STT_REPO} REWRITE={active.backend}:{active.model}", file=sys.stderr)
+    print(f"[serve] STT={'soniox' if soniox_mode else STT_REPO} REWRITE={active.backend}:{active.model}",
+          file=sys.stderr)
     # 第二意見會把音訊送出機器：這行是每次啟動的「你正在上傳音訊」提示，
     # 不像 rewrite 那樣只送文字。要看狀態就從這裡看，不要猜。
     print(
@@ -1532,10 +1637,11 @@ def serve_forever(language="zh", polish=True, config=None):
     )
     try:
         to_taiwan_traditional("暖機")
-        import numpy as np
-        # 必須「不是靜音」才會真的觸發 Whisper 載入（is_silence 會提早 return）
-        warm = (np.random.default_rng(0).standard_normal(SAMPLE_RATE).astype("float32") * 0.02)
-        transcribe_audio(warm, language=language)
+        if not soniox_mode:
+            import numpy as np
+            # 必須「不是靜音」才會真的觸發 Whisper 載入（is_silence 會提早 return）
+            warm = (np.random.default_rng(0).standard_normal(SAMPLE_RATE).astype("float32") * 0.02)
+            transcribe_audio(warm, language=language)
         print("[serve] 暖機完成，等待請求", file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         print(f"[serve] 暖機失敗（不致命：第一次請求會慢一點）: {e!r}", file=sys.stderr)
@@ -1553,7 +1659,25 @@ def serve_forever(language="zh", polish=True, config=None):
         if not isinstance(req, str):
             print(f"[serve] 忽略非文字請求：{type(req).__name__}", file=sys.stderr)
             continue
+        # Soniox 模式：App 已經有一份帶標點的文字，只要繁化＋詞庫＋收尾。
+        # 走同一條 stdin/stdout 協定，一次請求一行回應，不動既有排隊邏輯。
+        if req.startswith("{"):
+            try:
+                peek = json.loads(req)
+            except ValueError:
+                peek = None
+            if isinstance(peek, dict) and isinstance(peek.get("text"), str):
+                rules = load_term_rules(active.terms_file)
+                out = postprocess_transcript(peek["text"], rules=rules)
+                print(f"[post] {len(peek['text'])} 字 → {out['status']} {len(out.get('text') or '')} 字",
+                      file=sys.stderr)
+                print(json.dumps(out, ensure_ascii=False), flush=True)
+                continue
         if req.startswith("partial "):
+            if soniox_mode:
+                # Soniox 是即時串流，錄音中不需要再跑一次本地預覽
+                print(json.dumps({"status": "partial", "text": ""}, ensure_ascii=False), flush=True)
+                continue
             # 錄音中的即時預覽。優先權最低：先看不阻塞地是不是已經有「完整請求」在排隊，
             # 有就直接放棄這次預覽去處理它 —— 使用者按下停止後不該再等一個過期的預覽跑完。
             queued = reader.drain()
@@ -1717,7 +1841,29 @@ def main():
                     help="同一段音訊再送一次 Vertex 轉錄模型並印出比對（同步，供驗證用）")
     ap.add_argument("--second-opinion-report", action="store_true",
                     help="統計第二意見記錄：一致率、常見不一致、延遲與 token")
+    ap.add_argument("--stt", choices=["breeze", "soniox"], default=None,
+                    help="覆寫 VOICE_STT：breeze（本地，預設）或 soniox（雲端即時）")
+    ap.add_argument("--postprocess-json", default=None,
+                    help="只做後處理：吃 {\"text\": ...} 或純文字檔，印出繁化＋詞庫後的最終文字")
     args = ap.parse_args()
+    global STT_PROVIDER
+    if args.stt:
+        STT_PROVIDER = args.stt
+    if args.postprocess_json:
+        payload = Path(args.postprocess_json).read_text(encoding="utf-8")
+        try:
+            doc = json.loads(payload)
+            text = (doc.get("text") or "") if isinstance(doc, dict) else payload
+        except ValueError:
+            text = payload
+        rules = load_term_rules(args.terms_file or REWRITE_TERMS_FILE)
+        out = postprocess_transcript(text, rules=rules)
+        print(f"[post] {out['status']} {len(out.get('text') or '')} 字", file=sys.stderr)
+        if out["text"]:
+            print(out["text"])
+        if out["status"] == "silence":
+            sys.exit(3)
+        return
     if args.learn_edit_json:
         terms_file = args.terms_file or REWRITE_TERMS_FILE
         learn_edit_file(args.learn_edit_json, terms_file)

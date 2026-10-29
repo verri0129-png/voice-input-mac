@@ -180,11 +180,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isRecording = true
         statusItem.button?.title = "🔴"
         // 趁使用者講話時先把模型載好（暖機 ~6s），按下停止後只剩推論（~0.9s）
+        // Soniox 模式：這個程序只負責「文字後處理」（繁化＋詞庫），不載本地模型。
         Transcriber.startWarmServer()
+        if SonioxCoordinator.enabled {
+            SonioxCoordinator.begin()
+            recorder.onAudio = { data in SonioxCoordinator.audio(data) }
+        } else {
+            recorder.onAudio = nil
+        }
         recorder.start()
         indicator.show()          // 畫面上的音波指示圖（不搶焦點）
-        startPreviewLoop()        // 即時預覽（暖機完成後才真的開始送）
-        Transcriber.log("[app] recording start")
+        if !SonioxCoordinator.enabled {
+            startPreviewLoop()    // 即時預覽只給 Breeze 用（Soniox 本來就即時）
+        }
+        Transcriber.log("[app] recording start（STT=\(SonioxCoordinator.enabled ? "soniox" : "breeze")）")
     }
 
     @objc func stopAndTranscribe() {
@@ -195,10 +204,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tStop = Date()
         statusItem.button?.title = "⏳"
         guard let url = recorder.stop() else {
+            recorder.onAudio = nil
+            SonioxCoordinator.cancel()
             statusItem.button?.title = "🎙️"
             Transcriber.log("[app] recording stop：沒有音訊，放棄")
             return
         }
+        recorder.onAudio = nil
         Transcriber.log("[app] recording stop -> \(url.path)")
         DispatchQueue.global(qos: .userInitiated).async {
             do {

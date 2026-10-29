@@ -10,6 +10,9 @@ final class Recorder: NSObject {
     private let sampleRate: Double = 16000
     /// 錄音中的即時音量 0…1（在主執行緒回呼），給畫面錄音指示圖用。
     var onLevel: ((Float) -> Void)?
+    /// 錄音中每個音訊塊（16k mono Int16 little-endian）→ Soniox 串流用。
+    /// 由 App 在 Soniox 模式下設定、停止時清掉；Breeze 模式保持 nil。
+    var onAudio: ((Data) -> Void)?
     private var maxLevel: Float = 0
     private var loggedLevel = false
 
@@ -117,18 +120,31 @@ final class Recorder: NSObject {
                 self.maxLevel = max(self.maxLevel, norm)
                 DispatchQueue.main.async { onLevel(norm) }
             }
+            var mixed = [Float](repeating: 0, count: n)
             if chCount == 1 {
-                self.sampleLock.lock()
-                self.samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: n))
-                self.sampleLock.unlock()
+                mixed.withUnsafeMutableBufferPointer { dst in
+                    if let base = dst.baseAddress { base.update(from: ch[0], count: n) }
+                }
             } else {
-                self.sampleLock.lock()
                 for i in 0..<n {
                     var sum: Float = 0
                     for c in 0..<chCount { sum += ch[c][i] }
-                    self.samples.append(sum / Float(chCount))
+                    mixed[i] = sum / Float(chCount)
                 }
-                self.sampleLock.unlock()
+            }
+            self.sampleLock.lock()
+            self.samples.append(contentsOf: mixed)
+            self.sampleLock.unlock()
+            // Soniox 串流：同一份混音後的音訊同步送出去（16k mono Int16 LE）。
+            // 這裡刻意不進 sampleLock：cb 只做網路送出的排隊，不碰 samples。
+            if let onAudio = self.onAudio {
+                var int16 = [Int16](repeating: 0, count: n)
+                for i in 0..<n {
+                    int16[i] = Int16(max(-1, min(1, mixed[i])) * 32767)
+                }
+                var data = Data(capacity: n * 2)
+                int16.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
+                onAudio(data)
             }
         }
         engine.prepare()
