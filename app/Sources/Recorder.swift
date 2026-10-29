@@ -13,7 +13,18 @@ final class Recorder: NSObject {
     private var maxLevel: Float = 0
     private var loggedLevel = false
 
+    /// 只收引擎、不動樣本（給 start() 開頭與 stop() 共用）。
+    private func teardownEngine() {
+        guard let engine else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        self.engine = nil
+    }
+
     func start() {
+        // 上一次沒收乾淨（引擎還在跑、tap 還掛在節點上）時再 install 一次 tap
+        // 會讓 AVAudioEngine 丟 ObjC NSException，Swift 攔不到 → 整個 process SIGABRT。
+        teardownEngine()
         sampleLock.lock(); samples = []; sampleLock.unlock()
         maxLevel = 0
         loggedLevel = false
@@ -22,23 +33,40 @@ final class Recorder: NSObject {
         let input = engine.inputNode
         let formatIn = input.outputFormat(forBus: 0)
         Transcriber.log("[rec] input format \(Int(formatIn.sampleRate))Hz \(formatIn.channelCount)ch device=\(inputDeviceName())")
-        guard formatIn.channelCount > 0 else {
-            Transcriber.log("[rec] 沒有可用的輸入裝置（channelCount=0）")
+        // 沒有裝置、或系統塞了一個半死的 aggregate（實測 CADefaultDeviceAggregate）
+        // 時 sampleRate 會是 0，硬 installTap 就是 abort。
+        guard formatIn.sampleRate > 0, formatIn.channelCount > 0 else {
+            Transcriber.log("[rec] 輸入裝置不可用（\(Int(formatIn.sampleRate))Hz \(formatIn.channelCount)ch），放棄這次錄音")
+            teardownEngine()
             return
         }
         // 取樣率轉換時保留通道數，之後才自己混成單聲道。
         // 直接請 AVAudioConverter 做 2ch → 1ch 會踩到 channel layout 問題：整段變成數位靜音
         // （本 app 一直是這樣，錄進來的每個檔都是全 0，Whisper 只好開始幻覺）。
-        guard let formatOut = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
-                                           channels: formatIn.channelCount, interleaved: false),
-              let converter = AVAudioConverter(from: formatIn, to: formatOut) else {
-            Transcriber.log("[rec] converter init failed（in=\(formatIn)）")
-            return
-        }
-        let ratio = sampleRate / formatIn.sampleRate
+        // converter 改成拿到第一塊音訊後、依它的實際格式建：tap 的 format 傳 nil
+        // （＝用節點當下的輸出格式），裝置中途被換掉也不會格式不符而炸掉。
+        var converter: AVAudioConverter?
+        var outFormat: AVAudioFormat?
+        var ratio: Double = 1
+        var loggedTapFormat = false
         var loggedChannels = false
-        input.installTap(onBus: 0, bufferSize: 4096, format: formatIn) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
+            if converter == nil {
+                guard let out = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: self.sampleRate,
+                                              channels: buffer.format.channelCount, interleaved: false),
+                      let made = AVAudioConverter(from: buffer.format, to: out) else {
+                    Transcriber.log("[rec] converter init failed（in=\(buffer.format)）")
+                    return
+                }
+                converter = made
+                outFormat = out
+                ratio = self.sampleRate / buffer.format.sampleRate
+            }
+            if !loggedTapFormat {
+                loggedTapFormat = true
+                Transcriber.log("[rec] tap 實際格式 \(Int(buffer.format.sampleRate))Hz \(buffer.format.channelCount)ch")
+            }
             if !loggedChannels, let ch = buffer.floatChannelData {
                 loggedChannels = true
                 let peaks = (0..<Int(buffer.format.channelCount)).map { c -> String in
@@ -48,8 +76,9 @@ final class Recorder: NSObject {
                 }
                 Transcriber.log("[rec] 硬體每通道峰值 ch=[\(peaks.joined(separator: ", "))] @\(Int(buffer.format.sampleRate))Hz")
             }
+            guard let converter, let outFormat else { return }
             let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
-            guard let pcm = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else { return }
+            guard let pcm = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else { return }
             // 同一塊輸入只餵一次，之後回 .noDataNow；每次都回 .haveData 會讓 SRC 重複吃同一塊。
             var supplied = false
             var err: NSError?
@@ -103,13 +132,16 @@ final class Recorder: NSObject {
             }
         }
         engine.prepare()
-        do { try engine.start() } catch { Transcriber.log("[rec] engine start failed: \(error)") }
+        do {
+            try engine.start()
+        } catch {
+            Transcriber.log("[rec] engine start failed: \(error)")
+            teardownEngine()
+        }
     }
 
     func stop() -> URL? {
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
+        teardownEngine()
         let snapshot = snapshotSamples()
         guard !snapshot.isEmpty else {
             Transcriber.log("[rec] 沒有取到任何樣本（麥克風權限被拒，或輸入裝置沒送訊號）")

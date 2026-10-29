@@ -45,6 +45,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Dock 可見、可用 Dock 選單關閉/重啟
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 只允許一個實例。兩份同時在跑會互相搶麥克風（第二份拿到的是
+        // CADefaultDeviceAggregate，installTap 直接丟 NSException → SIGABRT），
+        // 而且兩個都註冊了 ⌘E，同一段字會被貼兩次。
+        let mine = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .map(\.processIdentifier)
+            .filter { $0 != mine }
+        if let existing = others.min(), existing < mine {
+            Transcriber.log("[app] 已有另一個實例在跑（pid=\(existing)），本實例結束")
+            NSApp.terminate(nil)
+            return
+        }
         let axOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(axOpts)
         NSApp.setActivationPolicy(.regular)
