@@ -52,6 +52,43 @@ open .build/release/VoiceInputMac.app
 
 操作：`⌘E` 按一次開始錄音、再按一次結束並轉寫貼到當前游標（任意 App；左右 Cmd 都可）。結果進剪貼簿並自動 `Cmd+V`，中文一律繁體。
 
+## 健康狀態（health.json）
+
+「現在有沒有壞」有機器可讀的答案，不必回頭翻 log：
+
+```bash
+python3 healthcheck.py                 # 產 ~/orca/state/voice-input/health.json，印 HEALTH=OK/DEGRADED
+python3 healthcheck.py --emit          # 壞掉時會開哪些單（dry-run，只印 WOULD_CREATE）
+python3 healthcheck.py --emit --apply  # 真的開 GitHub issue，編號寫回 emitted_issues.json
+```
+
+`health.json` 欄位：`agent_loaded`（熱鍵 agent 在 `launchctl` 清單裡）、`last_exit`、
+`app_running`（⌘E 有沒有 App 接）、`err_lines_since_last_check`（上次檢查之後
+`~/orca/state/voice-toggle-hotkey.err.log` 多了幾行，靠 `checkpoint.json` 的 offset；
+第一次跑只建立基準、不把歷史 log 算成新錯誤）、`stt_backend`（`breeze`／`soniox`／`unknown`）、
+`checked_at`。`stt_backend` 讀的是**實際在跑的那個 checkout** 的 `local.env`（預設
+`~/orca/voice-input-mac`，可用 `--runtime` 指定），不讀本 clone 的、也不讀 shell 的環境變數
+——App 是 GUI 啟動的，看不到你 shell 裡 export 的東西。
+
+開單規則只有一處：`healthcheck.collect_findings`（App 沒跑、agent 沒載入、`last_exit` 非 0、
+error log 有新增行、`VOICE_STT` 認不得）。`issue_emitter.py` 是可共用的 core：去重 key
+`<!-- key: health/<date>/<field>/<sha8> -->`、五段 body、gh 去重、編號回寫都在那裡，
+新 repo 只要提供「什麼算 finding」。健康的機器跑 `--emit` 會印 `EMIT_ISSUES=NONE`。
+
+重放驗證（不必等真的壞）：
+
+```bash
+cp ~/orca/state/voice-input/health.json /tmp/h.json
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("/tmp/h.json"); d = json.loads(p.read_text())
+d["app_running"] = False; d["app_pids"] = []
+p.write_text(json.dumps(d, ensure_ascii=False))
+PY
+python3 healthcheck.py --from-health /tmp/h.json --emit --apply   # CREATED（一張）
+python3 healthcheck.py --from-health /tmp/h.json --emit --apply   # SKIPPED_EXISTING（不是第二張）
+```
+
 ## 第二意見（背景量測，不影響貼字）
 
 貼完字之後，python 端會把**同一段音訊**再送一次 Vertex `gemini-3.5-transcribe`，比對它跟本地

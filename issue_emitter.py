@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""把 finding 變成去重後的 GitHub issue —— 可共用的 core。
+
+這支刻意不知道任何 repo 的事：**什麼算 finding** 由呼叫端提供（本 repo 是
+`healthcheck.py` 的 `collect_findings`），這裡只負責四件事：
+
+1. **key**：`<prefix>/<scope>/<field>/<value-sha8>`，是「觀測值」的函式，
+   同一個值重跑不會重開單，值變了才會開第二張。`key_salt` 用來區分
+   「同一個值、但發生在不同機器／不同對象」。
+2. **marker**：issue body 第一行 `<!-- key: … -->`，去重的唯一依據
+   （不靠標題搜尋，所以改標題不會讓同一件事重開單）。
+3. **五段 body**：背景／證據／重現命令／完成定義（gate token）／不可動範圍，
+   跟 `.github/ISSUE_TEMPLATE/task.yml` 同一套形狀。
+4. **去重與編號回寫**：建立前掃既有 issue（含已關閉）的 marker；建立後把
+   issue 編號寫回本機 record（JSON），下次連 gh 都不用問就知道開過。
+
+daily-qa 的 `emit_issues.py`／`emit_review_issues.py` 是同一個設計的特例；
+新 repo 直接 import 這支，不要複製一份再改死。
+
+用法：
+
+    from issue_emitter import Finding, emit_all
+    emit_all(findings, scope="2026-11-01", repo=Path("."), apply=False)
+
+判定行（給 shell 與 gate 用的固定台詞）：
+
+    EMIT_ISSUES=NONE           沒有 finding，什麼都不該開
+    EMIT_ISSUES=DRY_RUN        只印 WOULD_CREATE，沒有寫入
+    EMIT_ISSUES=CREATED        至少開了一張（或全部被跳過）
+    EMIT_ISSUES=FAIL           讀 gh／建立失敗（exit 2）
+    SKIPPED_EXISTING key=…     GitHub 上已有同一個 key
+    SKIPPED_RECORDED key=…     record 裡已有編號（連 gh 都省了）
+
+Exit codes：0 = 做完該做的事（含「沒東西要開」）、2 = gh／record 失敗。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+MARKER = "<!-- key: {key} -->"
+KEY_LINE_PREFIX = "<!-- key: "
+DEFAULT_LIMIT = 300
+
+DEFAULT_FORBIDDEN = """\
+不改 Hermes 的 config／skills、不動 `~/.hermes`。
+不重啟或重裝 launchd agent（`install.sh`、`com.hunghanchu.*.plist`），除非這張單就是要修它。
+不改模型來源與 Vertex 專案設定；不動 `local.env`（含憑證）。
+不把音檔內容、轉錄全文、個人用語表寫進 repo 或 issue。"""
+
+
+class EmitterError(RuntimeError):
+    """gh 或 record 讀寫失敗——呼叫端應該收成 `EMIT_ISSUES=FAIL`。"""
+
+
+@dataclass(frozen=True)
+class Finding:
+    """一件值得開單的事。內容全部由呼叫端提供；這裡只管鍵與排版。"""
+
+    field: str                     # 去重鍵裡的欄位名，例 "app_running"
+    value: str                     # 觀測值；sha8 由它（加上 key_salt）決定
+    title: str                     # 一句話現象（不含 `[health] ` 這種前綴）
+    problem: str                   # 背景段：發生什麼、哪台、為什麼算問題
+    done: str                      # 完成定義：哪個可觀測訊號從什麼變成什麼
+    reproduce: str = ""            # shell 片段（不含 ``` 圍籬）
+    evidence: tuple[str, ...] = ()  # 證據條列（路徑＋行號，不貼全文）
+    labels: tuple[str, ...] = ()
+    forbidden: str = DEFAULT_FORBIDDEN
+    key_prefix: str = "health"
+    key_salt: str = ""             # 同一值在不同機器時用來分開鍵
+    observation: str = "重跑一次同一條檢查，不是等下一次自然故障。"
+    source: str = ""               # 這張單是誰產生的，例 "healthcheck.py"
+
+    def digest(self) -> str:
+        raw = f"{self.key_salt}|{self.value}" if self.key_salt else self.value
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+
+    def key(self, scope: str) -> str:
+        return f"{self.key_prefix}/{scope}/{self.field}/{self.digest()}"
+
+    def marker(self, scope: str) -> str:
+        return MARKER.format(key=self.key(scope))
+
+
+def build_body(finding: Finding, scope: str) -> str:
+    """五段 body。第一行一定是 marker——去重只認那一行。"""
+
+    evidence = list(finding.evidence) or ["（呼叫端沒有提供證據條目）"]
+    evidence += [
+        f"觸發欄位：`{finding.field}` = `{finding.value}`",
+        f"scope：`{finding.key_prefix}/{scope}`",
+    ]
+    # 呼叫端可以自己帶「- 」開頭，不要變成「- - 」。
+    bullets = "\n".join(
+        line if line.lstrip().startswith("- ") else f"- {line}" for line in evidence
+    )
+    reproduce = finding.reproduce.strip() or "（呼叫端沒有提供重現命令）"
+    source_line = (
+        f"（本單由 `{finding.source}` 自動產生，不是人手寫的判斷。）"
+        if finding.source
+        else ""
+    )
+    background = finding.problem.strip()
+    if source_line:
+        background += "\n\n" + source_line
+    return f"""{finding.marker(scope)}
+
+## 背景
+
+{background}
+
+## 證據
+
+{bullets}
+
+## 重現命令
+
+```bash
+{reproduce}
+```
+
+## 完成定義（gate token）
+
+{finding.done.strip()}
+
+觀測來源：{finding.observation}
+
+## 不可動範圍
+
+{finding.forbidden.strip()}
+"""
+
+
+def parse_marker_keys(items: Iterable[dict]) -> set[str]:
+    """從 `gh issue list --json number,body` 的結果抽出所有 key（含已關閉的單）。"""
+
+    keys: set[str] = set()
+    for item in items:
+        body = item.get("body") or ""
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith(KEY_LINE_PREFIX) and line.endswith(" -->"):
+                keys.add(line[len(KEY_LINE_PREFIX): -len(" -->")])
+                break
+    return keys
+
+
+def _gh(runner: str, args: Sequence[str], repo: Path) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            [runner, *args], cwd=str(repo), capture_output=True, text=True, check=False
+        )
+    except OSError as exc:  # gh 不存在
+        raise EmitterError(f"跑不起 {runner}：{exc}") from exc
+
+
+def existing_keys(runner: str, repo: Path, limit: int = DEFAULT_LIMIT) -> set[str]:
+    """GitHub 上（開著與關著的都算）已有的 key。"""
+
+    proc = _gh(
+        runner,
+        ["issue", "list", "--state", "all", "--limit", str(limit), "--json", "number,body"],
+        repo,
+    )
+    if proc.returncode != 0:
+        raise EmitterError(f"gh issue list failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    try:
+        items = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise EmitterError(f"gh issue list 回傳不是 JSON：{exc}") from exc
+    return parse_marker_keys(items)
+
+
+def create_issue(finding: Finding, scope: str, runner: str, repo: Path) -> str:
+    """建一張單，回傳 URL。標題照 `.github/ISSUE_TEMPLATE/task.yml` 的 `[<kind>] …`。"""
+
+    title = f"[{finding.key_prefix}] {finding.title.strip()}"
+    args = ["issue", "create", "--title", title, "--body", build_body(finding, scope)]
+    if finding.labels:
+        args += ["--label", ",".join(finding.labels)]
+    proc = _gh(runner, args, repo)
+    if proc.returncode != 0:
+        raise EmitterError(f"gh issue create failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    return proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+
+
+def _issue_number(url: str) -> str:
+    tail = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+    return tail if tail.isdigit() else ""
+
+
+def load_record(path: Path) -> dict:
+    """讀編號回寫檔；不存在就回空殼，壞掉就報錯（不要安靜覆蓋掉別人的紀錄）。"""
+
+    if not path.exists():
+        return {"issues": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EmitterError(f"record 讀不到（{path}）：{exc}") from exc
+    if not isinstance(data, dict):
+        raise EmitterError(f"record 形狀不對（{path}）：{type(data).__name__}")
+    data.setdefault("issues", {})
+    return data
+
+
+def record_back(path: Path, key: str, number: str, url: str = "", when: str = "") -> None:
+    """把 issue 編號寫回 record（原子寫、mode 600）。"""
+
+    data = load_record(path)
+    data["issues"][key] = {"number": number, "url": url, "at": when}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".record-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def emit_all(
+    findings: Sequence[Finding],
+    *,
+    scope: str,
+    repo: Path,
+    runner: str = "gh",
+    apply: bool = False,
+    record_path: Path | None = None,
+    checked_at: str = "",
+    out=print,
+) -> int:
+    """把 findings 開成單（`apply=False` 只印會開什麼）。回傳 exit code。"""
+
+    if not findings:
+        out(f"EMIT_ISSUES=NONE scope={scope} (no finding)")
+        return 0
+
+    # 先看本機 record：它比 gh 便宜，而且 gh 掛掉時仍能避免重開同一張單。
+    recorded: dict[str, dict] = {}
+    if record_path is not None:
+        try:
+            recorded = load_record(record_path)["issues"]
+        except EmitterError as exc:
+            out(f"EMIT_ISSUES=FAIL {exc}")
+            return 2
+
+    try:
+        existing = existing_keys(runner, repo)
+    except EmitterError as exc:
+        if apply:
+            out(f"EMIT_ISSUES=FAIL {exc}")
+            return 2
+        out(f"WARN existing keys unavailable（dry-run 照跑）：{exc}")
+        existing = set()
+
+    created = skipped = 0
+    for finding in findings:
+        key = finding.key(scope)
+        if key in existing:
+            out(f"SKIPPED_EXISTING key={key}")
+            skipped += 1
+            continue
+        if key in recorded:
+            out(f"SKIPPED_RECORDED key={key} -> #{recorded[key].get('number', '?')}")
+            skipped += 1
+            continue
+        if not apply:
+            out(f"WOULD_CREATE title={f'[{finding.key_prefix}] {finding.title.strip()}'!r} key={key}")
+            created += 1
+            existing.add(key)  # 同一批裡重複的 finding 只印一次
+            continue
+        try:
+            url = create_issue(finding, scope, runner, repo)
+        except EmitterError as exc:
+            out(f"EMIT_ISSUES=FAIL {exc}")
+            return 2
+        out(f"CREATED {url}")
+        created += 1
+        existing.add(key)
+        number = _issue_number(url)
+        if record_path is not None and number:
+            record_back(record_path, key, number, url=url, when=checked_at)
+            out(f"RECORDED_BACK {record_path} {key}=#{number}")
+
+    out(f"EMIT_ISSUES={'CREATED' if apply else 'DRY_RUN'} scope={scope} new={created} skipped={skipped}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """手動用：把一份 findings JSON 開成單。repo 端通常直接呼叫 emit_all。"""
+
+    parser = argparse.ArgumentParser(description="把 findings JSON 開成去重後的 GitHub issue。")
+    parser.add_argument("--findings", required=True, help='JSON list：[{"field":…,"value":…,"title":…}]')
+    parser.add_argument("--scope", required=True, help="去重鍵的中段，通常是日期")
+    parser.add_argument("--repo", default=".", help="gh 在哪個 repo 跑（預設 cwd）")
+    parser.add_argument("--runner", default="gh")
+    parser.add_argument("--record", default=None, help="編號回寫檔（JSON）")
+    parser.add_argument("--apply", action="store_true", help="真的開單（預設 dry-run）")
+    args = parser.parse_args(argv)
+
+    try:
+        raw = json.loads(Path(args.findings).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"EMIT_ISSUES=FAIL findings 讀不到：{exc}")
+        return 2
+    findings = [Finding(**item) for item in raw]
+    return emit_all(
+        findings,
+        scope=args.scope,
+        repo=Path(args.repo),
+        runner=args.runner,
+        apply=args.apply,
+        record_path=Path(args.record) if args.record else None,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
