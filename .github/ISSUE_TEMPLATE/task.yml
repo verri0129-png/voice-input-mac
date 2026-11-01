@@ -1,0 +1,87 @@
+name: Task (issue = 工單)
+description: 一張工單就是一個 session 的全部上下文：背景、證據、重現、完成定義、不可動範圍。
+title: "[<kind>] <一句話現象>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        這張 issue 會被一個**沒有其他背景**的 session 單獨接手。
+        寫到「它能只靠這張單動工並自我驗證」為止，上限 150 行。
+        隱私：音檔路徑、轉錄全文、個人用語表**不可**寫進來；引用本機路徑與行號即可。
+  - type: dropdown
+    id: source
+    attributes:
+      label: 來源
+      options:
+        - 健康檢查（health.json）
+        - 單元測試／實機驗證
+        - 使用者口頭回饋
+    validations:
+      required: true
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: 發生什麼、哪台機器、為什麼算問題。不要貼整份 log。
+      placeholder: M4 上 ⌘E 按下後沒有反應；launchd agent 還在但 app process 不見了。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 證據
+      description: 檔案路徑＋行號＋該 commit 的短 sha。可判定的證據，不是印象。
+      placeholder: |
+        - ~/orca/state/voice-input/health.json（agent_loaded=false）
+        - ~/orca/state/voice-toggle-hotkey.err.log 最後 20 行
+        - git rev-parse --short HEAD = xxxxxxx
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 重現命令
+      description: 別人照貼就能看到同一個現象的一行或幾行命令。
+      render: shell
+      placeholder: |
+        launchctl list | grep -i voice-toggle-hotkey
+        tail -20 ~/orca/state/voice-toggle-hotkey.err.log
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: 完成定義（gate token）
+      description: 哪一個可觀測的訊號從什麼變成什麼，才算做完；**並且寫出這個觀測怎麼產生**（重放錄音／實機按一次／重跑測試）。不接受「看起來好了」。
+      placeholder: |
+        health.json 的 agent_loaded=true 且 last_exit=0；
+        ./.venv/bin/python transcribe.py --file <wav> 產出文字且延遲 < 1.5s。
+        觀測來源：實機按一次 ⌘E（重放既有 wav）。
+    validations:
+      required: true
+  - type: textarea
+    id: forbidden
+    attributes:
+      label: 不可動範圍
+      description: 這次不該碰的東西。動了會在別的機器或別的 session 上出錯。
+      value: |
+        不改 Hermes 的 config／skills、不動 `~/.hermes`。
+        不重啟或重裝 launchd agent（`install.sh`）除非這張單就是要修它。
+        不改模型來源與 Vertex 專案設定；不動 `local.env`（含憑證）。
+        不把音檔內容、轉錄全文寫進 repo 或 issue。
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 送出前確認
+      options:
+        - label: 這張單沒有轉錄全文、音檔內容或個人用語表
+          required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 一個 session 一個單
+      options:
+        - label: 這張單可以在單一 session 內做完（不用中途轉交）
+          required: true
