@@ -40,6 +40,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -154,10 +155,25 @@ def parse_marker_keys(items: Iterable[dict]) -> set[str]:
     return keys
 
 
+def resolve_runner(runner: str) -> str:
+    """把 `gh` 找出來：GUI／launchd 啟動的行程 PATH 沒有 `/opt/homebrew/bin`。
+
+    找不到就原樣回傳，讓 `_gh` 自己去失敗（錯誤訊息才說明得了是哪一個 binary）。
+    """
+
+    if "/" in runner:
+        return runner
+    for path in (os.environ.get("PATH", ""), "/opt/homebrew/bin:/usr/local/bin"):
+        found = shutil.which(runner, path=path)
+        if found:
+            return found
+    return runner
+
+
 def _gh(runner: str, args: Sequence[str], repo: Path) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            [runner, *args], cwd=str(repo), capture_output=True, text=True, check=False
+            [resolve_runner(runner), *args], cwd=str(repo), capture_output=True, text=True, check=False
         )
     except OSError as exc:  # gh 不存在
         raise EmitterError(f"跑不起 {runner}：{exc}") from exc
@@ -248,7 +264,8 @@ def emit_all(
         out(f"EMIT_ISSUES=NONE scope={scope} (no finding)")
         return 0
 
-    # 先看本機 record：它比 gh 便宜，而且 gh 掛掉時仍能避免重開同一張單。
+    # 先看本機 record：它比 gh 便宜（這支會被 App 每次用完就跑一次，不要每次都打網路），
+    # 而且 gh 掛掉時仍能避免重開同一張單。
     recorded: dict[str, dict] = {}
     if record_path is not None:
         try:
@@ -257,24 +274,31 @@ def emit_all(
             out(f"EMIT_ISSUES=FAIL {exc}")
             return 2
 
-    try:
-        existing = existing_keys(runner, repo)
-    except EmitterError as exc:
-        if apply:
-            out(f"EMIT_ISSUES=FAIL {exc}")
-            return 2
-        out(f"WARN existing keys unavailable（dry-run 照跑）：{exc}")
-        existing = set()
-
-    created = skipped = 0
+    candidates: list[Finding] = []
+    skipped = 0
     for finding in findings:
+        key = finding.key(scope)
+        if key in recorded:
+            out(f"SKIPPED_RECORDED key={key} -> #{recorded[key].get('number', '?')}")
+            skipped += 1
+            continue
+        candidates.append(finding)
+
+    created = 0
+    existing: set[str] = set()
+    if candidates:
+        try:
+            existing = existing_keys(runner, repo)
+        except EmitterError as exc:
+            if apply:
+                out(f"EMIT_ISSUES=FAIL {exc}")
+                return 2
+            out(f"WARN existing keys unavailable（dry-run 照跑）：{exc}")
+
+    for finding in candidates:
         key = finding.key(scope)
         if key in existing:
             out(f"SKIPPED_EXISTING key={key}")
-            skipped += 1
-            continue
-        if key in recorded:
-            out(f"SKIPPED_RECORDED key={key} -> #{recorded[key].get('number', '?')}")
             skipped += 1
             continue
         if not apply:

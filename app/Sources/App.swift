@@ -93,6 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.onLevel = { [weak self] level in self?.indicator.push(level) }
         setupCarbonHotKey()
         Transcriber.log("[app] launched. bundle=\(Bundle.main.bundlePath) python=\(Transcriber.pythonBin) script=\(Transcriber.scriptPath) log=\(Transcriber.logPath)")
+        // 用完才檢查：開起來的這一刻跑一次健康檢查（不會擋住任何東西，見 HealthCheck.swift）。
+        HealthCheck.run(reason: "launch")
     }
 
     // 熱鍵：⌘E（使用者指定）。按一下開始錄音，再按一下結束並把文字插入「當下游標所在的位置」。
@@ -208,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SonioxCoordinator.cancel()
             statusItem.button?.title = "🎙️"
             Transcriber.log("[app] recording stop：沒有音訊，放棄")
+            HealthCheck.run(reason: "no_audio")
             return
         }
         recorder.onAudio = nil
@@ -226,6 +229,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 DispatchQueue.main.async {
                     Transcriber.log("[app] 結果（停止→文字 \(String(format: "%.2f", Date().timeIntervalSince(tStop)))s）：\(text)")
+                    // 不管貼不貼，這一輪「用起來成不成功」已經有答案了 → 交給健康檢查判斷。
+                    HealthCheck.run(reason: text.isEmpty ? "empty" : "ok")
                     self.statusItem.button?.title = "🎙️"
                     guard !text.isEmpty else {
                         Transcriber.log("[app] 結果為空，不貼上")
@@ -292,6 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if code == 3 {
                         // transcribe.py 的能量閘門：整段幾乎沒收到聲音 → 不貼上（避免幻覺文字被當成逐字稿）
                         Transcriber.log("[app] exit 3：沒有可用語音（麥克風沒收到聲音，或結果被判為幻覺）→ 未貼上任何東西")
+                        HealthCheck.run(reason: "no_speech")
                         self.statusItem.button?.title = "🔇"
                         self.statusItem.button?.toolTip = "沒有可用語音（沒收到聲音或判為幻覺）— 詳見 ~/orca/voice-input-mac/.run.log"
                         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
@@ -301,6 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         return
                     }
                     Transcriber.log("[app] transcribe failed: \(error.localizedDescription)")
+                    HealthCheck.run(reason: "failed")
                     let alert = NSAlert()
                     alert.messageText = "轉寫失敗"
                     alert.informativeText = "\(error.localizedDescription)"

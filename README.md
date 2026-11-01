@@ -54,7 +54,15 @@ open .build/release/VoiceInputMac.app
 
 ## 健康狀態（health.json）
 
-「現在有沒有壞」有機器可讀的答案，不必回頭翻 log：
+**檢查掛在「使用」上，不掛在時鐘上。** 這套輸入沒有排程、App 是「要用才開」，
+所以「App 沒在跑」是靜止狀態、不是故障。真正的問題是「按了 ⌘E 卻沒拿到字」，
+那個答案在 `.run.log` 裡：
+
+- App **啟動那一刻**跑一次（正要開始用，順便抓跨次問題：熱鍵 agent 死掉、上次非零結束）。
+- **每一次轉寫結束**再跑一次（成功、空白、失敗都算）。
+
+要不要開單由 python 判斷；健康時它一個字都不會印，也不會打網路（`emitted_issues.json`
+已經記過的直接跳過）。手動看狀態：
 
 ```bash
 python3 healthcheck.py                 # 產 ~/orca/state/voice-input/health.json，印 HEALTH=OK/DEGRADED
@@ -62,18 +70,22 @@ python3 healthcheck.py --emit          # 壞掉時會開哪些單（dry-run，�
 python3 healthcheck.py --emit --apply  # 真的開 GitHub issue，編號寫回 emitted_issues.json
 ```
 
-`health.json` 欄位：`agent_loaded`（熱鍵 agent 在 `launchctl` 清單裡）、`last_exit`、
-`app_running`（⌘E 有沒有 App 接）、`err_lines_since_last_check`（上次檢查之後
-`~/orca/state/voice-toggle-hotkey.err.log` 多了幾行，靠 `checkpoint.json` 的 offset；
-第一次跑只建立基準、不把歷史 log 算成新錯誤）、`stt_backend`（`breeze`／`soniox`／`unknown`）、
-`checked_at`。`stt_backend` 讀的是**實際在跑的那個 checkout** 的 `local.env`（預設
-`~/orca/voice-input-mac`，可用 `--runtime` 指定），不讀本 clone 的、也不讀 shell 的環境變數
-——App 是 GUI 啟動的，看不到你 shell 裡 export 的東西。
+`health.json` 欄位：
 
-開單規則只有一處：`healthcheck.collect_findings`（App 沒跑、agent 沒載入、`last_exit` 非 0、
-error log 有新增行、`VOICE_STT` 認不得）。`issue_emitter.py` 是可共用的 core：去重 key
-`<!-- key: health/<date>/<field>/<sha8> -->`、五段 body、gh 去重、編號回寫都在那裡，
-新 repo 只要提供「什麼算 finding」。健康的機器跑 `--emit` 會印 `EMIT_ISSUES=NONE`。
+| 欄位 | 意義 |
+|---|---|
+| `last_attempt` | `.run.log` 最近一輪的結果：`ok`／`empty`（結果空白）／`no_speech`（exit 3）／`suspect`（exit 4）／`failed`（轉寫失敗）／`no_audio`（沒收到音訊）＋`chars`、`duration_s`、錯誤 `detail`（**不含轉錄文字**） |
+| `consecutive_no_text` | 從最近一次成功之後，連續幾輪沒拿到字 |
+| `agent_loaded` / `last_exit` | 熱鍵 agent 在不在 `launchctl` 清單裡、上次怎麼結束 |
+| `err_lines_since_last_check` | 上次檢查之後 `~/orca/state/voice-toggle-hotkey.err.log` 多了幾行（靠 `checkpoint.json` 的 offset；第一次跑只建立基準） |
+| `stt_backend` | `breeze`／`soniox`／`unknown`，讀**實際在跑的那個 checkout** 的 `local.env`（不讀 shell env：GUI 啟動的 App 看不到） |
+| `app_running` | 僅供參考。要用才開，關著不是故障，**不會**開單 |
+
+開單規則只有一處：`healthcheck.collect_findings`——上一次真的失敗（`failed`／`no_audio`）一次就開；
+連續三次沒拿到字才開（單次空白可能只是沒講話）；另外 agent 沒載入、`last_exit` 非 0、
+error log 有新增行、`VOICE_STT` 認不得也會開。`issue_emitter.py` 是可共用的 core：
+去重 key `<!-- key: health/<date>/<field>/<sha8> -->`、五段 body、gh 去重、編號回寫都在那裡，
+新 repo 只要提供「什麼算 finding」。健康時跑 `--emit` 會印 `EMIT_ISSUES=NONE`。
 
 重放驗證（不必等真的壞）：
 
@@ -82,12 +94,15 @@ cp ~/orca/state/voice-input/health.json /tmp/h.json
 python3 - <<'PY'
 import json, pathlib
 p = pathlib.Path("/tmp/h.json"); d = json.loads(p.read_text())
-d["app_running"] = False; d["app_pids"] = []
+d["last_attempt"] = {"outcome": "failed", "detail": "重放用"}
 p.write_text(json.dumps(d, ensure_ascii=False))
 PY
 python3 healthcheck.py --from-health /tmp/h.json --emit --apply   # CREATED（一張）
-python3 healthcheck.py --from-health /tmp/h.json --emit --apply   # SKIPPED_EXISTING（不是第二張）
+python3 healthcheck.py --from-health /tmp/h.json --emit --apply   # 不再開第二張
 ```
+
+檢查自己的台詞寫在 `~/orca/state/voice-input/healthcheck.log`（觸發原因＋`EMIT_ISSUES` 結論），
+`.run.log` 只多一行 `[health] 檢查觸發（reason=…）`。
 
 ## 第二意見（背景量測，不影響貼字）
 

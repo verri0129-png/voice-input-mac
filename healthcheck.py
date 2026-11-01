@@ -8,8 +8,14 @@
     ~/orca/state/voice-input/checkpoint.json  log 讀到哪裡（讓「上次檢查之後」有定義）
     ~/orca/state/voice-input/emitted_issues.json  開過的單（key -> 編號）
 
-全程唯讀巡檢：讀 `launchctl list`、`pgrep`、熱鍵 agent 的 `.err.log`、以及**實際在跑的那個
-checkout** 的 `local.env`。不重啟、不重裝 agent，不動 `local.env`，不上傳任何東西。
+**檢查掛在「使用」上，不掛在時鐘上。** 這套輸入沒有固定排程，`App` 是「要用才開」，
+所以「App 不在執行」是靜止狀態、不是故障。真正的問題是「你按了 ⌘E 卻沒拿到字」，
+那個答案在 `.run.log` 裡：App 啟動時跑一次 `healthcheck.py --emit --apply`，每次轉寫
+結束（不管成功或失敗）再跑一次。平常一個字都不會印，壞掉那天才會有單。
+
+全程唯讀巡檢：讀 `launchctl list`、`pgrep`、熱鍵 agent 的 `.err.log`、`App` 的 `.run.log`、
+以及**實際在跑的那個 checkout** 的 `local.env`。不重啟、不重裝 agent，不動 `local.env`，
+不上傳任何東西。
 
 用法：
 
@@ -31,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -49,11 +56,17 @@ HOTKEY_ERR_LOG = HOME / "orca" / "state" / "voice-toggle-hotkey.err.log"
 # app/Sources/Transcriber.swift 的預設；`VOICE_INPUT_TRANSCRIBE_PY` 可以覆寫它。
 DEFAULT_TRANSCRIBE = HOME / "orca" / "voice-input-mac" / "transcribe.py"
 STT_BACKENDS = ("breeze", "soniox")
+# 「按了卻沒拿到字」幾次才值得開單：一次空白可能是誤按、或根本沒講話，
+# 連續三次就代表不是運氣問題（麥克風被佔住、裝置換掉、serve 起不來…）。
+NO_TEXT_STREAK = 3
+# 一定算壞掉的結果（不是「沒講話」那種）。
+HARD_FAIL_OUTCOMES = ("failed", "no_audio")
 FORBIDDEN = """\
 不改 Hermes 的 config／skills、不動 `~/.hermes`。
 不重啟或重裝 launchd agent（`install.sh`、`com.hunghanchu.*.plist`）——修好之後由使用者決定要不要重啟。
 不改模型來源與 Vertex 專案設定；不動 `local.env`（含憑證）。
 不把音檔內容、轉錄全文、個人用語表寫進 repo 或 issue。"""
+
 
 
 # ── 唯讀探測（每個都能單獨餵字串測，不必真的跑 launchctl）─────────────────────
@@ -193,6 +206,94 @@ def count_new_lines(path: Path, offset: int) -> tuple[int, int]:
     return complete.count(b"\n"), offset + len(complete)
 
 
+# ── .run.log：最近一次「真的用到它」的結果 ────────────────────────────────────
+# 每一次錄音在 `.run.log` 裡是一段：`[app] recording start` 開頭，接著一個終端標記。
+# 只有終端標記決定這一輪的結果；其餘（context、insert、learn…）都是過程。
+_RESULT_RE = re.compile(r"\[app\] 結果（停止→文字 ([\d.]+)s）：(.*)$")
+_TERMINALS = (
+    (re.compile(r"\[app\] transcribe failed: ?(.*)$"), "failed"),
+    (re.compile(r"\[app\] recording stop：沒有音訊，放棄"), "no_audio"),
+    (re.compile(r"\[app\] exit 3："), "no_speech"),
+    (re.compile(r"\[app\] exit 4："), "suspect"),
+    (re.compile(r"\[app\] 結果為空，不貼上"), "empty"),
+)
+_TS_RE = re.compile(r"^\[([0-9T:.+\-Z]+)\]")
+DETAIL_CHARS = 120
+
+
+def _line_time(line: str) -> str:
+    m = _TS_RE.match(line.strip())
+    return m.group(1) if m else ""
+
+
+def classify_line(line: str) -> dict | None:
+    """一行 log → 這一輪的結果（不是終端標記就回 None）。
+
+    注意：`detail` 只放錯誤訊息，**不放轉錄出來的文字**（那是不能進 issue 的東西）。
+    """
+
+    m = _RESULT_RE.search(line)
+    if m:
+        text = m.group(2).strip()
+        if not text:
+            return {"outcome": "empty"}
+        return {"outcome": "ok", "duration_s": float(m.group(1)), "chars": len(text)}
+    for pattern, outcome in _TERMINALS:
+        m = pattern.search(line)
+        if m:
+            info: dict = {"outcome": outcome}
+            detail = (m.group(1).strip() if m.groups() else "")[:DETAIL_CHARS]
+            if detail:
+                info["detail"] = detail
+            return info
+    return None
+
+
+def parse_attempts(lines) -> list[dict]:
+    """把 log 切成一次一次的錄音，只留有結果的那些。"""
+
+    attempts: list[dict] = []
+    current: dict | None = None
+    for line in lines:
+        if "[app] recording start" in line:
+            current = {"at": _line_time(line), "outcome": None}
+            attempts.append(current)
+            continue
+        if current is None:
+            continue
+        info = classify_line(line)
+        if info:
+            current.update(info)
+            if not current.get("at"):
+                current["at"] = _line_time(line)
+    return [a for a in attempts if a.get("outcome")]
+
+
+def read_last_attempt(run_log: Path, tail_bytes: int = 200_000) -> tuple[dict | None, int]:
+    """回傳 (最近一次的結果, 從最近一次成功之後連續沒拿到字的次數)。
+
+    只讀 log 尾巴（這支 log 會長到 MB 級），抓最近那幾輪就夠判斷。
+    """
+
+    try:
+        size = run_log.stat().st_size
+        with run_log.open("rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+            chunk = fh.read()
+    except OSError:
+        return None, 0
+    attempts = parse_attempts(chunk.decode("utf-8", errors="replace").splitlines())
+    if not attempts:
+        return None, 0
+    streak = 0
+    for attempt in reversed(attempts):
+        if attempt["outcome"] == "ok":
+            break
+        streak += 1
+    return attempts[-1], streak
+
+
 # ── 觀測與判定 ────────────────────────────────────────────────────────────────
 def machine_name() -> str:
     return socket.gethostname().split(".")[0]
@@ -212,9 +313,14 @@ def build_record(
     stt_source: str,
     runtime: Path,
     sources: dict[str, str],
+    last_attempt: dict | None = None,
+    consecutive_no_text: int = 0,
     errors: list[str] | None = None,
 ) -> dict:
-    """純函式：把探測結果組成 health.json 的內容（含 ok／reasons）。"""
+    """純函式：把探測結果組成 health.json 的內容（含 ok／reasons）。
+
+    `app_running` 只當觀察值：這套輸入是「要用才開」，App 關著是靜止狀態，不是故障。
+    """
 
     record = {
         "machine": machine,
@@ -224,6 +330,8 @@ def build_record(
         "last_exit": last_exit,
         "app_running": bool(app_running),
         "app_pids": list(app_pids),
+        "last_attempt": last_attempt,
+        "consecutive_no_text": int(consecutive_no_text),
         "err_lines_since_last_check": int(err_lines),
         "stt_backend": stt_backend,
         "stt_source": stt_source,
@@ -238,7 +346,11 @@ def build_record(
 
 
 def unhealthy_reasons(record: dict) -> list[str]:
-    """哪些欄位不合格（人類可讀，順序固定）。空 list＝健康。"""
+    """哪些欄位不合格（人類可讀，順序固定）。空 list＝健康。
+
+    判準全是「用起來會不會出事」，不是「App 有沒有開著」：這套輸入沒有固定排程，
+    App 關著是靜止狀態。
+    """
 
     reasons: list[str] = []
     if not record.get("agent_loaded"):
@@ -246,8 +358,13 @@ def unhealthy_reasons(record: dict) -> list[str]:
     last_exit = record.get("last_exit")
     if last_exit not in (0, None):
         reasons.append(f"last_exit={last_exit}（上次不是正常結束）")
-    if not record.get("app_running"):
-        reasons.append("app_running=false（⌘E 沒有 App 可接）")
+    attempt = record.get("last_attempt") or {}
+    outcome = attempt.get("outcome")
+    streak = int(record.get("consecutive_no_text") or 0)
+    if outcome in HARD_FAIL_OUTCOMES:
+        reasons.append(f"last_attempt={outcome}（上一次真的沒轉出東西）")
+    elif streak >= NO_TEXT_STREAK:
+        reasons.append(f"consecutive_no_text={streak}（連續 {streak} 次沒拿到字）")
     err_lines = int(record.get("err_lines_since_last_check") or 0)
     if err_lines > 0:
         reasons.append(f"err_lines_since_last_check={err_lines}（錯誤 log 有新增行）")
@@ -298,6 +415,8 @@ def collect(
     checkpoint["logs"][err_log.name] = {"offset": new_offset, "path": str(err_log)}
 
     backend, backend_source = stt_backend(runtime)
+    run_log = runtime / ".run.log"
+    attempt, streak = read_last_attempt(run_log)
     health_path = state_dir / "health.json"
     stamp = (now or datetime.now().astimezone()).isoformat(timespec="seconds")
     checkpoint["updated_at"] = stamp
@@ -314,7 +433,14 @@ def collect(
         stt_backend=backend,
         stt_source=backend_source,
         runtime=runtime,
-        sources={"health": str(health_path), "err_log": str(err_log), "agent_label": AGENT_LABEL},
+        last_attempt=attempt,
+        consecutive_no_text=streak,
+        sources={
+            "health": str(health_path),
+            "err_log": str(err_log),
+            "run_log": str(run_log),
+            "agent_label": AGENT_LABEL,
+        },
         errors=errors,
     )
     save_checkpoint(checkpoint_path, checkpoint)
@@ -337,13 +463,18 @@ def write_health(record: dict, path: Path) -> None:
 
 # ── 什麼算 finding（這個 repo 唯一的供應點）─────────────────────────────────────
 def collect_findings(record: dict) -> list[Finding]:
-    """純函式：health record → 該開的單。健康時回空 list（emitter 就會印 NONE）。"""
+    """純函式：health record → 該開的單。健康時回空 list（emitter 就會印 NONE）。
+
+    **不檢查 `app_running`。** 這套輸入是「要用才開」，使用者關掉 App 是正常靜止狀態；
+    把它當故障會在你每次關掉之後開一張單。訊號改看「上一次用它有沒有拿到字」。
+    """
 
     machine = str(record.get("machine") or "unknown")
     checked_at = str(record.get("checked_at") or "")
     sources = record.get("sources") or {}
     health_path = sources.get("health") or str(STATE_DIR / "health.json")
     err_log = sources.get("err_log") or str(HOTKEY_ERR_LOG)
+    run_log = sources.get("run_log") or str(Path(str(record.get("runtime_dir") or DEFAULT_TRANSCRIBE.parent)) / ".run.log")
     backend = str(record.get("stt_backend") or "unknown")
     observations = (
         f"- machine=`{machine}`",
@@ -362,34 +493,80 @@ def collect_findings(record: dict) -> list[Finding]:
             **kwargs,
         )
 
-    if not record.get("app_running"):
+    attempt = record.get("last_attempt") or {}
+    outcome = str(attempt.get("outcome") or "")
+    streak = int(record.get("consecutive_no_text") or 0)
+    attempt_line = (
+        f"- `.run.log` 最後一輪：outcome=`{outcome}`"
+        + (f"、detail=`{attempt.get('detail')}`" if attempt.get("detail") else "")
+        + (f"、chars={attempt.get('chars')}" if attempt.get("chars") else "")
+        + (f"、at=`{attempt.get('at')}`" if attempt.get("at") else "")
+    )
+
+    if outcome in HARD_FAIL_OUTCOMES:
+        detail = str(attempt.get("detail") or "（沒有錯誤訊息）")
         findings.append(
             base(
-                "app_running",
-                "false",
-                title="⌘E 按下去沒有 App 可以接（voice-input App 不在執行）",
+                "last_attempt",
+                outcome,
+                title=(
+                    "上一次按 ⌘E 完全沒轉出東西（"
+                    + ("沒有音訊" if outcome == "no_audio" else "轉寫失敗")
+                    + "）"
+                ),
                 problem=(
-                    f"{machine} 上找不到 `{APP_PATTERN}` 的 process，"
-                    "但熱鍵 agent 是載入著的"
-                    f"（agent_loaded={str(record.get('agent_loaded')).lower()}）。"
-                    "也就是說：熱鍵出現、使用者按下去，卻沒有東西接——表現完全像「壞了」，"
-                    "而且不會有任何 log 留下來。"
+                    f"{machine} 上最近一次實際使用沒有拿到文字，結果是 `{outcome}`：{detail}。"
+                    "這不是「沒講話」那種空白，是流程真的斷掉（音訊沒進來，或轉寫程式直接失敗）。"
+                    f"使用者看到的只有「按了沒反應」，而 `.run.log` 裡的理由埋在幾百行後面。"
                 ),
                 evidence=(
-                    f"health.json：`{health_path}`（`app_running=false`）",
-                    f"runtime checkout：`{record.get('runtime_dir')}`",
+                    f"health.json：`{health_path}`（`last_attempt.outcome={outcome}`）",
+                    attempt_line,
+                    f"App log：`{run_log}`",
                 )
                 + observations,
                 reproduce=(
-                    f'pgrep -fl "{APP_PATTERN}"; echo "rc=$?（1 = 沒有 process）"\n'
-                    f'launchctl list | grep -i voice\n'
-                    f'cat "{health_path}"'
+                    f"grep -n 'transcribe failed\\|沒有音訊，放棄' \"{run_log}\" | tail -5\n"
+                    f'tail -40 "{run_log}"\n'
+                    f"cat \"{health_path}\""
                 ),
                 done=(
-                    "同一條 `pgrep -fl` 有 PID，且 `python3 healthcheck.py` 印出 `HEALTH=OK`、"
-                    "health.json 的 `app_running=true` 且 `ok=true`。"
+                    "下一次真的用一次（按 ⌘E 講一句話）後，`.run.log` 有 "
+                    "`[app] 結果（停止→文字 …）`，且 `python3 healthcheck.py` 印出 `HEALTH=OK`、"
+                    "`last_attempt.outcome=ok`。"
                 ),
-                observation="實機開一次 App 之後重跑 `healthcheck.py`（不必等下一次自然故障）。",
+                observation="下一次實機使用後重跑 `healthcheck.py`（App 每次轉寫結束也會自己跑一次）。",
+                labels=("src:health", "kind:bug"),
+            )
+        )
+    elif streak >= NO_TEXT_STREAK:
+        findings.append(
+            base(
+                "consecutive_no_text",
+                str(streak),
+                title=f"連續 {streak} 次按 ⌘E 都沒拿到文字",
+                problem=(
+                    f"{machine} 上連續 {streak} 次使用都沒有拿到文字（最近一次是 `{outcome}`）。"
+                    "單次空白可能只是沒講話或誤按，連續這麼多次通常是真的收不到聲音："
+                    "麥克風被別的 App 佔住、預設輸入裝置被換掉、或暖機的 `serve` 起不來。"
+                    f"每一輪在 `.run.log` 裡都有各自的理由，但沒人會去翻。"
+                ),
+                evidence=(
+                    f"health.json：`{health_path}`（`consecutive_no_text={streak}`）",
+                    attempt_line,
+                    f"App log：`{run_log}`",
+                )
+                + observations,
+                reproduce=(
+                    f"grep -n '\\[app\\] exit 3\\|結果為空\\|transcribe failed' \"{run_log}\" | tail -5\n"
+                    f'launchctl list | grep -i voice\n'
+                    f"system_profiler SPAudioDataType | sed -n '/Input/,+6p' | head -30"
+                ),
+                done=(
+                    "按 ⌘E 連續兩次都拿到文字（`.run.log` 有 `[app] 結果（停止→文字 …）`），"
+                    "且 `healthcheck.py` 印出 `HEALTH=OK`、`consecutive_no_text=0`。"
+                ),
+                observation="下一次實機使用後重跑 `healthcheck.py`（不必等下一次自然故障）。",
                 labels=("src:health", "kind:bug"),
             )
         )
@@ -516,8 +693,16 @@ def _print_summary(record: dict, health_path: Path, out=print) -> None:
             str(record.get("agent_loaded")).lower(), record.get("agent_pid"), record.get("last_exit")
         )
     )
+    attempt = record.get("last_attempt") or {}
     out(
-        "  app_running={} pids={}".format(
+        "  last_attempt={} chars={} 連續沒拿到字={}".format(
+            attempt.get("outcome") or "（log 裡還沒有任何一輪）",
+            attempt.get("chars", "-"),
+            record.get("consecutive_no_text"),
+        )
+    )
+    out(
+        "  app_running={}（僅供參考：要用才開，關著不是故障） pids={}".format(
             str(record.get("app_running")).lower(), ",".join(str(p) for p in record.get("app_pids") or [])
         )
     )

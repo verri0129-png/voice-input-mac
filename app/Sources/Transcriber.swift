@@ -18,6 +18,10 @@ enum Transcriber {
     static var logPath: String {
         (NSHomeDirectory() as NSString).appendingPathComponent("orca/voice-input-mac/.run.log")
     }
+    /// 健康檢查（用完才跑，見 HealthCheck.swift）。和 transcribe.py 放在同一個 checkout。
+    static var healthCheckPath: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent("orca/voice-input-mac/healthcheck.py")
+    }
 
     // app 用 `open`/launchd 啟動時 stdout 沒人接，診斷一律寫檔
     //
