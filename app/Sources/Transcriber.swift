@@ -437,7 +437,7 @@ enum Transcriber {
             log("[refine] 不動手：這個 App 不支援 AX 選取，無法原地替換")
             return false
         }
-        _ = insertText(refined, refinement: true)
+        _ = insertText(refined)
         let expected = current.replacingCharacters(in: first, with: refined)
         return confirmReadback(expected)
     }
@@ -474,7 +474,7 @@ enum Transcriber {
             log("[refine] 不動手：這個 App 不支援 AX 選取，無法原地替換")
             return false
         }
-        _ = insertText(refined, refinement: true)
+        _ = insertText(refined)
         let expected = base.replacingCharacters(in: block, with: refined)
         return confirmReadback(expected)
     }
@@ -558,68 +558,21 @@ enum Transcriber {
     /// 所以主要路徑改成 CGEvent unicode 注入（等同使用者打字），⌘V 只當保底。
     /// 剪貼簿一定也放一份，使用者手動 ⌘V 隨時可用。
     @discardableResult
-    static func insertText(_ text: String, refinement: Bool = false) -> String {
+    static func insertText(_ text: String) -> String {
         guard !text.isEmpty else { return "" }
         // TUI／終端機會把換行當成「送出」：逐字稿不需要換行，一律換成空格
         let safe = text
             .replacingOccurrences(of: "\r\n", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
-        let pb = NSPasteboard.general
-        // 語音輸入的第一次寫入：保存使用者自己的剪貼簿。
-        // 定版（refinement）是同一段語音的後續替換，不能再保存——那時剪貼簿裡已經是語音結果，
-        // 會把語音結果當成「使用者原本的內容」還原回去。定版沿用第一次保存的內容。
-        if !refinement {
-            let snapshot = snapshotPasteboard(pb)
-            clipboardLock.lock(); userClipboard = snapshot; clipboardLock.unlock()
-        }
-        pb.clearContents()
-        pb.setString(safe, forType: .string)
-        let ourChangeCount = pb.changeCount
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(safe, forType: .string)
         log("[insert] 文字已放進剪貼簿（\(safe.count) 字），開始注入")
-        // 注入成功後才還原；三條路全失敗時不還原，語音文字留在剪貼簿供手動 ⌘V（見上方註解）。
-        if typeViaCGEvent(safe) { restorePasteboard(ourChangeCount: ourChangeCount); return safe }
-        if pasteViaAppleScript() { restorePasteboard(ourChangeCount: ourChangeCount); return safe }
-        if pasteViaCGEvent() { restorePasteboard(ourChangeCount: ourChangeCount); return safe }
+        if typeViaCGEvent(safe) { return safe }
+        if pasteViaAppleScript() { return safe }
+        if pasteViaCGEvent() { return safe }
         log("[insert] ❌ 三條路都不通 → 文字只在剪貼簿裡（手動按 ⌘V 可以貼）")
         return safe
-    }
-
-    /// 使用者在語音輸入前的剪貼簿內容（給還原用）。
-    private static let clipboardLock = NSLock()
-    private static var userClipboard: [[NSPasteboard.PasteboardType: Data]]?
-
-    /// 把剪貼簿所有項目與型別的原始資料存下來（之後可以原樣寫回）。
-    private static func snapshotPasteboard(_ pb: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
-        (pb.pasteboardItems ?? []).map { item in
-            var dict: [NSPasteboard.PasteboardType: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) { dict[type] = data }
-            }
-            return dict
-        }
-    }
-
-    /// 延遲約 1 秒還原（貼上是非同步的，目標 app 讀取剪貼簿前不能太早換回去）。
-    /// 如果這段時間使用者自己又複製了東西（changeCount 變了），就不還原，避免蓋掉新內容。
-    private static func restorePasteboard(ourChangeCount: Int) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
-            let pb = NSPasteboard.general
-            guard pb.changeCount == ourChangeCount else {
-                log("[insert] 剪貼簿已被使用者改動，不還原")
-                return
-            }
-            clipboardLock.lock(); let saved = userClipboard; clipboardLock.unlock()
-            guard let saved else { return }
-            pb.clearContents()
-            let items: [NSPasteboardItem] = saved.map { dict in
-                let item = NSPasteboardItem()
-                for (type, data) in dict { item.setData(data, forType: type) }
-                return item
-            }
-            if !items.isEmpty { pb.writeObjects(items) }
-            log("[insert] 已還原使用者原本的剪貼簿（\(items.count) 項）")
-        }
     }
 
     /// CGEvent unicode 注入：把字串當成鍵盤輸入打進最前面的 app。
