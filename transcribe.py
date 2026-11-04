@@ -53,6 +53,72 @@ def _setting(name, default):
 
 STT_REPO = _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
 
+# ── 遠端 ASR：模型只放在另一台機器（例如 M4），本機（例如 M2）不載入、不佔記憶體 ──
+# 設定 VOICE_STT_REMOTE=m4（ssh 別名）即啟用；留空就維持原本的本地模型。
+# 遠端那台要有同一份 repo（含 asr_server.py）與 .venv（含 mlx_whisper）。
+STT_REMOTE_HOST = (_setting("VOICE_STT_REMOTE", "") or "").strip()
+STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bin/python")
+STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
+_REMOTE_PROC = None
+_REMOTE_LOCK = threading.Lock()
+
+def _remote_proc():
+    """長駐一條 ssh 連線（遠端的模型因此只載入一次）；斷線時自動重連。"""
+    global _REMOTE_PROC
+    if _REMOTE_PROC is None or _REMOTE_PROC.poll() is not None:
+        cmd = f"{STT_REMOTE_PY} {STT_REMOTE_SCRIPT}"
+        print(f"[remote-stt] 連線 {STT_REMOTE_HOST}（模型在遠端，本機不載入）", file=sys.stderr)
+        _REMOTE_PROC = subprocess.Popen(
+            ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", STT_REMOTE_HOST, cmd],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+        )
+    return _REMOTE_PROC
+
+def _remote_whisper(samples, language, prompt):
+    """把 16 kHz float32 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。"""
+    import numpy as np
+    global _REMOTE_PROC
+    payload = json.dumps({
+        "audio": base64.b64encode(np.asarray(samples, dtype="<f4").tobytes()).decode("ascii"),
+        "language": language,
+        "prompt": prompt,
+    }, ensure_ascii=False)
+    with _REMOTE_LOCK:
+        line = ""
+        try:
+            proc = _remote_proc()
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+        except (OSError, ValueError) as e:
+            print(f"[remote-stt] 通訊失敗: {e!r}", file=sys.stderr)
+        if not line:
+            if _REMOTE_PROC is not None:
+                try:
+                    _REMOTE_PROC.kill()
+                except OSError:
+                    pass
+            _REMOTE_PROC = None
+            raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
+    resp = json.loads(line)
+    if "error" in resp:
+        raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
+    return resp
+
+def _whisper(language, audio=None, path=None):
+    """統一的 Whisper 入口：遠端啟用時送到 M4；否則用本機模型（行為與原本相同）。"""
+    prompt = stt_initial_prompt()
+    if STT_REMOTE_HOST:
+        if audio is None and path:
+            audio = wav_samples(path)
+        if audio is None:
+            raise RuntimeError("遠端 ASR 需要可讀取的音訊")
+        return _remote_whisper(audio, language, prompt)
+    import mlx_whisper
+    src = path if path is not None else audio
+    return mlx_whisper.transcribe(src, path_or_hf_repo=STT_REPO, language=language,
+                                  verbose=False, initial_prompt=prompt)
+
 # ── STT provider ──────────────────────────────────────────────────────────────
 # breeze（預設）：本地 Breeze-ASR-25，完全離線。
 # soniox        ：Soniox 即時 API（雲端），自帶標點，停止後幾乎不用等；
@@ -333,7 +399,6 @@ def wav_samples(path):
     return np.frombuffer(data, dtype="<i2").astype("float32") / 32768.0
 
 def transcribe_audio(audio, language="zh"):
-    import mlx_whisper
     import numpy as np
     # normalize to float32 in [-1,1] if int16
     if audio.dtype == np.int16:
@@ -344,13 +409,7 @@ def transcribe_audio(audio, language="zh"):
         return ""
     # Use word_timestamps=False for speed; rely on gate for hallucination
     # Use suppress_blank / no_speech handling via temperature fallback
-    result = mlx_whisper.transcribe(
-        audio,
-        path_or_hf_repo=STT_REPO,
-        language=language if language else None,
-        verbose=False,
-        initial_prompt=stt_initial_prompt(),
-    )
+    result = _whisper(language if language else None, audio=audio)
     text = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
     # 實測全 0 音檔的幻覺 no_speech_prob=0.000，所以主要防線仍是能量門檻）
@@ -964,10 +1023,8 @@ def process_wav_file(
         print(f"[gate]{label} 沒收到聲音（peak {peak_db:.1f} dB、最大 0.5s 窗 rms {window_db:.1f} dB）"
               f" → 不跑 Whisper（避免幻覺）", file=sys.stderr)
         return {"status": "silence", "text": ""}
-    import mlx_whisper
     lang = None if language == "auto" else language
-    result = mlx_whisper.transcribe(path, path_or_hf_repo=STT_REPO, language=lang, verbose=False,
-                                    initial_prompt=stt_initial_prompt())
+    result = _whisper(lang, audio=a, path=path)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
     raw = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
