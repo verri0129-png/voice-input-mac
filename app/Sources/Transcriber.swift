@@ -356,6 +356,12 @@ enum Transcriber {
         return nil
     }
 
+    private static let terminalBundleIDs: Set<String> = [
+        "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable",
+        "net.kovidgoyal.kitty", "com.github.wez.wezterm", "org.alacritty",
+        "com.mitchellh.ghostty", "co.zeit.hyper",
+    ]
+
     /// 原地定版：把剛注入的那一段換成雲端版本。
     /// 只有在「欄位去掉那段之後仍等於貼上前的內容」時才動手 —— 你已經改過字就不碰。
     @discardableResult
@@ -367,6 +373,13 @@ enum Transcriber {
     ) -> Bool {
         guard !inserted.isEmpty, !refined.isEmpty, inserted != refined else {
             log("[refine] 不動手：沒有可替換的內容")
+            return false
+        }
+        // 終端機的 AX 欄位是整個捲動區：選取「成功」但打字進的是輸入列，不會取代，
+        // 結果規則版＋定版各一份（貼兩次）。終端機一律保留規則版。
+        if let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           terminalBundleIDs.contains(bundleID) {
+            log("[refine] 不動手：終端機無法原地替換（\(bundleID)），保留規則版避免貼兩次")
             return false
         }
         guard let field = ContextCapture.focusedTextField() else {
