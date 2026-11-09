@@ -10,3 +10,6 @@ rewrite_terms.json
 .run.log
 models/
 .second-opinion.jsonl
+
+# Claude Code worktrees (one per Remote Control session, 2026-11-09)
+.claude/worktrees/

@@ -1,0 +1,3 @@
+# 開 worktree 時從主資料夾複製這些未追蹤的本機檔（Claude Code .worktreeinclude）
+local.env
+rewrite_terms.json
