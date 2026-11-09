@@ -78,8 +78,12 @@ def _remote_whisper(samples, language, prompt):
     """把 16 kHz float32 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。"""
     import numpy as np
     global _REMOTE_PROC
+    # 上行頻寬是瓶頸：錄音本來就是 int16，直接送 int16（float32 + base64 是 2.7 倍）。
+    # wav_samples 給的是 int16/32768，這裡乘回去再四捨五入，無損。
+    pcm = np.clip(np.rint(np.asarray(samples, dtype="float32") * 32768.0), -32768, 32767).astype("<i2")
     payload = json.dumps({
-        "audio": base64.b64encode(np.asarray(samples, dtype="<f4").tobytes()).decode("ascii"),
+        "audio": base64.b64encode(pcm.tobytes()).decode("ascii"),
+        "fmt": "i2",
         "language": language,
         "prompt": prompt,
     }, ensure_ascii=False)
@@ -1731,8 +1735,10 @@ def serve_forever(language="zh", polish=True, config=None):
                 print(json.dumps(out, ensure_ascii=False), flush=True)
                 continue
         if req.startswith("partial "):
-            if soniox_mode:
-                # Soniox 是即時串流，錄音中不需要再跑一次本地預覽
+            if soniox_mode or STT_REMOTE_HOST:
+                # Soniox 是即時串流，錄音中不需要再跑一次本地預覽。
+                # 遠端 STT：預覽每秒重送整段累積音訊，會塞住 M2→M4 的 ssh 上行，
+                # 讓停止後的正式請求排在後面（實測 20 秒錄音多等 ~11 秒），所以直接不做。
                 print(json.dumps({"status": "partial", "text": ""}, ensure_ascii=False), flush=True)
                 continue
             # 錄音中的即時預覽。優先權最低：先看不阻塞地是不是已經有「完整請求」在排隊，

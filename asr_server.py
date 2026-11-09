@@ -5,7 +5,7 @@
 改由這裡常駐的模型做辨識。模型只存在這台機器上，不會在 M2 重複下載、也不佔 M2 記憶體。
 
 協定（stdin／stdout 一行一個 JSON，診斷一律走 stderr）：
-  請求：{"audio": "<base64 的 float32 little-endian PCM，16 kHz 單聲道>",
+  請求：{"audio": "<base64 的 PCM，16 kHz 單聲道>", "fmt": "i2"（int16 LE；省略＝float32 LE，舊客戶端）,
          "language": "zh" | null, "prompt": "<initial_prompt>"}
   回應：{"text": "...", "segments": [...]}   （與 mlx_whisper.transcribe 的結果同形）
         或 {"error": "..."}
@@ -60,7 +60,11 @@ def main() -> int:
             continue
         try:
             req = json.loads(line)
-            audio = np.frombuffer(base64.b64decode(req["audio"]), dtype="<f4").astype("float32")
+            raw = base64.b64decode(req["audio"])
+            if req.get("fmt") == "i2":  # int16 PCM（新）
+                audio = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+            else:  # float32 PCM（舊客戶端）
+                audio = np.frombuffer(raw, dtype="<f4").astype("float32")
             language = req.get("language") or None
             prompt = req.get("prompt") or None
             result = mlx_whisper.transcribe(
