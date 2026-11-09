@@ -62,6 +62,17 @@ STT_REMOTE_HOST = (_setting("VOICE_STT_REMOTE", "") or "").strip()
 STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bin/python")
 STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
 STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lower()
+# 選單列「ASR 模型」寫的小檔（內容 breeze 或 qwen）。每次辨識都重讀，所以切換立即生效、不用重啟；
+# 檔案不存在或內容不認得就退回上面的設定。
+ASR_BACKEND_FILE = Path(_setting("VOICE_ASR_BACKEND_FILE", "~/orca/state/voice-input/asr-backend")).expanduser()
+ASR_BACKENDS = ("breeze", "qwen")
+
+def current_remote_backend() -> str:
+    try:
+        chosen = ASR_BACKEND_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        chosen = ""
+    return chosen if chosen in ASR_BACKENDS else STT_REMOTE_BACKEND
 # Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
 STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
 if STT_REMOTE_BACKEND and not STT_REMOTE_HOST:
@@ -146,8 +157,9 @@ def _remote_whisper(samples, language, prompt):
     錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
     pcm = _pcm16(samples)
     base = {"fmt": "i2", "language": language, "prompt": prompt}
-    if STT_REMOTE_BACKEND:
-        base["backend"] = STT_REMOTE_BACKEND
+    backend = current_remote_backend()
+    if backend:
+        base["backend"] = backend
         base["terms"] = stt_terms()
     with _REMOTE_LOCK:
         n = _streamed_prefix(pcm)
@@ -166,9 +178,9 @@ def _remote_whisper(samples, language, prompt):
         raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
     got = resp.get("backend")  # 舊版伺服器不回報
     print(f"[remote-stt] 遠端用的模型：{got or '未回報（遠端還是舊版）'}", file=sys.stderr)
-    if STT_REMOTE_BACKEND and got != STT_REMOTE_BACKEND:
+    if backend and got != backend:
         # 不偷偷用別的模型：試用期間若悄悄跑 Breeze，使用者會把結果當成 Qwen 的
-        raise RuntimeError(f"要求 {STT_REMOTE_BACKEND} 但遠端是 {got or '舊版（忽略了 backend）'}："
+        raise RuntimeError(f"要求 {backend} 但遠端是 {got or '舊版（忽略了 backend）'}："
                            f"M4 的 asr_server.py 需要更新並重啟（git pull ＋ 結束舊的暖機程序）")
     # Qwen 以 zh 輸出簡體；詞庫替換在 rewrite 階段（早於最後的繁化），詞庫變體是繁體寫法，
     # 所以在遠端結果的邊界就繁化，所有後端走同一條路（Breeze 本來就是繁體，等於 no-op）。

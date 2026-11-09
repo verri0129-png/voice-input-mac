@@ -50,6 +50,8 @@ class LoadEnginesTest(unittest.TestCase):
 
 class ClientRequestTest(unittest.TestCase):
     def setUp(self):
+        self._file = t.ASR_BACKEND_FILE
+        t.ASR_BACKEND_FILE = Path("/nonexistent/asr-backend")
         self.sent = []
         self._call, self._be = t._remote_call, t.STT_REMOTE_BACKEND
         t._remote_call = lambda req: (self.sent.append(req), {"text": "ok", "segments": [],
@@ -58,6 +60,7 @@ class ClientRequestTest(unittest.TestCase):
 
     def tearDown(self):
         t._remote_call, t.STT_REMOTE_BACKEND = self._call, self._be
+        t.ASR_BACKEND_FILE = self._file
 
     def test_backend_and_terms_sent_only_when_selected(self):
         import numpy as np
@@ -74,11 +77,12 @@ class ClientRequestTest(unittest.TestCase):
 
 class ResponseHandlingTest(unittest.TestCase):
     def setUp(self):
-        self._call, self._be = t._remote_call, t.STT_REMOTE_BACKEND
+        self._call, self._be, self._file = t._remote_call, t.STT_REMOTE_BACKEND, t.ASR_BACKEND_FILE
+        t.ASR_BACKEND_FILE = Path("/nonexistent/asr-backend")
         t._stream_reset()
 
     def tearDown(self):
-        t._remote_call, t.STT_REMOTE_BACKEND = self._call, self._be
+        t._remote_call, t.STT_REMOTE_BACKEND, t.ASR_BACKEND_FILE = self._call, self._be, self._file
 
     def _run(self, resp):
         import numpy as np
@@ -102,6 +106,32 @@ class ResponseHandlingTest(unittest.TestCase):
     def test_no_backend_requested_accepts_any(self):
         t.STT_REMOTE_BACKEND = ""
         self.assertEqual(self._run({"text": "好", "segments": [], "backend": "breeze"})["text"], "好")
+
+
+class MenuChoiceFileTest(unittest.TestCase):
+    def setUp(self):
+        self._file, self._be = t.ASR_BACKEND_FILE, t.STT_REMOTE_BACKEND
+        self.td = tempfile.TemporaryDirectory()
+        t.ASR_BACKEND_FILE = Path(self.td.name) / "asr-backend"
+
+    def tearDown(self):
+        t.ASR_BACKEND_FILE, t.STT_REMOTE_BACKEND = self._file, self._be
+        self.td.cleanup()
+
+    def test_file_overrides_setting_and_is_reread_each_call(self):
+        t.STT_REMOTE_BACKEND = "breeze"
+        t.ASR_BACKEND_FILE.write_text("qwen\n")
+        self.assertEqual(t.current_remote_backend(), "qwen")
+        t.ASR_BACKEND_FILE.write_text("breeze")
+        self.assertEqual(t.current_remote_backend(), "breeze")  # 不用重啟
+
+    def test_missing_or_unknown_falls_back_to_setting(self):
+        t.STT_REMOTE_BACKEND = "qwen"
+        self.assertEqual(t.current_remote_backend(), "qwen")  # 檔案不存在
+        t.ASR_BACKEND_FILE.write_text("whisper-xl")
+        self.assertEqual(t.current_remote_backend(), "qwen")  # 不認得
+        t.STT_REMOTE_BACKEND = ""
+        self.assertEqual(t.current_remote_backend(), "")
 
 
 class SttTermsTest(unittest.TestCase):

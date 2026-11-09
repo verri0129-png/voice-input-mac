@@ -3,7 +3,7 @@ import ApplicationServices
 import Carbon
 
 @main
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var recorder = Recorder()
     // 錄音中的畫面音波指示圖（不搶焦點，讓使用者知道現在在錄音）
@@ -20,6 +20,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // exit 4（疑似非語音）時保留的文字與對應選單項：不自動貼，但讓使用者能手動貼。
     private var pendingText: String?
     private var pendingItem: NSMenuItem?
+    // 「ASR 模型」子選單：選擇寫進一個小檔，transcribe.py 每次辨識都重讀（切換立即生效，不重啟暖機程序）。
+    // 只在遠端模式（VOICE_STT_REMOTE，M2 經 ssh 呼叫 M4）才有作用。
+    private var backendItems: [String: NSMenuItem] = [:]
+    private static let backendFile = NSString(string: "~/orca/state/voice-input/asr-backend").expandingTildeInPath
+    private static let backends: [(id: String, title: String)] = [
+        ("breeze", "Breeze-ASR-25（現用）"),
+        ("qwen", "Qwen3-ASR 1.7B"),
+    ]
     // 有沒有收到過真正的 Cmd 修飾鍵事件。某些環境（合成事件、遠端桌面）完全收不到
     // flagsChanged；那種情況下才降級放行，否則嚴格只認左 Cmd。
     private var sawCmdFlags = false
@@ -72,6 +80,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pending.isEnabled = false
         pendingItem = pending
         menu.addItem(pending)
+        menu.addItem(.separator())
+        let backendMenu = NSMenu()
+        for b in Self.backends {
+            let item = NSMenuItem(title: b.title, action: #selector(selectBackend(_:)), keyEquivalent: "")
+            item.representedObject = b.id
+            backendItems[b.id] = item
+            backendMenu.addItem(item)
+        }
+        let backendParent = NSMenuItem(title: "ASR 模型（遠端）", action: nil, keyEquivalent: "")
+        backendParent.submenu = backendMenu
+        menu.addItem(backendParent)
+        refreshBackendChecks()
+        menu.delegate = self
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "開啟 VoiceInputMac 檔案位置", action: #selector(revealInFinder), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "重新啟動", action: #selector(relaunch), keyEquivalent: "r"))
@@ -390,6 +411,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 目前選的模型；沒選過（沒有檔案）＝預設 breeze。
+    static func readBackend() -> String {
+        let v = (try? String(contentsOfFile: backendFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return backends.contains(where: { $0.id == v }) ? v : "breeze"
+    }
+    private func refreshBackendChecks() {
+        let cur = Self.readBackend()
+        for (id, item) in backendItems { item.state = (id == cur) ? .on : .off }
+    }
+    // 每次打開選單都重讀，檔案被別的方式改掉時勾選也不會過期
+    func menuWillOpen(_ menu: NSMenu) { refreshBackendChecks() }
+    @objc func selectBackend(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        let dir = (Self.backendFile as NSString).deletingLastPathComponent
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try id.write(toFile: Self.backendFile, atomically: true, encoding: .utf8)
+            Transcriber.log("[asr] 選單切換 ASR 模型 → \(id)（下一次辨識生效）")
+        } catch {
+            Transcriber.log("[asr] 切換 ASR 模型失敗：\(error.localizedDescription)")
+        }
+        refreshBackendChecks()
+    }
     @objc func revealInFinder() { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: Bundle.main.bundlePath)]) }
     @objc func relaunch() {
         let url = URL(fileURLWithPath: Bundle.main.bundlePath)
