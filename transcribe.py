@@ -60,7 +60,7 @@ STT_REMOTE_HOST = (_setting("VOICE_STT_REMOTE", "") or "").strip()
 STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bin/python")
 STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
 _REMOTE_PROC = None
-_REMOTE_LOCK = threading.Lock()
+_REMOTE_LOCK = threading.RLock()
 
 def _remote_proc():
     """長駐一條 ssh 連線（遠端的模型因此只載入一次）；斷線時自動重連。"""
@@ -74,37 +74,78 @@ def _remote_proc():
         )
     return _REMOTE_PROC
 
-def _remote_whisper(samples, language, prompt):
-    """把 16 kHz float32 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。"""
+def _pcm16(samples):
+    """wav_samples 給的是 int16/32768；乘回去再四捨五入，無損。"""
     import numpy as np
+    return np.clip(np.rint(np.asarray(samples, dtype="float32") * 32768.0), -32768, 32767).astype("<i2")
+
+def _remote_call(req):
+    """送一行 JSON、讀一行回應（呼叫端要先拿著 _REMOTE_LOCK）。斷線就重連並丟 RuntimeError。"""
     global _REMOTE_PROC
-    # 上行頻寬是瓶頸：錄音本來就是 int16，直接送 int16（float32 + base64 是 2.7 倍）。
-    # wav_samples 給的是 int16/32768，這裡乘回去再四捨五入，無損。
-    pcm = np.clip(np.rint(np.asarray(samples, dtype="float32") * 32768.0), -32768, 32767).astype("<i2")
-    payload = json.dumps({
-        "audio": base64.b64encode(pcm.tobytes()).decode("ascii"),
-        "fmt": "i2",
-        "language": language,
-        "prompt": prompt,
-    }, ensure_ascii=False)
+    line = ""
+    try:
+        proc = _remote_proc()
+        proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+    except (OSError, ValueError) as e:
+        print(f"[remote-stt] 通訊失敗: {e!r}", file=sys.stderr)
+    if not line:
+        if _REMOTE_PROC is not None:
+            try:
+                _REMOTE_PROC.kill()
+            except OSError:
+                pass
+        _REMOTE_PROC = None
+        _STREAM["n"], _STREAM["digest"] = 0, None  # 遠端緩衝區跟著沒了
+        raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
+    return json.loads(line)
+
+def _b64(pcm):
+    return base64.b64encode(pcm.tobytes()).decode("ascii")
+
+def _sha(pcm):
+    import hashlib
+    return hashlib.sha1(pcm.tobytes()).digest()
+
+# 邊錄邊傳：上行頻寬（M2→M4 約 130–180 KB/s）是瓶頸，停止後才一次傳整段，錄越久等越久。
+# 錄音中每次預覽 tick 只傳「上次之後新增」的樣本，M4 先存著；停止時只補尾巴。
+# 正確性靠內容比對：n＝已送出的樣本數、digest＝那段前綴的 sha1；
+# 最終音訊的前 n 個樣本 sha1 對得上才走增量，否則（新錄音、重連、別的呼叫）整段重傳。
+_STREAM = {"n": 0, "digest": None}
+
+def remote_stream_append(samples):
+    """錄音中呼叫：samples 是「到目前為止」的整段音訊；只把新增的部分傳到 M4。"""
+    pcm = _pcm16(samples)
     with _REMOTE_LOCK:
-        line = ""
-        try:
-            proc = _remote_proc()
-            proc.stdin.write(payload + "\n")
-            proc.stdin.flush()
-            line = proc.stdout.readline()
-        except (OSError, ValueError) as e:
-            print(f"[remote-stt] 通訊失敗: {e!r}", file=sys.stderr)
-        if not line:
-            if _REMOTE_PROC is not None:
-                try:
-                    _REMOTE_PROC.kill()
-                except OSError:
-                    pass
-            _REMOTE_PROC = None
-            raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
-    resp = json.loads(line)
+        n = _STREAM["n"]
+        if n and (n > len(pcm) or _sha(pcm[:n]) != _STREAM["digest"]):
+            n = 0  # 不是同一段錄音的延續 → 從頭來（offset=0 會讓 M4 清掉舊的）
+        if len(pcm) == n and n:
+            return
+        resp = _remote_call({"op": "append", "fmt": "i2", "audio": _b64(pcm[n:]), "offset": n})
+        if resp.get("ok"):
+            _STREAM["n"], _STREAM["digest"] = len(pcm), _sha(pcm)
+        else:
+            _STREAM["n"], _STREAM["digest"] = 0, None
+
+def _remote_whisper(samples, language, prompt):
+    """把 16 kHz 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。
+    錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
+    pcm = _pcm16(samples)
+    base = {"fmt": "i2", "language": language, "prompt": prompt}
+    with _REMOTE_LOCK:
+        n = _STREAM["n"]
+        streamed = bool(n) and n <= len(pcm) and _sha(pcm[:n]) == _STREAM["digest"]
+        _STREAM["n"], _STREAM["digest"] = 0, None  # 無論成敗，M4 端的緩衝區這次都會被清掉
+        full = dict(base, audio=_b64(pcm))
+        if streamed:
+            resp = _remote_call(dict(base, op="final", audio=_b64(pcm[n:]), offset=n))
+            if resp.get("error") == "offset":
+                print("[remote-stt] 增量對不上 → 改送整段", file=sys.stderr)
+                resp = _remote_call(full)
+        else:
+            resp = _remote_call(full)
     if "error" in resp:
         raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
     return resp
@@ -1735,10 +1776,8 @@ def serve_forever(language="zh", polish=True, config=None):
                 print(json.dumps(out, ensure_ascii=False), flush=True)
                 continue
         if req.startswith("partial "):
-            if soniox_mode or STT_REMOTE_HOST:
-                # Soniox 是即時串流，錄音中不需要再跑一次本地預覽。
-                # 遠端 STT：預覽每秒重送整段累積音訊，會塞住 M2→M4 的 ssh 上行，
-                # 讓停止後的正式請求排在後面（實測 20 秒錄音多等 ~11 秒），所以直接不做。
+            if soniox_mode:
+                # Soniox 是即時串流，錄音中不需要再跑一次本地預覽
                 print(json.dumps({"status": "partial", "text": ""}, ensure_ascii=False), flush=True)
                 continue
             # 錄音中的即時預覽。優先權最低：先看不阻塞地是不是已經有「完整請求」在排隊，
@@ -1747,7 +1786,14 @@ def serve_forever(language="zh", polish=True, config=None):
             fulls = [q for q in queued if not q.startswith("partial ")]
             if not fulls:
                 try:
-                    t = partial_text(req[len("partial "):], language=language)
+                    if STT_REMOTE_HOST:
+                        # 遠端 STT：不做預覽辨識（沒有文字回來），但借這個 tick 把新增的音訊先傳過去
+                        a = wav_samples(req[len("partial "):])
+                        if a is not None:
+                            remote_stream_append(a)
+                        t = ""
+                    else:
+                        t = partial_text(req[len("partial "):], language=language)
                 except Exception as e:  # noqa: BLE001
                     t = ""
                     print(f"[partial] 預覽失敗: {e!r}", file=sys.stderr)

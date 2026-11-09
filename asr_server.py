@@ -41,6 +41,36 @@ def _load_stt_repo() -> str:
     return value or default
 
 
+def handle_request(req: dict, buf: bytearray):
+    """解一個請求。回傳 (回應, 要辨識的音訊)；音訊為 None 代表不用跑模型，直接回「回應」。
+
+    op=append：邊錄邊傳的增量；offset（樣本數）必須等於已收到的長度，否則回 error=offset，
+               客戶端會改送整段。offset=0 代表新的一段錄音，先清空。
+    op=final ：停止後只補尾巴；offset 對得上才把 buf + 尾巴 當整段辨識。
+    其他     ：整段音訊（舊行為）；順便清空 buf，避免殘留。
+    """
+    op = req.get("op")
+    raw = base64.b64decode(req["audio"]) if req.get("audio") else b""
+    if req.get("fmt") == "i2":  # int16 PCM
+        pcm = raw
+    else:  # float32 PCM（舊客戶端）→ 只能是整段
+        buf.clear()
+        return None, np.frombuffer(raw, dtype="<f4").astype("float32")
+    if op == "append":
+        if req.get("offset") == 0:
+            buf.clear()
+        if req.get("offset") != len(buf) // 2:
+            return {"error": "offset", "have": len(buf) // 2}, None
+        buf += pcm
+        return {"ok": True, "len": len(buf) // 2}, None
+    if op == "final":
+        if req.get("offset") != len(buf) // 2:
+            return {"error": "offset", "have": len(buf) // 2}, None
+        pcm = bytes(buf) + pcm
+    buf.clear()
+    return None, np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
+
+
 def main() -> int:
     import mlx_whisper
 
@@ -54,34 +84,30 @@ def main() -> int:
         print(f"[asr-server] 暖機失敗（不致命）: {e!r}", file=sys.stderr, flush=True)
     print("[asr-server] 就緒，等待請求", file=sys.stderr, flush=True)
 
+    buf = bytearray()  # 邊錄邊傳：已收到的 int16 PCM（跨請求保留，final 或整段請求時清空）
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         try:
             req = json.loads(line)
-            raw = base64.b64decode(req["audio"])
-            if req.get("fmt") == "i2":  # int16 PCM（新）
-                audio = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
-            else:  # float32 PCM（舊客戶端）
-                audio = np.frombuffer(raw, dtype="<f4").astype("float32")
-            language = req.get("language") or None
-            prompt = req.get("prompt") or None
-            result = mlx_whisper.transcribe(
-                audio,
-                path_or_hf_repo=repo,
-                language=language,
-                verbose=False,
-                initial_prompt=prompt,
-            )
-            out = {
-                "text": result.get("text") or "",
-                "segments": [
-                    {k: (float(v) if isinstance(v, (int, float)) else v)
-                     for k, v in seg.items() if k != "tokens"}
-                    for seg in (result.get("segments") or [])
-                ],
-            }
+            out, audio = handle_request(req, buf)
+            if audio is not None:
+                result = mlx_whisper.transcribe(
+                    audio,
+                    path_or_hf_repo=repo,
+                    language=req.get("language") or None,
+                    verbose=False,
+                    initial_prompt=req.get("prompt") or None,
+                )
+                out = {
+                    "text": result.get("text") or "",
+                    "segments": [
+                        {k: (float(v) if isinstance(v, (int, float)) else v)
+                         for k, v in seg.items() if k != "tokens"}
+                        for seg in (result.get("segments") or [])
+                    ],
+                }
         except Exception as e:  # noqa: BLE001
             print(f"[asr-server] 處理失敗: {e!r}", file=sys.stderr, flush=True)
             out = {"error": repr(e)}
