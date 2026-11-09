@@ -55,10 +55,15 @@ STT_REPO = _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
 
 # ── 遠端 ASR：模型只放在另一台機器（例如 M4），本機（例如 M2）不載入、不佔記憶體 ──
 # 設定 VOICE_STT_REMOTE=m4（ssh 別名）即啟用；留空就維持原本的本地模型。
-# 遠端那台要有同一份 repo（含 asr_server.py）與 .venv（含 mlx_whisper）。
+# 遠端那台要有同一份 repo（含 asr_server.py）與 .venv（含 mlx_whisper、mlx_qwen3_asr）。
+# VOICE_STT_REMOTE_BACKEND=breeze|qwen 選遠端用哪個模型（留空＝由遠端的 VOICE_ASR_BACKEND 決定，預設 breeze）。
+# 改完要重開 App（或等暖機程序閒置結束）才會生效；兩個模型都常駐在遠端，切換不必重啟遠端。
 STT_REMOTE_HOST = (_setting("VOICE_STT_REMOTE", "") or "").strip()
 STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bin/python")
 STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
+STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lower()
+# Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
+STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
 _REMOTE_PROC = None
 _REMOTE_LOCK = threading.Lock()
 
@@ -138,6 +143,9 @@ def _remote_whisper(samples, language, prompt):
     錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
     pcm = _pcm16(samples)
     base = {"fmt": "i2", "language": language, "prompt": prompt}
+    if STT_REMOTE_BACKEND:
+        base["backend"] = STT_REMOTE_BACKEND
+        base["terms"] = stt_terms()
     with _REMOTE_LOCK:
         n = _streamed_prefix(pcm)
         _stream_reset()  # 無論成敗，M4 端的緩衝區這次都會被清掉
@@ -153,6 +161,11 @@ def _remote_whisper(samples, language, prompt):
             resp = _remote_call(dict(base, audio=_b64(pcm)))
     if "error" in resp:
         raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
+    got = resp.get("backend")  # 舊版伺服器不回報
+    print(f"[remote-stt] 遠端用的模型：{got or '未回報（遠端還是舊版）'}", file=sys.stderr)
+    if STT_REMOTE_BACKEND and got != STT_REMOTE_BACKEND:
+        print(f"[remote-stt] ⚠ 要求 {STT_REMOTE_BACKEND} 但遠端是 {got or '舊版（忽略了 backend）'}"
+              "——遠端 asr_server.py 需要重啟才會載入新版", file=sys.stderr)
     return resp
 
 def _whisper(language, audio=None, path=None):
@@ -212,6 +225,20 @@ def stt_initial_prompt(terms_file: str | None = None) -> str:
         picked.append(word)
         used += len(word) + 1
     return base + head + "、".join(picked) if picked else base
+
+
+def stt_terms(terms_file: str | None = None) -> list[str]:
+    """給 Qwen 的熱詞（純詞，不含 Whisper 那種提示句）。取詞庫的正字，
+    跳過明顯是句子片段的條目（含標點或太長）——詞庫被「手動修正學習」塞進片段時，
+    Qwen 會把它們當詞去聽，比 Whisper 更吃虧。"""
+    try:
+        rules = load_term_rules(terms_file or REWRITE_TERMS_FILE)
+    except Exception:  # noqa: BLE001
+        return []
+    bad = set("，。,.？?！!、；;：:（）()「」\"'")
+    words = [r.text.strip() for r in rules if r.text.strip()]
+    words = [w for w in words if len(w) <= 16 and not (set(w) & bad)]
+    return list(dict.fromkeys(words))[:STT_QWEN_MAX_TERMS]
 
 
 REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")

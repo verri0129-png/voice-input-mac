@@ -6,14 +6,20 @@
 
 協定（stdin／stdout 一行一個 JSON，診斷一律走 stderr）：
   請求：{"audio": "<base64 的 PCM，16 kHz 單聲道>", "fmt": "i2"（int16 LE；省略＝float32 LE，舊客戶端）,
-         "language": "zh" | null, "prompt": "<initial_prompt>"}
+         "language": "zh" | null, "prompt": "<initial_prompt>",
+         "backend": "breeze" | "qwen"（省略＝本機 VOICE_ASR_BACKEND，預設 breeze）,
+         "terms": ["熱詞", ...]（qwen 用：空白串成 context；breeze 用 prompt，不看 terms）}
   回應：{"text": "...", "segments": [...]}   （與 mlx_whisper.transcribe 的結果同形）
         或 {"error": "..."}
 
 啟動方式（由 M2 的 transcribe.py 透過 ssh 拉起，也可以手動測試）：
   <repo>/.venv/bin/python <repo>/asr_server.py
 
-模型路徑讀取順序：環境變數 VOICE_STT_REPO → 本機的 local.env → 預設值。
+設定讀取順序：環境變數 → 本機的 local.env → 預設值。
+  VOICE_STT_REPO      Breeze（mlx_whisper）模型路徑
+  VOICE_ASR_BACKEND   請求沒指定 backend 時用哪個（breeze | qwen），預設 breeze
+  VOICE_ASR_BACKENDS  啟動時要載入哪些，預設 "breeze,qwen"（兩個都載，切換不用重啟；約 +4GB）
+  VOICE_QWEN_REPO     Qwen3-ASR 模型，預設 Qwen/Qwen3-ASR-1.7B
 """
 import base64
 import json
@@ -24,10 +30,8 @@ from pathlib import Path
 import numpy as np
 
 
-def _load_stt_repo() -> str:
+def _setting(name: str, default: str) -> str:
     """與 transcribe.py 同樣的讀法，但不 import transcribe.py（避免拉進不需要的依賴）。"""
-    name = "VOICE_STT_REPO"
-    default = "mlx-community/whisper-large-v3-turbo"
     value = os.environ.get(name)
     if not value:
         env_file = Path(__file__).with_name("local.env")
@@ -39,6 +43,55 @@ def _load_stt_repo() -> str:
                     if k.strip() == name:
                         value = v.strip().strip('"').strip("'")
     return value or default
+
+
+def _load_stt_repo() -> str:
+    return _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
+
+
+def run_backend(engines: dict, default: str, req: dict, audio):
+    """依 req["backend"] 挑引擎辨識。engines: 名稱 → fn(audio, req) -> {"text", "segments"}。
+    回傳回應 dict；要求的後端沒載入就回 error（不偷偷換成別的模型，免得使用者以為在比較）。"""
+    name = req.get("backend") or default
+    engine = engines.get(name)
+    if engine is None:
+        return {"error": f"backend {name!r} 沒載入（有：{sorted(engines)}）"}
+    out = engine(audio, req)
+    out["backend"] = name
+    return out
+
+
+def _breeze_engine(repo: str):
+    import mlx_whisper
+
+    def run(audio, req):
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo=repo, language=req.get("language") or None,
+            verbose=False, initial_prompt=req.get("prompt") or None,
+        )
+        return {
+            "text": result.get("text") or "",
+            "segments": [
+                {k: (float(v) if isinstance(v, (int, float)) else v)
+                 for k, v in seg.items() if k != "tokens"}
+                for seg in (result.get("segments") or [])
+            ],
+        }
+    return run
+
+
+def _qwen_engine(model: str):
+    import mlx.core as mx
+    from mlx_qwen3_asr import Session
+
+    session = Session(model, dtype=mx.float16)
+
+    def run(audio, req):
+        # context 吃空白分隔的熱詞；Qwen 沒有 no_speech_prob／compression_ratio，segments 留空
+        ctx = " ".join(t for t in (req.get("terms") or []) if t)
+        r = session.transcribe(audio, context=ctx, language=req.get("language") or None)
+        return {"text": r.text or "", "segments": []}
+    return run
 
 
 def handle_request(req: dict, buf: bytearray):
@@ -71,17 +124,27 @@ def handle_request(req: dict, buf: bytearray):
 
 
 def main() -> int:
-    import mlx_whisper
-
-    repo = _load_stt_repo()
-    print(f"[asr-server] 暖機中 STT={repo}", file=sys.stderr, flush=True)
-    # 暖機：先跑一段非靜音的雜訊，讓模型真的載入（與 transcribe.py 的 serve 相同做法）
+    default = _setting("VOICE_ASR_BACKEND", "breeze")
+    wanted = [n.strip() for n in _setting("VOICE_ASR_BACKENDS", "breeze,qwen").split(",") if n.strip()]
+    if default not in wanted:
+        wanted.append(default)
     warm = (np.random.default_rng(0).standard_normal(16000).astype("float32") * 0.02)
-    try:
-        mlx_whisper.transcribe(warm, path_or_hf_repo=repo, language="zh", verbose=False)
-    except Exception as e:  # noqa: BLE001
-        print(f"[asr-server] 暖機失敗（不致命）: {e!r}", file=sys.stderr, flush=True)
-    print("[asr-server] 就緒，等待請求", file=sys.stderr, flush=True)
+    engines = {}
+    for name in wanted:
+        print(f"[asr-server] 暖機中 backend={name}", file=sys.stderr, flush=True)
+        try:
+            if name == "breeze":
+                engine = _breeze_engine(_load_stt_repo())
+            elif name == "qwen":
+                engine = _qwen_engine(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"))
+            else:
+                raise ValueError(f"不認得的 backend {name!r}（只有 breeze、qwen）")
+            # 暖機：先跑一段非靜音的雜訊，讓模型真的載入（與 transcribe.py 的 serve 相同做法）
+            engine(warm, {"language": "zh"})
+            engines[name] = engine  # 暖機成功才登記；失敗的後端會在請求時得到明確的 error
+        except Exception as e:  # noqa: BLE001
+            print(f"[asr-server] backend={name} 載入／暖機失敗: {e!r}", file=sys.stderr, flush=True)
+    print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}）", file=sys.stderr, flush=True)
 
     buf = bytearray()  # 邊錄邊傳：已收到的 int16 PCM（跨請求保留，final 或整段請求時清空）
     for line in sys.stdin:
@@ -92,21 +155,7 @@ def main() -> int:
             req = json.loads(line)
             out, audio = handle_request(req, buf)
             if audio is not None:
-                result = mlx_whisper.transcribe(
-                    audio,
-                    path_or_hf_repo=repo,
-                    language=req.get("language") or None,
-                    verbose=False,
-                    initial_prompt=req.get("prompt") or None,
-                )
-                out = {
-                    "text": result.get("text") or "",
-                    "segments": [
-                        {k: (float(v) if isinstance(v, (int, float)) else v)
-                         for k, v in seg.items() if k != "tokens"}
-                        for seg in (result.get("segments") or [])
-                    ],
-                }
+                out = run_backend(engines, default, req, audio)
         except Exception as e:  # noqa: BLE001
             print(f"[asr-server] 處理失敗: {e!r}", file=sys.stderr, flush=True)
             out = {"error": repr(e)}

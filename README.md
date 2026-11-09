@@ -52,6 +52,24 @@ open .build/release/VoiceInputMac.app
 
 操作：`⌘E` 按一次開始錄音、再按一次結束並轉寫貼到當前游標（任意 App；左右 Cmd 都可）。結果進剪貼簿並自動 `Cmd+V`，中文一律繁體。
 
+## 選 ASR 模型（breeze／qwen）
+
+遠端模式（M2 經 ssh 呼叫 M4）下，M4 的 `asr_server.py` 同時載入 Breeze 與 Qwen3-ASR-1.7B
+（兩個都常駐，約 +4GB），由 M2 的 `local.env` 一行決定用哪個：
+
+```
+VOICE_STT_REMOTE_BACKEND=breeze   # 或 qwen；留空＝由 M4 的 VOICE_ASR_BACKEND 決定（預設 breeze）
+```
+
+改完重開 App（或等暖機程序閒置 10 分鐘結束）才生效。切換不必動 M4。
+log 會印 `[remote-stt] 遠端用的模型：…`；如果要求的和遠端回的不同，會印 `⚠`（通常是 M4 的舊 asr_server 還沒重啟）。
+
+- 熱詞：Breeze 吃 `initial_prompt`（`stt_initial_prompt`），Qwen 吃空白分隔的純詞（`stt_terms`，會跳過含標點的句子片段）。
+  兩者都來自 `rewrite_terms.json`。
+- Qwen 沒有 `no_speech_prob`／`compression_ratio`，所以 `suspect_reason` 少兩票證據；
+  短雜音可能出「嗯。」這類字，目前沒有針對它的守門。
+- 比較資料與腳本在 `~/orca/state/asr-bench/`（不進 repo）。
+
 ## 健康狀態（health.json）
 
 **檢查掛在「使用」上，不掛在時鐘上。** 這套輸入沒有排程、App 是「要用才開」，
