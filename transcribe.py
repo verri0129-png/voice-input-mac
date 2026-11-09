@@ -142,6 +142,8 @@ def _remote_whisper(samples, language, prompt):
         n = _streamed_prefix(pcm)
         _stream_reset()  # 無論成敗，M4 端的緩衝區這次都會被清掉
         resp = None
+        print(f"[remote-stt] 送出 {'增量：已先傳 %d 樣本，只補 %d' % (n, len(pcm) - n) if n else '整段 %d' % len(pcm)} 樣本",
+              file=sys.stderr)
         if n:
             resp = _remote_call(dict(base, op="final", audio=_b64(pcm[n:]), offset=n))
             if resp.get("error") == "offset":
@@ -1630,6 +1632,9 @@ def second_opinion_report(path: str | None = None) -> str:
 
 def partial_text(path, language="zh"):
     """錄音中「即時預覽」用：Whisper ＋ 繁化，**不潤飾**。
+
+    遠端 STT（STT_REMOTE_HOST）模式下**沒有預覽文字**：這個 tick 只用來把新增的音訊先傳到 M4
+    （邊錄邊傳，見 remote_stream_append），永遠回空字串。不要在遠端模式略過它，否則停止後要整段重傳。
 
     刻意與 process_wav_file 不同：
       - 不重寫：最終文字才走雲端校正（而且預覽不是最終文字）
