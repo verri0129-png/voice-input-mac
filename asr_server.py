@@ -123,27 +123,38 @@ def handle_request(req: dict, buf: bytearray):
     return None, np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
 
 
+def load_engines(names, builders, warm):
+    """依序建立後端並暖機。建構成功就登記；暖機失敗只記 log（與舊版「暖機失敗不致命」一致，
+    mlx_whisper 會在第一個請求時再載入）。建構失敗（例如 Qwen 權重載不進來）才不登記，
+    之後要求該後端會得到明確的 error。"""
+    engines = {}
+    for name in names:
+        print(f"[asr-server] 暖機中 backend={name}", file=sys.stderr, flush=True)
+        try:
+            if name not in builders:
+                raise ValueError(f"不認得的 backend {name!r}（只有 {sorted(builders)}）")
+            engines[name] = builders[name]()
+        except Exception as e:  # noqa: BLE001
+            print(f"[asr-server] backend={name} 載入失敗: {e!r}", file=sys.stderr, flush=True)
+            continue
+        try:
+            # 先跑一段非靜音的雜訊，讓權重真的進記憶體（與 transcribe.py 的 serve 相同做法）
+            engines[name](warm, {"language": "zh"})
+        except Exception as e:  # noqa: BLE001
+            print(f"[asr-server] backend={name} 暖機失敗（不致命）: {e!r}", file=sys.stderr, flush=True)
+    return engines
+
+
 def main() -> int:
     default = _setting("VOICE_ASR_BACKEND", "breeze")
     wanted = [n.strip() for n in _setting("VOICE_ASR_BACKENDS", "breeze,qwen").split(",") if n.strip()]
     if default not in wanted:
         wanted.append(default)
     warm = (np.random.default_rng(0).standard_normal(16000).astype("float32") * 0.02)
-    engines = {}
-    for name in wanted:
-        print(f"[asr-server] 暖機中 backend={name}", file=sys.stderr, flush=True)
-        try:
-            if name == "breeze":
-                engine = _breeze_engine(_load_stt_repo())
-            elif name == "qwen":
-                engine = _qwen_engine(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"))
-            else:
-                raise ValueError(f"不認得的 backend {name!r}（只有 breeze、qwen）")
-            # 暖機：先跑一段非靜音的雜訊，讓模型真的載入（與 transcribe.py 的 serve 相同做法）
-            engine(warm, {"language": "zh"})
-            engines[name] = engine  # 暖機成功才登記；失敗的後端會在請求時得到明確的 error
-        except Exception as e:  # noqa: BLE001
-            print(f"[asr-server] backend={name} 載入／暖機失敗: {e!r}", file=sys.stderr, flush=True)
+    engines = load_engines(wanted, {
+        "breeze": lambda: _breeze_engine(_load_stt_repo()),
+        "qwen": lambda: _qwen_engine(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B")),
+    }, warm)
     print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}）", file=sys.stderr, flush=True)
 
     buf = bytearray()  # 邊錄邊傳：已收到的 int16 PCM（跨請求保留，final 或整段請求時清空）

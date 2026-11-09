@@ -64,6 +64,9 @@ STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/
 STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lower()
 # Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
 STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
+if STT_REMOTE_BACKEND and not STT_REMOTE_HOST:
+    print(f"[remote-stt] ⚠ 設了 VOICE_STT_REMOTE_BACKEND={STT_REMOTE_BACKEND} 但沒設 VOICE_STT_REMOTE："
+          "只有遠端模式才會選模型，現在用的是本機模型", file=sys.stderr)
 _REMOTE_PROC = None
 _REMOTE_LOCK = threading.Lock()
 
@@ -164,8 +167,13 @@ def _remote_whisper(samples, language, prompt):
     got = resp.get("backend")  # 舊版伺服器不回報
     print(f"[remote-stt] 遠端用的模型：{got or '未回報（遠端還是舊版）'}", file=sys.stderr)
     if STT_REMOTE_BACKEND and got != STT_REMOTE_BACKEND:
-        print(f"[remote-stt] ⚠ 要求 {STT_REMOTE_BACKEND} 但遠端是 {got or '舊版（忽略了 backend）'}"
-              "——遠端 asr_server.py 需要重啟才會載入新版", file=sys.stderr)
+        # 不偷偷用別的模型：試用期間若悄悄跑 Breeze，使用者會把結果當成 Qwen 的
+        raise RuntimeError(f"要求 {STT_REMOTE_BACKEND} 但遠端是 {got or '舊版（忽略了 backend）'}："
+                           f"M4 的 asr_server.py 需要更新並重啟（git pull ＋ 結束舊的暖機程序）")
+    # Qwen 以 zh 輸出簡體；詞庫替換在 rewrite 階段（早於最後的繁化），詞庫變體是繁體寫法，
+    # 所以在遠端結果的邊界就繁化，所有後端走同一條路（Breeze 本來就是繁體，等於 no-op）。
+    if resp.get("text"):
+        resp["text"] = to_taiwan_traditional(resp["text"])
     return resp
 
 def _whisper(language, audio=None, path=None):
