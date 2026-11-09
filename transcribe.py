@@ -63,11 +63,12 @@ STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bi
 STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
 STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lower()
 # 選單列「ASR 模型」寫的小檔（內容 breeze 或 qwen）。每次辨識都重讀，所以切換立即生效、不用重啟；
-# 檔案不存在或內容不認得就退回上面的設定。
+# 檔案不存在或內容不認得就退回上面的設定。遠端模式選的是遠端那台的模型；本機模式選 qwen 則在
+# 本機載入 Qwen3-ASR（第一次用到才載入），選 breeze 或沒選＝原本的本機 Breeze，行為不變。
 ASR_BACKEND_FILE = Path(_setting("VOICE_ASR_BACKEND_FILE", "~/orca/state/voice-input/asr-backend")).expanduser()
 ASR_BACKENDS = ("breeze", "qwen")
 
-def current_remote_backend() -> str:
+def current_backend() -> str:
     try:
         chosen = ASR_BACKEND_FILE.read_text(encoding="utf-8").strip().lower()
     except OSError:
@@ -75,9 +76,6 @@ def current_remote_backend() -> str:
     return chosen if chosen in ASR_BACKENDS else STT_REMOTE_BACKEND
 # Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
 STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
-if STT_REMOTE_BACKEND and not STT_REMOTE_HOST:
-    print(f"[remote-stt] ⚠ 設了 VOICE_STT_REMOTE_BACKEND={STT_REMOTE_BACKEND} 但沒設 VOICE_STT_REMOTE："
-          "只有遠端模式才會選模型，現在用的是本機模型", file=sys.stderr)
 _REMOTE_PROC = None
 _REMOTE_LOCK = threading.Lock()
 
@@ -157,7 +155,7 @@ def _remote_whisper(samples, language, prompt):
     錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
     pcm = _pcm16(samples)
     base = {"fmt": "i2", "language": language, "prompt": prompt}
-    backend = current_remote_backend()
+    backend = current_backend()
     if backend:
         base["backend"] = backend
         base["terms"] = stt_terms()
@@ -188,8 +186,23 @@ def _remote_whisper(samples, language, prompt):
         resp["text"] = to_taiwan_traditional(resp["text"])
     return resp
 
+_LOCAL_QWEN = None
+
+def _local_qwen(audio, language):
+    """本機的 Qwen3-ASR（選單選 qwen 且沒有遠端時）。第一次用到才載入，常駐在這個程序裡。
+    回傳與 mlx_whisper 同形；Qwen 以 zh 輸出簡體，這裡先繁化（理由同 _remote_whisper）。"""
+    global _LOCAL_QWEN
+    if _LOCAL_QWEN is None:
+        import mlx.core as mx
+        from mlx_qwen3_asr import Session
+        t0 = time.time()
+        _LOCAL_QWEN = Session(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"), dtype=mx.float16)
+        print(f"[local-qwen] 載入 Qwen3-ASR（{time.time() - t0:.1f}s）", file=sys.stderr)
+    r = _LOCAL_QWEN.transcribe(audio, context=" ".join(stt_terms()), language=language)
+    return {"text": to_taiwan_traditional(r.text or ""), "segments": [], "backend": "qwen"}
+
 def _whisper(language, audio=None, path=None):
-    """統一的 Whisper 入口：遠端啟用時送到 M4；否則用本機模型（行為與原本相同）。"""
+    """統一的 Whisper 入口：遠端啟用時送到 M4；否則用本機模型（預設行為與原本相同）。"""
     prompt = stt_initial_prompt()
     if STT_REMOTE_HOST:
         if audio is None and path:
@@ -197,6 +210,12 @@ def _whisper(language, audio=None, path=None):
         if audio is None:
             raise RuntimeError("遠端 ASR 需要可讀取的音訊")
         return _remote_whisper(audio, language, prompt)
+    if current_backend() == "qwen":
+        if audio is None and path:
+            audio = wav_samples(path)
+        if audio is None:
+            raise RuntimeError("本機 Qwen 需要可讀取的音訊")
+        return _local_qwen(audio, language)
     import mlx_whisper
     src = path if path is not None else audio
     return mlx_whisper.transcribe(src, path_or_hf_repo=STT_REPO, language=language,

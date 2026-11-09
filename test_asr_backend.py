@@ -121,17 +121,76 @@ class MenuChoiceFileTest(unittest.TestCase):
     def test_file_overrides_setting_and_is_reread_each_call(self):
         t.STT_REMOTE_BACKEND = "breeze"
         t.ASR_BACKEND_FILE.write_text("qwen\n")
-        self.assertEqual(t.current_remote_backend(), "qwen")
+        self.assertEqual(t.current_backend(), "qwen")
         t.ASR_BACKEND_FILE.write_text("breeze")
-        self.assertEqual(t.current_remote_backend(), "breeze")  # 不用重啟
+        self.assertEqual(t.current_backend(), "breeze")  # 不用重啟
 
     def test_missing_or_unknown_falls_back_to_setting(self):
         t.STT_REMOTE_BACKEND = "qwen"
-        self.assertEqual(t.current_remote_backend(), "qwen")  # 檔案不存在
+        self.assertEqual(t.current_backend(), "qwen")  # 檔案不存在
         t.ASR_BACKEND_FILE.write_text("whisper-xl")
-        self.assertEqual(t.current_remote_backend(), "qwen")  # 不認得
+        self.assertEqual(t.current_backend(), "qwen")  # 不認得
         t.STT_REMOTE_BACKEND = ""
-        self.assertEqual(t.current_remote_backend(), "")
+        self.assertEqual(t.current_backend(), "")
+
+
+class LocalRoutingTest(unittest.TestCase):
+    """本機模式（沒有遠端）：選 qwen 才走 Qwen；沒選或選 breeze 必須維持原本的 mlx_whisper。"""
+
+    def setUp(self):
+        import sys
+        import types
+        self._keep = (t.ASR_BACKEND_FILE, t.STT_REMOTE_BACKEND, t.STT_REMOTE_HOST, t._local_qwen,
+                      sys.modules.get("mlx_whisper"))
+        self.td = tempfile.TemporaryDirectory()
+        t.ASR_BACKEND_FILE = Path(self.td.name) / "asr-backend"
+        t.STT_REMOTE_BACKEND, t.STT_REMOTE_HOST = "", ""
+        self.calls = []
+        fake = types.ModuleType("mlx_whisper")
+        fake.transcribe = lambda *a, **k: (self.calls.append("whisper"), {"text": "w", "segments": []})[1]
+        sys.modules["mlx_whisper"] = fake
+        t._local_qwen = lambda audio, lang: (self.calls.append("qwen"), {"text": "q", "segments": []})[1]
+
+    def tearDown(self):
+        import sys
+        t.ASR_BACKEND_FILE, t.STT_REMOTE_BACKEND, t.STT_REMOTE_HOST, t._local_qwen, mod = self._keep
+        if mod is None:
+            sys.modules.pop("mlx_whisper", None)
+        else:
+            sys.modules["mlx_whisper"] = mod
+        self.td.cleanup()
+
+    def _run(self):
+        import numpy as np
+        return t._whisper("zh", audio=np.zeros(1600, dtype="float32"))
+
+    def test_default_is_unchanged_whisper(self):
+        self._run()
+        self.assertEqual(self.calls, ["whisper"])
+
+    def test_breeze_choice_is_whisper(self):
+        t.ASR_BACKEND_FILE.write_text("breeze")
+        self._run()
+        self.assertEqual(self.calls, ["whisper"])
+
+    def test_qwen_choice_routes_to_qwen_and_switches_back_without_restart(self):
+        t.ASR_BACKEND_FILE.write_text("qwen")
+        self._run()
+        t.ASR_BACKEND_FILE.write_text("breeze")
+        self._run()
+        self.assertEqual(self.calls, ["qwen", "whisper"])
+
+    def test_remote_host_wins_over_local_qwen(self):
+        t.STT_REMOTE_HOST = "m4"
+        t.ASR_BACKEND_FILE.write_text("qwen")
+        seen = []
+        orig = t._remote_whisper
+        t._remote_whisper = lambda *a, **k: (seen.append(1), {"text": "r", "segments": []})[1]
+        try:
+            self._run()
+        finally:
+            t._remote_whisper = orig
+        self.assertEqual((seen, self.calls), ([1], []))
 
 
 class SttTermsTest(unittest.TestCase):

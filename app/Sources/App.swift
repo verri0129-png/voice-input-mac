@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingText: String?
     private var pendingItem: NSMenuItem?
     // 「ASR 模型」子選單：選擇寫進一個小檔，transcribe.py 每次辨識都重讀（切換立即生效，不重啟暖機程序）。
-    // 只在遠端模式（VOICE_STT_REMOTE，M2 經 ssh 呼叫 M4）才有作用。
+    // 遠端模式（VOICE_STT_REMOTE）選的是遠端那台的模型；本機模式選 qwen 則在本機載入 Qwen。
     private var backendItems: [String: NSMenuItem] = [:]
     private static let backendFile = NSString(string: "~/orca/state/voice-input/asr-backend").expandingTildeInPath
     private static let backends: [(id: String, title: String)] = [
@@ -88,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             backendItems[b.id] = item
             backendMenu.addItem(item)
         }
-        let backendParent = NSMenuItem(title: "ASR 模型（遠端）", action: nil, keyEquivalent: "")
+        let backendParent = NSMenuItem(title: "ASR 模型", action: nil, keyEquivalent: "")
         backendParent.submenu = backendMenu
         menu.addItem(backendParent)
         refreshBackendChecks()
