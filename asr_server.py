@@ -56,16 +56,15 @@ def handle_request(req: dict, buf: bytearray):
     else:  # float32 PCM（舊客戶端）→ 只能是整段
         buf.clear()
         return None, np.frombuffer(raw, dtype="<f4").astype("float32")
+    if op == "append" and req.get("offset") == 0:
+        buf.clear()
+    have = len(buf) // 2
+    if op in ("append", "final") and req.get("offset") != have:
+        return {"error": "offset", "have": have}, None  # transcribe.py 以這個字串判斷要不要改送整段
     if op == "append":
-        if req.get("offset") == 0:
-            buf.clear()
-        if req.get("offset") != len(buf) // 2:
-            return {"error": "offset", "have": len(buf) // 2}, None
         buf += pcm
-        return {"ok": True, "len": len(buf) // 2}, None
+        return {"ok": True, "len": have + len(pcm) // 2}, None
     if op == "final":
-        if req.get("offset") != len(buf) // 2:
-            return {"error": "offset", "have": len(buf) // 2}, None
         pcm = bytes(buf) + pcm
     buf.clear()
     return None, np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0

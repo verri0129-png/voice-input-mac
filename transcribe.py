@@ -1,5 +1,5 @@
 """Pipe: record or file -> local Breeze ASR -> cloud rewrite -> clipboard or stdout."""
-import argparse, base64, difflib, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
+import argparse, base64, difflib, hashlib, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,7 +60,7 @@ STT_REMOTE_HOST = (_setting("VOICE_STT_REMOTE", "") or "").strip()
 STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bin/python")
 STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
 _REMOTE_PROC = None
-_REMOTE_LOCK = threading.RLock()
+_REMOTE_LOCK = threading.Lock()
 
 def _remote_proc():
     """長駐一條 ssh 連線（遠端的模型因此只載入一次）；斷線時自動重連。"""
@@ -97,16 +97,12 @@ def _remote_call(req):
             except OSError:
                 pass
         _REMOTE_PROC = None
-        _STREAM["n"], _STREAM["digest"] = 0, None  # 遠端緩衝區跟著沒了
+        _stream_reset()  # 遠端緩衝區跟著沒了
         raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
     return json.loads(line)
 
 def _b64(pcm):
     return base64.b64encode(pcm.tobytes()).decode("ascii")
-
-def _sha(pcm):
-    import hashlib
-    return hashlib.sha1(pcm.tobytes()).digest()
 
 # 邊錄邊傳：上行頻寬（M2→M4 約 130–180 KB/s）是瓶頸，停止後才一次傳整段，錄越久等越久。
 # 錄音中每次預覽 tick 只傳「上次之後新增」的樣本，M4 先存著；停止時只補尾巴。
@@ -114,20 +110,28 @@ def _sha(pcm):
 # 最終音訊的前 n 個樣本 sha1 對得上才走增量，否則（新錄音、重連、別的呼叫）整段重傳。
 _STREAM = {"n": 0, "digest": None}
 
-def remote_stream_append(samples):
-    """錄音中呼叫：samples 是「到目前為止」的整段音訊；只把新增的部分傳到 M4。"""
-    pcm = _pcm16(samples)
+def _sha(pcm):
+    return hashlib.sha1(memoryview(pcm)).digest()
+
+def _stream_reset():
+    _STREAM["n"], _STREAM["digest"] = 0, None
+
+def _streamed_prefix(pcm):
+    """已經傳到 M4 的前綴有幾個樣本（對不上＝0）。呼叫端要先拿著 _REMOTE_LOCK。"""
+    n = _STREAM["n"]
+    return n if n and n <= len(pcm) and _sha(pcm[:n]) == _STREAM["digest"] else 0
+
+def remote_stream_append(pcm):
+    """錄音中呼叫：pcm 是「到目前為止」的整段 int16 音訊；只把新增的部分傳到 M4。"""
     with _REMOTE_LOCK:
-        n = _STREAM["n"]
-        if n and (n > len(pcm) or _sha(pcm[:n]) != _STREAM["digest"]):
-            n = 0  # 不是同一段錄音的延續 → 從頭來（offset=0 會讓 M4 清掉舊的）
-        if len(pcm) == n and n:
+        n = _streamed_prefix(pcm)  # 0＝新錄音或對不上，從頭來（offset=0 會讓 M4 清掉舊的）
+        if n and len(pcm) == n:
             return
         resp = _remote_call({"op": "append", "fmt": "i2", "audio": _b64(pcm[n:]), "offset": n})
         if resp.get("ok"):
             _STREAM["n"], _STREAM["digest"] = len(pcm), _sha(pcm)
         else:
-            _STREAM["n"], _STREAM["digest"] = 0, None
+            _stream_reset()
 
 def _remote_whisper(samples, language, prompt):
     """把 16 kHz 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。
@@ -135,17 +139,16 @@ def _remote_whisper(samples, language, prompt):
     pcm = _pcm16(samples)
     base = {"fmt": "i2", "language": language, "prompt": prompt}
     with _REMOTE_LOCK:
-        n = _STREAM["n"]
-        streamed = bool(n) and n <= len(pcm) and _sha(pcm[:n]) == _STREAM["digest"]
-        _STREAM["n"], _STREAM["digest"] = 0, None  # 無論成敗，M4 端的緩衝區這次都會被清掉
-        full = dict(base, audio=_b64(pcm))
-        if streamed:
+        n = _streamed_prefix(pcm)
+        _stream_reset()  # 無論成敗，M4 端的緩衝區這次都會被清掉
+        resp = None
+        if n:
             resp = _remote_call(dict(base, op="final", audio=_b64(pcm[n:]), offset=n))
             if resp.get("error") == "offset":
                 print("[remote-stt] 增量對不上 → 改送整段", file=sys.stderr)
-                resp = _remote_call(full)
-        else:
-            resp = _remote_call(full)
+                resp = None
+        if resp is None:
+            resp = _remote_call(dict(base, audio=_b64(pcm)))
     if "error" in resp:
         raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
     return resp
@@ -427,10 +430,8 @@ def hallucination_reason(result):
         return f"avg_logprob={avg_lp:.2f} text='{text}'"
     return None
 
-def wav_samples(path):
-    """16-bit PCM wav -> float32 array in [-1,1], or None if unreadable.
-    The file path had NO silence gate before, which is how a silent recording turned into
-    a Whisper hallucination that got pasted as if it were speech."""
+def wav_pcm16(path):
+    """16-bit PCM wav -> int16 array，讀不了回 None。"""
     import numpy as np
     import wave
     try:
@@ -441,7 +442,14 @@ def wav_samples(path):
     except Exception as e:  # noqa: BLE001
         print(f"[gate] 無法讀取 {path}: {e!r}", file=sys.stderr)
         return None
-    return np.frombuffer(data, dtype="<i2").astype("float32") / 32768.0
+    return np.frombuffer(data, dtype="<i2")
+
+def wav_samples(path):
+    """16-bit PCM wav -> float32 array in [-1,1], or None if unreadable.
+    The file path had NO silence gate before, which is how a silent recording turned into
+    a Whisper hallucination that got pasted as if it were speech."""
+    pcm = wav_pcm16(path)
+    return None if pcm is None else pcm.astype("float32") / 32768.0
 
 def transcribe_audio(audio, language="zh"):
     import numpy as np
@@ -1631,6 +1639,12 @@ def partial_text(path, language="zh"):
     實測（M4 Max，暖機）：whisper-large-v3-turbo 約 33x 即時速度
     → 10s 的音訊一次預覽約 0.3s，1.2s 一次完全跟得上。
     """
+    if STT_REMOTE_HOST:
+        # 遠端 STT：不做預覽辨識（沒有文字回來）；借這個 tick 把新增的音訊先傳到 M4（邊錄邊傳）
+        pcm = wav_pcm16(path)
+        if pcm is not None:
+            remote_stream_append(pcm)
+        return ""
     a = wav_samples(path)
     if a is None or is_silence(a):
         return ""
@@ -1786,14 +1800,7 @@ def serve_forever(language="zh", polish=True, config=None):
             fulls = [q for q in queued if not q.startswith("partial ")]
             if not fulls:
                 try:
-                    if STT_REMOTE_HOST:
-                        # 遠端 STT：不做預覽辨識（沒有文字回來），但借這個 tick 把新增的音訊先傳過去
-                        a = wav_samples(req[len("partial "):])
-                        if a is not None:
-                            remote_stream_append(a)
-                        t = ""
-                    else:
-                        t = partial_text(req[len("partial "):], language=language)
+                    t = partial_text(req[len("partial "):], language=language)
                 except Exception as e:  # noqa: BLE001
                     t = ""
                     print(f"[partial] 預覽失敗: {e!r}", file=sys.stderr)
