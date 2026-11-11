@@ -495,3 +495,18 @@ log 可以直接確認載入的是哪一顆。
 **還沒驗**：真人按 ⌘E 累積一週樣本後的「誰常對」。判準＝
 `./.venv/bin/python transcribe.py --second-opinion-report` 的一致率、最常不一致清單、標點分布。
 
+<!-- 2026-11-06 從舊 wip 分支救回，內容未改 -->
+
+
+## 2026-10-22 再確認：M2 的標點不是 ASR 給的、聽寫沒有走 M4
+
+- 使用者回報「M2 的 voice input 有加標點」，懷疑 Breeze-ASR-25 自帶標點。實測 M2 `.run.log`：
+  **`[raw]` 110 筆、0 筆含標點；`[final]` 109 筆、101 筆有標點**。→ 標點 100% 來自
+  `--no-polish` 路徑的 `punctuate_deterministic()`（連接詞前補「，」＋句尾「。」／「？」），
+  不是 Breeze 的能力。`STT_INITIAL_PROMPT` 雖然寫了「標點符號：…」，實測沒有讓 raw 吐出任何標點。
+- 例：raw `…那一頁然後還有下一頁…大家都固定` → final `…那一頁，然後，還有下一頁…大家都固定。`
+  （只多出 `，，，。`，逐字未改）。
+- M2 仍是全本機：`local.env` 指向 `~/orca/voice-input-mac/models/breeze-asr-25-mlx-4bit`；
+  app 用 M2 的 `.venv/bin/python` 跑本機 `transcribe.py --serve --no-polish`；無 `launchctl` 環境覆寫、
+  app 無任何網路連線、原始碼無 HTTP/ssh 呼叫。M2→M4 的 SSH tunnel 只有 voice-tts（朗讀）那條，
+  與聽寫無關。

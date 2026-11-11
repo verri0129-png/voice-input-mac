@@ -1,5 +1,5 @@
 """Pipe: record or file -> local Breeze ASR -> cloud rewrite -> clipboard or stdout."""
-import argparse, base64, difflib, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
+import argparse, base64, difflib, hashlib, subprocess, sys, tempfile, os, time, re, threading, unicodedata, json
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +53,174 @@ def _setting(name, default):
 
 STT_REPO = _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
 
+# ── 遠端 ASR：模型只放在另一台機器（例如 M4），本機（例如 M2）不載入、不佔記憶體 ──
+# 設定 VOICE_STT_REMOTE=m4（ssh 別名）即啟用；留空就維持原本的本地模型。
+# 遠端那台要有同一份 repo（含 asr_server.py）與 .venv（含 mlx_whisper、mlx_qwen3_asr）。
+# VOICE_STT_REMOTE_BACKEND=breeze|qwen 選遠端用哪個模型（留空＝由遠端的 VOICE_ASR_BACKEND 決定，預設 breeze）。
+# 改完要重開 App（或等暖機程序閒置結束）才會生效；兩個模型都常駐在遠端，切換不必重啟遠端。
+STT_REMOTE_HOST = (_setting("VOICE_STT_REMOTE", "") or "").strip()
+STT_REMOTE_PY = _setting("VOICE_STT_REMOTE_PY", "~/orca/voice-input-mac/.venv/bin/python")
+STT_REMOTE_SCRIPT = _setting("VOICE_STT_REMOTE_SCRIPT", "~/orca/voice-input-mac/asr_server.py")
+STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lower()
+# 選單列「ASR 模型」寫的小檔（內容 breeze 或 qwen）。每次辨識都重讀，所以切換立即生效、不用重啟；
+# 檔案不存在或內容不認得就退回上面的設定。遠端模式選的是遠端那台的模型；本機模式選 qwen 則在
+# 本機載入 Qwen3-ASR（第一次用到才載入），選 breeze 或沒選＝原本的本機 Breeze，行為不變。
+ASR_BACKEND_FILE = Path(_setting("VOICE_ASR_BACKEND_FILE", "~/orca/state/voice-input/asr-backend")).expanduser()
+ASR_BACKENDS = ("breeze", "qwen")
+
+def current_backend() -> str:
+    try:
+        chosen = ASR_BACKEND_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        chosen = ""
+    return chosen if chosen in ASR_BACKENDS else STT_REMOTE_BACKEND
+# Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
+STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
+_REMOTE_PROC = None
+_REMOTE_LOCK = threading.Lock()
+
+def _remote_proc():
+    """長駐一條 ssh 連線（遠端的模型因此只載入一次）；斷線時自動重連。"""
+    global _REMOTE_PROC
+    if _REMOTE_PROC is None or _REMOTE_PROC.poll() is not None:
+        cmd = f"{STT_REMOTE_PY} {STT_REMOTE_SCRIPT}"
+        print(f"[remote-stt] 連線 {STT_REMOTE_HOST}（模型在遠端，本機不載入）", file=sys.stderr)
+        _REMOTE_PROC = subprocess.Popen(
+            ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", STT_REMOTE_HOST, cmd],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+        )
+    return _REMOTE_PROC
+
+def _pcm16(samples):
+    """wav_samples 給的是 int16/32768；乘回去再四捨五入，無損。"""
+    import numpy as np
+    return np.clip(np.rint(np.asarray(samples, dtype="float32") * 32768.0), -32768, 32767).astype("<i2")
+
+def _remote_call(req):
+    """送一行 JSON、讀一行回應（呼叫端要先拿著 _REMOTE_LOCK）。斷線就重連並丟 RuntimeError。"""
+    global _REMOTE_PROC
+    line = ""
+    try:
+        proc = _remote_proc()
+        proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+    except (OSError, ValueError) as e:
+        print(f"[remote-stt] 通訊失敗: {e!r}", file=sys.stderr)
+    if not line:
+        if _REMOTE_PROC is not None:
+            try:
+                _REMOTE_PROC.kill()
+            except OSError:
+                pass
+        _REMOTE_PROC = None
+        _stream_reset()  # 遠端緩衝區跟著沒了
+        raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
+    return json.loads(line)
+
+def _b64(pcm):
+    return base64.b64encode(pcm.tobytes()).decode("ascii")
+
+# 邊錄邊傳：上行頻寬（M2→M4 約 130–180 KB/s）是瓶頸，停止後才一次傳整段，錄越久等越久。
+# 錄音中每次預覽 tick 只傳「上次之後新增」的樣本，M4 先存著；停止時只補尾巴。
+# 正確性靠內容比對：n＝已送出的樣本數、digest＝那段前綴的 sha1；
+# 最終音訊的前 n 個樣本 sha1 對得上才走增量，否則（新錄音、重連、別的呼叫）整段重傳。
+_STREAM = {"n": 0, "digest": None}
+
+def _sha(pcm):
+    return hashlib.sha1(memoryview(pcm)).digest()
+
+def _stream_reset():
+    _STREAM["n"], _STREAM["digest"] = 0, None
+
+def _streamed_prefix(pcm):
+    """已經傳到 M4 的前綴有幾個樣本（對不上＝0）。呼叫端要先拿著 _REMOTE_LOCK。"""
+    n = _STREAM["n"]
+    return n if n and n <= len(pcm) and _sha(pcm[:n]) == _STREAM["digest"] else 0
+
+def remote_stream_append(pcm):
+    """錄音中呼叫：pcm 是「到目前為止」的整段 int16 音訊；只把新增的部分傳到 M4。"""
+    with _REMOTE_LOCK:
+        n = _streamed_prefix(pcm)  # 0＝新錄音或對不上，從頭來（offset=0 會讓 M4 清掉舊的）
+        if n and len(pcm) == n:
+            return
+        resp = _remote_call({"op": "append", "fmt": "i2", "audio": _b64(pcm[n:]), "offset": n})
+        if resp.get("ok"):
+            _STREAM["n"], _STREAM["digest"] = len(pcm), _sha(pcm)
+        else:
+            _stream_reset()
+
+def _remote_whisper(samples, language, prompt):
+    """把 16 kHz 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。
+    錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
+    pcm = _pcm16(samples)
+    base = {"fmt": "i2", "language": language, "prompt": prompt}
+    backend = current_backend()
+    if backend:
+        base["backend"] = backend
+        base["terms"] = stt_terms()
+    with _REMOTE_LOCK:
+        n = _streamed_prefix(pcm)
+        _stream_reset()  # 無論成敗，M4 端的緩衝區這次都會被清掉
+        resp = None
+        print(f"[remote-stt] 送出 {'增量：已先傳 %d 樣本，只補 %d' % (n, len(pcm) - n) if n else '整段 %d' % len(pcm)} 樣本",
+              file=sys.stderr)
+        if n:
+            resp = _remote_call(dict(base, op="final", audio=_b64(pcm[n:]), offset=n))
+            if resp.get("error") == "offset":
+                print("[remote-stt] 增量對不上 → 改送整段", file=sys.stderr)
+                resp = None
+        if resp is None:
+            resp = _remote_call(dict(base, audio=_b64(pcm)))
+    if "error" in resp:
+        raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
+    got = resp.get("backend")  # 舊版伺服器不回報
+    print(f"[remote-stt] 遠端用的模型：{got or '未回報（遠端還是舊版）'}", file=sys.stderr)
+    if backend and got != backend:
+        # 不偷偷用別的模型：試用期間若悄悄跑 Breeze，使用者會把結果當成 Qwen 的
+        raise RuntimeError(f"要求 {backend} 但遠端是 {got or '舊版（忽略了 backend）'}："
+                           f"M4 的 asr_server.py 需要更新並重啟（git pull ＋ 結束舊的暖機程序）")
+    # Qwen 以 zh 輸出簡體；詞庫替換在 rewrite 階段（早於最後的繁化），詞庫變體是繁體寫法，
+    # 所以在遠端結果的邊界就繁化，所有後端走同一條路（Breeze 本來就是繁體，等於 no-op）。
+    if resp.get("text"):
+        resp["text"] = to_taiwan_traditional(resp["text"])
+    return resp
+
+_LOCAL_QWEN = None
+
+def _local_qwen(audio, language):
+    """本機的 Qwen3-ASR（選單選 qwen 且沒有遠端時）。第一次用到才載入，常駐在這個程序裡。
+    回傳與 mlx_whisper 同形；Qwen 以 zh 輸出簡體，這裡先繁化（理由同 _remote_whisper）。"""
+    global _LOCAL_QWEN
+    if _LOCAL_QWEN is None:
+        import mlx.core as mx
+        from mlx_qwen3_asr import Session
+        t0 = time.time()
+        _LOCAL_QWEN = Session(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"), dtype=mx.float16)
+        print(f"[local-qwen] 載入 Qwen3-ASR（{time.time() - t0:.1f}s）", file=sys.stderr)
+    r = _LOCAL_QWEN.transcribe(audio, context=" ".join(stt_terms()), language=language)
+    return {"text": to_taiwan_traditional(r.text or ""), "segments": [], "backend": "qwen"}
+
+def _whisper(language, audio=None, path=None):
+    """統一的 Whisper 入口：遠端啟用時送到 M4；否則用本機模型（預設行為與原本相同）。"""
+    prompt = stt_initial_prompt()
+    if STT_REMOTE_HOST:
+        if audio is None and path:
+            audio = wav_samples(path)
+        if audio is None:
+            raise RuntimeError("遠端 ASR 需要可讀取的音訊")
+        return _remote_whisper(audio, language, prompt)
+    if current_backend() == "qwen":
+        if audio is None and path:
+            audio = wav_samples(path)
+        if audio is None:
+            raise RuntimeError("本機 Qwen 需要可讀取的音訊")
+        return _local_qwen(audio, language)
+    import mlx_whisper
+    src = path if path is not None else audio
+    return mlx_whisper.transcribe(src, path_or_hf_repo=STT_REPO, language=language,
+                                  verbose=False, initial_prompt=prompt)
+
 # ── STT provider ──────────────────────────────────────────────────────────────
 # breeze（預設）：本地 Breeze-ASR-25，完全離線。
 # soniox        ：Soniox 即時 API（雲端），自帶標點，停止後幾乎不用等；
@@ -96,6 +264,20 @@ def stt_initial_prompt(terms_file: str | None = None) -> str:
         picked.append(word)
         used += len(word) + 1
     return base + head + "、".join(picked) if picked else base
+
+
+def stt_terms(terms_file: str | None = None) -> list[str]:
+    """給 Qwen 的熱詞（純詞，不含 Whisper 那種提示句）。取詞庫的正字，
+    跳過明顯是句子片段的條目（含標點或太長）——詞庫被「手動修正學習」塞進片段時，
+    Qwen 會把它們當詞去聽，比 Whisper 更吃虧。"""
+    try:
+        rules = load_term_rules(terms_file or REWRITE_TERMS_FILE)
+    except Exception:  # noqa: BLE001
+        return []
+    bad = set("，。,.？?！!、；;：:（）()「」\"'")
+    words = [r.text.strip() for r in rules if r.text.strip()]
+    words = [w for w in words if len(w) <= 16 and not (set(w) & bad)]
+    return list(dict.fromkeys(words))[:STT_QWEN_MAX_TERMS]
 
 
 REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")
@@ -316,10 +498,8 @@ def hallucination_reason(result):
         return f"avg_logprob={avg_lp:.2f} text='{text}'"
     return None
 
-def wav_samples(path):
-    """16-bit PCM wav -> float32 array in [-1,1], or None if unreadable.
-    The file path had NO silence gate before, which is how a silent recording turned into
-    a Whisper hallucination that got pasted as if it were speech."""
+def wav_pcm16(path):
+    """16-bit PCM wav -> int16 array，讀不了回 None。"""
     import numpy as np
     import wave
     try:
@@ -330,10 +510,16 @@ def wav_samples(path):
     except Exception as e:  # noqa: BLE001
         print(f"[gate] 無法讀取 {path}: {e!r}", file=sys.stderr)
         return None
-    return np.frombuffer(data, dtype="<i2").astype("float32") / 32768.0
+    return np.frombuffer(data, dtype="<i2")
+
+def wav_samples(path):
+    """16-bit PCM wav -> float32 array in [-1,1], or None if unreadable.
+    The file path had NO silence gate before, which is how a silent recording turned into
+    a Whisper hallucination that got pasted as if it were speech."""
+    pcm = wav_pcm16(path)
+    return None if pcm is None else pcm.astype("float32") / 32768.0
 
 def transcribe_audio(audio, language="zh"):
-    import mlx_whisper
     import numpy as np
     # normalize to float32 in [-1,1] if int16
     if audio.dtype == np.int16:
@@ -344,13 +530,7 @@ def transcribe_audio(audio, language="zh"):
         return ""
     # Use word_timestamps=False for speed; rely on gate for hallucination
     # Use suppress_blank / no_speech handling via temperature fallback
-    result = mlx_whisper.transcribe(
-        audio,
-        path_or_hf_repo=STT_REPO,
-        language=language if language else None,
-        verbose=False,
-        initial_prompt=stt_initial_prompt(),
-    )
+    result = _whisper(language if language else None, audio=audio)
     text = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
     # 實測全 0 音檔的幻覺 no_speech_prob=0.000，所以主要防線仍是能量門檻）
@@ -964,10 +1144,8 @@ def process_wav_file(
         print(f"[gate]{label} 沒收到聲音（peak {peak_db:.1f} dB、最大 0.5s 窗 rms {window_db:.1f} dB）"
               f" → 不跑 Whisper（避免幻覺）", file=sys.stderr)
         return {"status": "silence", "text": ""}
-    import mlx_whisper
     lang = None if language == "auto" else language
-    result = mlx_whisper.transcribe(path, path_or_hf_repo=STT_REPO, language=lang, verbose=False,
-                                    initial_prompt=stt_initial_prompt())
+    result = _whisper(lang, audio=a, path=path)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
     raw = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
@@ -1521,6 +1699,9 @@ def second_opinion_report(path: str | None = None) -> str:
 def partial_text(path, language="zh"):
     """錄音中「即時預覽」用：Whisper ＋ 繁化，**不潤飾**。
 
+    遠端 STT（STT_REMOTE_HOST）模式下**沒有預覽文字**：這個 tick 只用來把新增的音訊先傳到 M4
+    （邊錄邊傳，見 remote_stream_append），永遠回空字串。不要在遠端模式略過它，否則停止後要整段重傳。
+
     刻意與 process_wav_file 不同：
       - 不重寫：最終文字才走雲端校正（而且預覽不是最終文字）
       - 不做 suspect／fabrication 投票：那是「要不要自動貼」的判斷，與預覽無關
@@ -1529,6 +1710,12 @@ def partial_text(path, language="zh"):
     實測（M4 Max，暖機）：whisper-large-v3-turbo 約 33x 即時速度
     → 10s 的音訊一次預覽約 0.3s，1.2s 一次完全跟得上。
     """
+    if STT_REMOTE_HOST:
+        # 遠端 STT：不做預覽辨識（沒有文字回來）；借這個 tick 把新增的音訊先傳到 M4（邊錄邊傳）
+        pcm = wav_pcm16(path)
+        if pcm is not None:
+            remote_stream_append(pcm)
+        return ""
     a = wav_samples(path)
     if a is None or is_silence(a):
         return ""
