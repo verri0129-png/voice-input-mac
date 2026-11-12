@@ -135,7 +135,7 @@ class MenuChoiceFileTest(unittest.TestCase):
 
 
 class LocalRoutingTest(unittest.TestCase):
-    """本機模式（沒有遠端）：選 qwen 才走 Qwen；沒選或選 breeze 必須維持原本的 mlx_whisper。"""
+    """本機模式（沒有遠端）：Breeze 已停用，一律走 Qwen3-ASR；選單的 qwen／qwen06 決定 1.7B 或 0.6B。"""
 
     def setUp(self):
         import sys
@@ -149,7 +149,7 @@ class LocalRoutingTest(unittest.TestCase):
         fake = types.ModuleType("mlx_whisper")
         fake.transcribe = lambda *a, **k: (self.calls.append("whisper"), {"text": "w", "segments": []})[1]
         sys.modules["mlx_whisper"] = fake
-        t._local_qwen = lambda audio, lang: (self.calls.append("qwen"), {"text": "q", "segments": []})[1]
+        t._local_qwen = lambda audio, lang, model="qwen": (self.calls.append(model), {"text": "q", "segments": []})[1]
 
     def tearDown(self):
         import sys
@@ -164,25 +164,26 @@ class LocalRoutingTest(unittest.TestCase):
         import numpy as np
         return t._whisper("zh", audio=np.zeros(1600, dtype="float32"))
 
-    def test_default_is_unchanged_whisper(self):
+    def test_default_is_qwen06_never_whisper(self):
         self._run()
-        self.assertEqual(self.calls, ["whisper"])
+        self.assertEqual(self.calls, ["qwen06"])
 
-    def test_breeze_choice_is_whisper(self):
+    def test_breeze_is_disabled_and_falls_back_to_qwen(self):
         t.ASR_BACKEND_FILE.write_text("breeze")
         self._run()
-        self.assertEqual(self.calls, ["whisper"])
+        self.assertEqual(self.calls, ["qwen06"])
+        self.assertNotIn("whisper", self.calls)
 
-    def test_qwen_choice_routes_to_qwen_and_switches_back_without_restart(self):
+    def test_qwen_choice_routes_to_17b_and_back(self):
         t.ASR_BACKEND_FILE.write_text("qwen")
         self._run()
-        t.ASR_BACKEND_FILE.write_text("breeze")
+        t.ASR_BACKEND_FILE.write_text("qwen06")
         self._run()
-        self.assertEqual(self.calls, ["qwen", "whisper"])
+        self.assertEqual(self.calls, ["qwen", "qwen06"])
 
     def test_remote_host_wins_over_local_qwen(self):
         t.STT_REMOTE_HOST = "m4"
-        t.ASR_BACKEND_FILE.write_text("qwen")
+        t.ASR_BACKEND_FILE.write_text("qwen06")
         seen = []
         orig = t._remote_whisper
         t._remote_whisper = lambda *a, **k: (seen.append(1), {"text": "r", "segments": []})[1]

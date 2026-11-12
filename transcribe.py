@@ -66,7 +66,13 @@ STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lo
 # 檔案不存在或內容不認得就退回上面的設定。遠端模式選的是遠端那台的模型；本機模式選 qwen 則在
 # 本機載入 Qwen3-ASR（第一次用到才載入），選 breeze 或沒選＝原本的本機 Breeze，行為不變。
 ASR_BACKEND_FILE = Path(_setting("VOICE_ASR_BACKEND_FILE", "~/orca/state/voice-input/asr-backend")).expanduser()
-ASR_BACKENDS = ("breeze", "qwen")
+ASR_BACKENDS = ("breeze", "qwen", "qwen06")
+# 本機模式只用 Qwen3-ASR（Breeze 已停用）：qwen06＝0.6B（預設），qwen＝1.7B。
+# 檔案寫 breeze 或不認得的值，本機一律走預設 0.6B。
+QWEN_REPOS = {
+    "qwen": _setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"),
+    "qwen06": _setting("VOICE_QWEN06_REPO", "Qwen/Qwen3-ASR-0.6B"),
+}
 
 def current_backend() -> str:
     try:
@@ -74,6 +80,10 @@ def current_backend() -> str:
     except OSError:
         chosen = ""
     return chosen if chosen in ASR_BACKENDS else STT_REMOTE_BACKEND
+
+def _local_qwen_model() -> str:
+    b = current_backend()
+    return b if b in QWEN_REPOS else "qwen06"
 # Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
 STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
 _REMOTE_PROC = None
@@ -186,20 +196,46 @@ def _remote_whisper(samples, language, prompt):
         resp["text"] = to_taiwan_traditional(resp["text"])
     return resp
 
-_LOCAL_QWEN = None
+_QWEN_SESSION = {"model": None, "obj": None}
 
-def _local_qwen(audio, language):
-    """本機的 Qwen3-ASR（選單選 qwen 且沒有遠端時）。第一次用到才載入，常駐在這個程序裡。
-    回傳與 mlx_whisper 同形；Qwen 以 zh 輸出簡體，這裡先繁化（理由同 _remote_whisper）。"""
-    global _LOCAL_QWEN
-    if _LOCAL_QWEN is None:
+def _qwen_session(model):
+    """本機 Qwen3-ASR 的常駐 Session：同一時間只留一個模型，切換時先釋放舊的再載新的。"""
+    if _QWEN_SESSION["model"] != model:
+        _QWEN_SESSION["obj"] = None
         import mlx.core as mx
         from mlx_qwen3_asr import Session
         t0 = time.time()
-        _LOCAL_QWEN = Session(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"), dtype=mx.float16)
-        print(f"[local-qwen] 載入 Qwen3-ASR（{time.time() - t0:.1f}s）", file=sys.stderr)
-    r = _LOCAL_QWEN.transcribe(audio, context=" ".join(stt_terms()), language=language)
-    return {"text": to_taiwan_traditional(r.text or ""), "segments": [], "backend": "qwen"}
+        _QWEN_SESSION["obj"] = Session(QWEN_REPOS[model], dtype=mx.float16)
+        _QWEN_SESSION["model"] = model
+        print(f"[local-qwen] 載入 Qwen3-ASR {model}（{time.time() - t0:.1f}s）", file=sys.stderr)
+    return _QWEN_SESSION["obj"]
+
+def _local_qwen(audio, language, model="qwen06"):
+    """本機的 Qwen3-ASR（1.7B 或 0.6B，由選單決定）。第一次用到才載入，常駐在這個程序裡。
+    回傳與 mlx_whisper 同形；Qwen 以 zh 輸出簡體，這裡先繁化（理由同 _remote_whisper）。"""
+    session = _qwen_session(model)
+    terms = stt_terms()
+    def run(context):
+        # Qwen 輸出簡體（词库），比對前要先繁化
+        return to_taiwan_traditional(session.transcribe(audio, context=context, language=language).text or "")
+    text = run(" ".join(terms))
+    if _qwen_echoes_context(text, terms):
+        # Qwen3-ASR 有時把熱詞清單原句照抄（實測 96 段合成語音中 12 段），不能貼出去
+        print(f"[local-qwen:{model}] 輸出照抄熱詞清單，改用無熱詞重跑", file=sys.stderr)
+        text = run("")
+        if _qwen_echoes_context(text, terms):
+            print(f"[local-qwen:{model}] 無熱詞重跑仍照抄，丟棄這段輸出", file=sys.stderr)
+            text = ""
+    return {"text": text, "segments": [], "backend": model}
+
+def _qwen_echoes_context(text, terms):
+    """輸出是否照抄了熱詞清單：(a) 清單開頭（前 4 詞連續出現）；或 (b) 一句話裡出現 6 個以上不同熱詞
+    （0.6B 實測會從清單中間開始照抄，只比開頭抓不到）。忽略空白比對。"""
+    flat = "".join(text.split())
+    head = "".join("".join(terms[:4]).split())
+    if len(terms) >= 4 and head in flat:
+        return True
+    return sum(1 for w in terms if "".join(w.split()) in flat) >= 6
 
 def _whisper(language, audio=None, path=None):
     """統一的 Whisper 入口：遠端啟用時送到 M4；否則用本機模型（預設行為與原本相同）。"""
@@ -210,16 +246,12 @@ def _whisper(language, audio=None, path=None):
         if audio is None:
             raise RuntimeError("遠端 ASR 需要可讀取的音訊")
         return _remote_whisper(audio, language, prompt)
-    if current_backend() == "qwen":
-        if audio is None and path:
-            audio = wav_samples(path)
-        if audio is None:
-            raise RuntimeError("本機 Qwen 需要可讀取的音訊")
-        return _local_qwen(audio, language)
-    import mlx_whisper
-    src = path if path is not None else audio
-    return mlx_whisper.transcribe(src, path_or_hf_repo=STT_REPO, language=language,
-                                  verbose=False, initial_prompt=prompt)
+    # 本機一律 Qwen3-ASR（Breeze 已停用，不再載入 mlx_whisper）
+    if audio is None and path:
+        audio = wav_samples(path)
+    if audio is None:
+        raise RuntimeError("本機 ASR 需要可讀取的音訊")
+    return _local_qwen(audio, language, _local_qwen_model())
 
 # ── STT provider ──────────────────────────────────────────────────────────────
 # breeze（預設）：本地 Breeze-ASR-25，完全離線。
@@ -281,6 +313,8 @@ def stt_terms(terms_file: str | None = None) -> list[str]:
 
 
 REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")
+# local-qwen 實驗用的本地定版模型路徑（空字串＝rewrite_local 的預設位置）
+LOCAL_REWRITE_REPO = _setting("VOICE_LOCAL_REWRITE_REPO", "")
 CLOUD_REWRITE_MODEL = _setting("VOICE_CLOUD_REWRITE_MODEL", "gemini-3.8-flash")
 CLOUD_REWRITE_LOCATION = _setting("VOICE_CLOUD_REWRITE_LOCATION", "global")
 CLOUD_REWRITE_PROJECT = _setting("VOICE_CLOUD_REWRITE_PROJECT", "")
@@ -879,9 +913,114 @@ def apply_terms(text: str, rules=()) -> str:
     return out
 
 
+# 小數的中文數字 → 阿拉伯數字（「二點一」→「2.1」）。只處理兩邊都是單一數字串的小數：
+# 左邊前面不能接十/百等位數字，右邊後面也不能接十/百，避免「十點三十分」被誤轉。
+_DIGIT_CN = "〇零一二三四五六七八九兩"
+_DIGIT_MAP = {c: str(i) for i, c in enumerate("〇一二三四五六七八九")}
+_DIGIT_MAP["零"] = "0"
+_DIGIT_MAP["兩"] = "2"
+_DECIMAL_CN = re.compile(
+    rf"(?<![{_DIGIT_CN}十百千萬億點\d])([{_DIGIT_CN}十百千]+)點([{_DIGIT_CN}]+)(?![{_DIGIT_CN}十百千萬億\d])"
+)
+
+
+def convert_decimal_numerals(text: str) -> str:
+    def _sub(m):
+        left = _parse_cn_int(m.group(1))
+        if left is None:
+            return m.group(0)
+        right = "".join(_DIGIT_MAP[c] for c in m.group(2))
+        return f"{left}.{right}"
+    return _DECIMAL_CN.sub(_sub, text)
+
+
+def _parse_cn_int(s: str) -> int | None:
+    """「二十五」→25、「三百五十六」→356、「十」→10。認不得的字回傳 None。"""
+    small = {"十": 10, "百": 100, "千": 1000}
+    total = cur = 0
+    for ch in s:
+        if ch in _DIGIT_MAP:
+            cur = int(_DIGIT_MAP[ch])
+        elif ch in small:
+            total += (cur or 1) * small[ch]
+            cur = 0
+        else:
+            return None
+    return total + cur
+
+
+# 萬／億：「二十萬」→「20萬」、「三百五十六點七萬」→「356.7萬」。
+# 前後不能接其他數字單位，所以「一億二千萬」這種複合寫法整段不轉。
+_UNIT_CN = re.compile(
+    rf"(?<![{_DIGIT_CN}十百千萬億點兩\d])([{_DIGIT_CN}十百千]+)(?:點([{_DIGIT_CN}]+))?([萬億])"
+    rf"(?![{_DIGIT_CN}十百千萬億\d])"
+)
+
+
+def _sub_unit(m):
+    value = _parse_cn_int(m.group(1))
+    if value is None:
+        return m.group(0)
+    frac = "".join(_DIGIT_MAP[c] for c in m.group(2)) if m.group(2) else ""
+    return f"{value}{'.' + frac if frac else ''}{m.group(3)}"
+
+
+def convert_unit_numerals(text: str) -> str:
+    return _UNIT_CN.sub(_sub_unit, text)
+
+
+# 時間：「十點二十五分」→「10點25分」、「十二點整」→「12點整」、「七點」→「7點」。
+# 「點」後面接數字（「一點七」）或「點」（「一點點」）時不轉。
+_TIME_CN = re.compile(
+    rf"(?<![{_DIGIT_CN}十百千萬億點兩\d])([{_DIGIT_CN}十]{{1,3}})點"
+    rf"(?:([{_DIGIT_CN}十]{{1,3}})分|(整|半))?"
+    rf"(?![{_DIGIT_CN}十百千萬億點\d])"
+)
+
+
+def _sub_time(m):
+    hour = _parse_cn_int(m.group(1))
+    if hour is None or hour > 24:
+        return m.group(0)
+    if m.group(2):
+        minute = _parse_cn_int(m.group(2))
+        if minute is None or minute > 59:
+            return m.group(0)
+        return f"{hour}點{minute}分"
+    return f"{hour}點{m.group(3) or ''}"
+
+
+def convert_time_numerals(text: str) -> str:
+    return _TIME_CN.sub(_sub_time, text)
+
+
+# 一般整數：「一千零五十六」→「1056」。只認含「十、百、千」的串，所以「一個」「十分」（單字）
+# 和「一二三」（逐字念）不轉；「一百分之三」因為後面接「分之」整段不轉。
+_INT_CN = re.compile(
+    rf"(?<![{_DIGIT_CN}十百千萬億點\d])([{_DIGIT_CN}十百千]+)(?![{_DIGIT_CN}十百千萬億點\d]|分之)"
+)
+
+
+def _sub_int(m):
+    s = m.group(1)
+    if len(s) < 2 or not any(u in s for u in "十百千"):
+        return m.group(0)
+    value = _parse_cn_int(s)
+    return m.group(0) if value is None else str(value)
+
+
+def convert_int_numerals(text: str) -> str:
+    return _INT_CN.sub(_sub_int, text)
+
+
+def convert_numerals(text: str) -> str:
+    """規則式數字轉換的總入口：小數 → 萬億 → 時間 → 整數。整數最後跑，避免把時間的「十點二十五分」先拆壞。"""
+    return convert_int_numerals(convert_time_numerals(convert_unit_numerals(convert_decimal_numerals(text))))
+
+
 def rules_rewrite_text(text: str, rules=()) -> str:
     """Deterministic fallback: 詞庫替換 + punctuation only, never touch other wording."""
-    return finalize_punctuation(normalize_punct_only(apply_terms(text, rules)))
+    return finalize_punctuation(normalize_punct_only(convert_numerals(apply_terms(text, rules))))
 
 
 def apply_rewrite(
@@ -915,6 +1054,26 @@ def apply_rewrite(
             print("[rewrite] 本地 LLM 已移除（改走雲端或規則）→ 用規則標點", file=sys.stderr)
         info["backend"] = "rules"
         return rules_rewrite_text(text, rules), info
+    if settings.backend == "local-qwen":
+        # opt-in 實驗：本地 Qwen2.5-3B 定版，仍經同一道守門；失敗退回規則版。
+        try:
+            from rewrite_local import local_rewrite
+
+            local_text, reason, changed = local_rewrite(
+                text,
+                rules,
+                allowed_deletions=_allowed_rewrite_deletions(),
+                model_dir=LOCAL_REWRITE_REPO or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - 本地模型守門拒絕或失敗，都不能擋住貼上
+            kind = "守門拒絕" if isinstance(exc, RewriteRejected) else "失敗"
+            print(f"[rewrite] 本地模型{kind}（{exc}）→ 退回規則版", file=sys.stderr)
+            info["backend"] = "rules-fallback"
+            info["reason"] = str(exc)[:300]
+            return rules_rewrite_text(text, rules), info
+        final = _settle_text(local_text, rules)
+        info.update({"backend": "local-qwen", "changed_chars": changed, "reason": reason})
+        return final, info
 
     try:
         result = rewrite_draft(
@@ -1158,7 +1317,7 @@ def process_wav_file(
         refine_path
         and polish
         and raw
-        and settings.backend not in ("off", "none", "raw", "rules", "local")
+        and settings.backend not in ("off", "none", "raw", "rules", "local", "local-qwen")
     )
     if defer_cloud:
         final, rewrite = apply_rewrite(raw, enabled=True, backend="rules", context=context)
@@ -1235,7 +1394,7 @@ def _settle_text(value: str, rules=()) -> str:
     `rules` 有值時先套詞庫——雲端被 prompt 告知正字卻仍寫錯時，這是最後一道
     零成本的攔截；沒有規則時行為與舊版完全相同。
     """
-    text = finalize_punctuation(to_taiwan_traditional(normalize_spacing(apply_terms(value, rules))))
+    text = finalize_punctuation(to_taiwan_traditional(normalize_spacing(convert_numerals(apply_terms(value, rules)))))
     return to_taiwan_traditional(normalize_spacing(text))
 
 
@@ -1997,9 +2156,9 @@ def main():
     ap.add_argument("--no-polish", action="store_true", help="只做 ASR，不做任何重寫")
     ap.add_argument(
         "--rewrite-backend",
-        choices=["cloud", "rules", "off"],
+        choices=["cloud", "rules", "off", "local-qwen"],
         default=None,
-        help="預設走 VOICE_REWRITE_BACKEND，一般不用加",
+        help="預設走 VOICE_REWRITE_BACKEND，一般不用加；local-qwen = 本地 Qwen2.5-3B 實驗",
     )
     ap.add_argument("--context-json", default=None, help="Typeless-style context JSON 檔案")
     ap.add_argument("--terms-file", default=None, help="個人專有名詞 JSON 檔案")
