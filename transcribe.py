@@ -51,7 +51,7 @@ _LOCAL = _local_env()
 def _setting(name, default):
     return os.environ.get(name) or _LOCAL.get(name) or default
 
-STT_REPO = _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
+STT_REPO = _setting("VOICE_STT_REPO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "breeze-asr-25-mlx-4bit"))
 
 # ── 遠端 ASR：模型只放在另一台機器（例如 M4），本機（例如 M2）不載入、不佔記憶體 ──
 # 設定 VOICE_STT_REMOTE=m4（ssh 別名）即啟用；留空就維持原本的本地模型。
