@@ -1330,7 +1330,8 @@ def process_wav_file(
     # 模型或規則可能把英文/數字兩側的空格加回來 → 最終文字再正規化一次
     final = normalize_spacing(final)
     # final hard guarantee: any remaining simplified -> Taiwan traditional
-    final = to_taiwan_traditional(final)
+    # 必須先繁化再套詞庫：OpenCC s2twp 會把「腳本」轉成「指令碼」，詞庫要排在它之後
+    final = apply_terms(to_taiwan_traditional(final), load_term_rules(settings.terms_file))
     print(f"[final] {final}", file=sys.stderr)
     fabricated = is_fabrication(raw, final)
     if fabricated:
@@ -1394,8 +1395,9 @@ def _settle_text(value: str, rules=()) -> str:
     `rules` 有值時先套詞庫——雲端被 prompt 告知正字卻仍寫錯時，這是最後一道
     零成本的攔截；沒有規則時行為與舊版完全相同。
     """
-    text = finalize_punctuation(to_taiwan_traditional(normalize_spacing(convert_numerals(apply_terms(value, rules)))))
-    return to_taiwan_traditional(normalize_spacing(text))
+    # 先繁化、再套詞庫，且之後不再繁化：否則「腳本」會被 s2twp 改回「指令碼」
+    text = apply_terms(to_taiwan_traditional(value), rules)
+    return finalize_punctuation(normalize_spacing(convert_numerals(text)))
 
 
 def refine_in_background(raw, context, settings, refine_path, pasted_text):
@@ -2305,7 +2307,7 @@ def main():
         config=settings,
     )
     final = normalize_spacing(final)
-    final = to_taiwan_traditional(final)
+    final = apply_terms(to_taiwan_traditional(final), load_term_rules(settings.terms_file))
     print(f"[final] {final}", file=sys.stderr)
     if final:
         print(final)
