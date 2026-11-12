@@ -23,7 +23,7 @@ import issue_emitter
 SCOPE = "2026-11-01"
 
 FAKE_GH = r'''#!/usr/bin/env python3
-"""替身 gh：只支援 issue list / issue create，狀態存在 FAKE_GH_STORE。"""
+"""替身 gh：只支援 issue list / create / close，狀態存在 FAKE_GH_STORE。"""
 import json, os, sys
 
 store_path = os.environ["FAKE_GH_STORE"]
@@ -34,8 +34,26 @@ except FileNotFoundError:
 issues = store.setdefault("issues", [])
 argv = sys.argv[1:]
 
+def opt(name, default=None):
+    return argv[argv.index(name) + 1] if name in argv else default
+
 if argv[:2] == ["issue", "list"]:
-    print(json.dumps([{"number": i["number"], "body": i["body"]} for i in issues]))
+    state = opt("--state", "open")
+    label = opt("--label")
+    rows = [
+        i for i in issues
+        if (state == "all" or i.get("state", "OPEN").lower() == state)
+        and (label is None or label in (i.get("labels") or "").split(","))
+    ]
+    print(json.dumps([{"number": i["number"], "body": i["body"]} for i in rows]))
+elif argv[:2] in (["issue", "close"], ["issue", "reopen"]):
+    number = int(argv[2])
+    for i in issues:
+        if i["number"] == number:
+            i["state"] = "CLOSED" if argv[1] == "close" else "OPEN"
+            i["comment"] = opt("--comment", "")
+            i["reason"] = opt("--reason", "")
+    open(store_path, "w", encoding="utf-8").write(json.dumps(store))
 elif argv[:2] == ["issue", "create"]:
     title = body = labels = ""
     i = 2
@@ -512,6 +530,157 @@ class EmitterCoreTests(unittest.TestCase):
         self.assertEqual(
             issue_emitter.parse_marker_keys(items), {"health/2026-11-01/last_attempt/deadbeef"}
         )
+
+
+class ResolveTests(unittest.TestCase):
+    """恢復就關：同一台、同一個欄位有「已恢復」的證據，才關 src:health 的單。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.store = self.tmp / "gh-store.json"
+        self.gh = self.tmp / "gh"
+        self.gh.write_text(FAKE_GH, encoding="utf-8")
+        self.gh.chmod(0o755)
+        os.environ["FAKE_GH_STORE"] = str(self.store)
+
+    def tearDown(self):
+        os.environ.pop("FAKE_GH_STORE", None)
+
+    def _seed(self, issues):
+        rows = []
+        for n, (body, labels, state) in enumerate(issues, start=1):
+            rows.append({"number": n, "title": f"t{n}", "body": body, "labels": labels, "state": state})
+        self.store.write_text(json.dumps({"issues": rows}), encoding="utf-8")
+
+    def _issues(self):
+        return {i["number"]: i for i in json.loads(self.store.read_text(encoding="utf-8"))["issues"]}
+
+    def _body(self, record, scope="2026-11-04"):
+        findings = healthcheck.collect_findings(record)
+        self.assertEqual(len(findings), 1)
+        return issue_emitter.build_body(findings[0], scope)
+
+    def _resolve(self, record, *, apply=True, record_path=None, runner=None):
+        lines: list[str] = []
+        rc = healthcheck.resolve_issues(
+            record,
+            repo=self.repo,
+            runner=runner or str(self.gh),
+            apply=apply,
+            record_path=record_path,
+            out=lines.append,
+        )
+        return rc, "\n".join(lines)
+
+    def test_recovered_evidence_needs_positive_signal(self):
+        ok = healthcheck.recovered_evidence(healthy_record())
+        for field in ("last_attempt", "consecutive_no_text", "agent_loaded", "last_exit", "stt_backend"):
+            self.assertIn(field, ok)
+        self.assertIn("43 字", ok["last_attempt"])
+        # 還沒有任何一輪 → 沒有「上一次有拿到字」的證據，不能關 last_attempt 的單
+        none_yet = healthcheck.recovered_evidence(healthy_record(last_attempt=None))
+        self.assertNotIn("last_attempt", none_yet)
+        self.assertNotIn("consecutive_no_text", none_yet)
+        down = healthcheck.recovered_evidence(healthy_record(agent_loaded=False, last_exit=None))
+        self.assertNotIn("agent_loaded", down)
+        self.assertNotIn("last_exit", down)
+
+    def test_closes_recovered_same_machine_with_comment(self):
+        self._seed([(self._body(failed_record()), "src:health,kind:bug", "OPEN")])
+        rc, out = self._resolve(healthy_record(checked_at="2026-11-12T21:17:29+07:00"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CLOSED #1", out)
+        issue = self._issues()[1]
+        self.assertEqual(issue["state"], "CLOSED")
+        self.assertEqual(issue["reason"], "completed")
+        self.assertIn("2026-11-12T21:17:29+07:00", issue["comment"])
+        self.assertIn("43 字", issue["comment"])
+        self.assertIn("chumac-studio-1", issue["comment"])
+
+    def test_other_machine_is_not_touched(self):
+        other = failed_record(machine="HungdeMac-mini")
+        self._seed([(self._body(other), "src:health,kind:bug", "OPEN")])
+        rc, out = self._resolve(healthy_record())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._issues()[1]["state"], "OPEN")
+        self.assertNotIn("CLOSED #", out)
+
+    def test_still_failing_field_stays_open(self):
+        self._seed([(self._body(healthy_record(agent_loaded=False, last_exit=None)), "src:health,kind:bug", "OPEN")])
+        rc, out = self._resolve(healthy_record(agent_loaded=False, last_exit=None))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._issues()[1]["state"], "OPEN")
+        self.assertIn("KEPT_OPEN #1", out)
+
+    def test_only_src_health_issues(self):
+        body = self._body(failed_record())
+        self._seed([(body, "kind:bug", "OPEN"), ("沒有 marker 的手寫單\n- machine=`chumac-studio-1`", "src:health", "OPEN")])
+        rc, out = self._resolve(healthy_record())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._issues()[1]["state"], "OPEN")
+        self.assertEqual(self._issues()[2]["state"], "OPEN")
+
+    def test_dry_run_does_not_close(self):
+        self._seed([(self._body(failed_record()), "src:health,kind:bug", "OPEN")])
+        rc, out = self._resolve(healthy_record(), apply=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WOULD_CLOSE #1", out)
+        self.assertEqual(self._issues()[1]["state"], "OPEN")
+
+    def test_no_open_issue_known_skips_gh_next_time(self):
+        record_path = self.tmp / "state" / "emitted_issues.json"
+        self._seed([])
+        rc, out = self._resolve(healthy_record(), record_path=record_path)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESOLVE_ISSUES=NONE", out)
+        # 上次確認過沒有開著的單、之後也沒開新單 → 不再打 gh
+        rc, out = self._resolve(healthy_record(), record_path=record_path, runner=str(self.tmp / "no-such-gh"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESOLVE_ISSUES=SKIPPED", out)
+
+    def test_still_broken_skips_gh_until_field_recovers(self):
+        record_path = self.tmp / "state" / "emitted_issues.json"
+        broken = healthy_record(agent_loaded=False, last_exit=None)
+        self._seed([(self._body(broken), "src:health,kind:bug", "OPEN")])
+        rc, out = self._resolve(broken, record_path=record_path)
+        self.assertIn("KEPT_OPEN #1", out)
+        # 還壞著 → 不再打 gh（App 每次轉寫完都會跑）
+        rc, out = self._resolve(broken, record_path=record_path, runner=str(self.tmp / "no-such-gh"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESOLVE_ISSUES=SKIPPED", out)
+        # 那個欄位恢復了 → 去問 gh 並關單
+        rc, out = self._resolve(healthy_record(), record_path=record_path)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CLOSED #1", out)
+
+    def test_same_day_relapse_reopens_auto_closed_issue(self):
+        record_path = self.tmp / "state" / "emitted_issues.json"
+        findings = healthcheck.collect_findings(failed_record())
+        emit = lambda: issue_emitter.emit_all(  # noqa: E731
+            findings, scope=SCOPE, repo=self.repo, runner=str(self.gh), apply=True,
+            record_path=record_path, checked_at="2026-11-01T13:00:00+07:00", out=lines.append,
+        )
+        lines: list[str] = []
+        emit()
+        self._resolve(healthy_record(), record_path=record_path)
+        self.assertEqual(self._issues()[1]["state"], "CLOSED")
+        lines.clear()
+        rc = emit()  # 同一天、同一個值又壞了 → 同一個 key
+        self.assertEqual(rc, 0, lines)
+        self.assertIn("REOPENED #1", "\n".join(lines))
+        self.assertEqual(self._issues()[1]["state"], "OPEN")
+        self.assertEqual(len(self._issues()), 1)
+
+    def test_err_log_issue_is_not_auto_closed(self):
+        # 錯誤 log 的單要人看過才算數；checkpoint 一前進就是 0，不能當恢復證據
+        self.assertNotIn("err_lines_since_last_check", healthcheck.recovered_evidence(healthy_record()))
+
+    def test_gh_failure_is_exit_2(self):
+        rc, out = self._resolve(healthy_record(), runner=str(self.tmp / "no-such-gh"))
+        self.assertEqual(rc, 2)
+        self.assertIn("RESOLVE_ISSUES=FAIL", out)
 
 
 class CliReplayTests(unittest.TestCase):

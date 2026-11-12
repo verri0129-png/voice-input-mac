@@ -21,7 +21,8 @@
 
     python3 healthcheck.py                      # 產 health.json，印 HEALTH=OK/DEGRADED
     python3 healthcheck.py --emit               # 再跑 emitter（預設 dry-run，只印 WOULD_CREATE）
-    python3 healthcheck.py --emit --apply       # 真的開單，編號寫回 emitted_issues.json
+    python3 healthcheck.py --emit --apply       # 真的開單，編號寫回 emitted_issues.json；
+                                                # 這台已恢復的 src:health 單會被關掉並留言
     python3 healthcheck.py --emit --from-health /tmp/health.json --apply
                                                 # 重放：用一份改過的副本判定（不碰系統）
 
@@ -295,6 +296,12 @@ def read_last_attempt(run_log: Path, tail_bytes: int = 200_000) -> tuple[dict | 
 
 
 # ── 觀測與判定 ────────────────────────────────────────────────────────────────
+def machine_line(machine: str) -> str:
+    """issue body 證據段裡的那一行。開單寫它、關單認它（只關同一台開的單）。"""
+
+    return f"- machine=`{machine}`"
+
+
 def machine_name() -> str:
     return socket.gethostname().split(".")[0]
 
@@ -477,7 +484,7 @@ def collect_findings(record: dict) -> list[Finding]:
     run_log = sources.get("run_log") or str(Path(str(record.get("runtime_dir") or DEFAULT_TRANSCRIBE.parent)) / ".run.log")
     backend = str(record.get("stt_backend") or "unknown")
     observations = (
-        f"- machine=`{machine}`",
+        machine_line(machine),
         f"- checked_at=`{checked_at}`",
         f"- stt_backend=`{backend}`",
     )
@@ -684,6 +691,69 @@ def collect_findings(record: dict) -> list[Finding]:
     return findings
 
 
+# ── 恢復就關 ────────────────────────────────────────────────────────────────
+def recovered_evidence(record: dict) -> dict[str, str]:
+    """純函式：哪些 finding 欄位有「已經恢復」的**正面**證據（欄位 → 一句白話）。
+
+    「這次沒觸發」不等於恢復：例如 `.run.log` 還沒有任何一輪，就沒有證據說
+    ⌘E 又能拿到字了，`last_attempt` 的單不能關。
+    """
+
+    evidence: dict[str, str] = {}
+    attempt = record.get("last_attempt") or {}
+    if attempt.get("outcome") == "ok":
+        line = f"上一次按 ⌘E（{attempt.get('at') or '時間不明'}）轉出 {attempt.get('chars', '?')} 字"
+        evidence["last_attempt"] = line
+        evidence["consecutive_no_text"] = line
+    if record.get("agent_loaded"):
+        evidence["agent_loaded"] = (
+            f"`launchctl list` 有 `{AGENT_LABEL}`（pid {record.get('agent_pid') or '-'}）"
+        )
+        if record.get("last_exit") == 0:
+            evidence["last_exit"] = "熱鍵 agent 的 last exit 是 0"
+    # 不給 `err_lines_since_last_check`：checkpoint 一前進它就是 0，那不是恢復，
+    # 這種單要人看過 log 才算數。
+    if record.get("stt_backend") in STT_BACKENDS:
+        evidence["stt_backend"] = f"VOICE_STT 解析為 `{record.get('stt_backend')}`"
+    return evidence
+
+
+def resolve_issues(
+    record: dict,
+    *,
+    repo: Path,
+    runner: str = "gh",
+    apply: bool = False,
+    record_path: Path | None = None,
+    out=print,
+) -> int:
+    """把這台機器開過、而且已經恢復的 src:health 單關掉（別台的單不碰：這台證明不了別台好了）。"""
+
+    machine = str(record.get("machine") or "unknown")
+    checked_at = str(record.get("checked_at") or "")
+
+    def comment(field: str, evidence: str) -> str:
+        return (
+            f"已恢復，自動關閉。{machine} 在 {checked_at} 的健康檢查確認：{evidence}"
+            f"（`{field}` 不再是問題）。\n\n"
+            "這張單由 `healthcheck.py` 自動關閉；如果又壞了，下一次檢查會重開這張或開新單。"
+        )
+
+    return issue_emitter.resolve_open(
+        recovered_evidence(record),
+        key_prefix="health",
+        owner_line=machine_line(machine),  # 只關這台開的單
+        label="src:health",
+        repo=repo,
+        comment=comment,
+        runner=runner,
+        apply=apply,
+        record_path=record_path,
+        checked_at=checked_at,
+        out=out,
+    )
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def _print_summary(record: dict, health_path: Path, out=print) -> None:
     state = "OK" if record.get("ok") else "DEGRADED"
@@ -754,7 +824,7 @@ def main(argv: list[str] | None = None) -> int:
 
     scope = str(record.get("checked_at") or "")[:10] or datetime.now().date().isoformat()
     record_path = Path(args.record).expanduser() if args.record else state_dir / "emitted_issues.json"
-    return issue_emitter.emit_all(
+    emit_rc = issue_emitter.emit_all(
         collect_findings(record),
         scope=scope,
         repo=Path(args.repo),
@@ -763,6 +833,10 @@ def main(argv: list[str] | None = None) -> int:
         record_path=record_path,
         checked_at=str(record.get("checked_at") or ""),
     )
+    resolve_rc = resolve_issues(
+        record, repo=Path(args.repo), runner=args.runner, apply=args.apply, record_path=record_path
+    )
+    return max(emit_rc, resolve_rc)
 
 
 if __name__ == "__main__":
