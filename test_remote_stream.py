@@ -23,7 +23,7 @@ class FakeRemote:
         out, audio = asr_server.handle_request(json.loads(json.dumps(req)), self.buf)
         if audio is not None:
             self.decoded.append(np.rint(audio * 32768).astype("int16"))
-            return {"text": "ok", "segments": []}
+            return {"text": "ok", "segments": [], "backend": req.get("backend") or "breeze"}  # 與真伺服器一樣回報後端
         return out
 
 

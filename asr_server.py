@@ -18,8 +18,9 @@
 設定讀取順序：環境變數 → 本機的 local.env → 預設值。
   VOICE_STT_REPO      Breeze（mlx_whisper）模型路徑
   VOICE_ASR_BACKEND   請求沒指定 backend 時用哪個（breeze | qwen），預設 breeze
-  VOICE_ASR_BACKENDS  啟動時要載入哪些，預設 "breeze,qwen"（兩個都載，切換不用重啟；約 +4GB）
-  VOICE_QWEN_REPO     Qwen3-ASR 模型，預設 Qwen/Qwen3-ASR-1.7B
+  VOICE_ASR_BACKENDS  啟動時要載入哪些，預設 DEFAULT_LOADED（三個都載，切換不用重啟）
+  VOICE_QWEN_REPO     Qwen3-ASR 1.7B 模型，預設 Qwen/Qwen3-ASR-1.7B
+  VOICE_QWEN06_REPO   Qwen3-ASR 0.6B 模型（後端名 qwen06），預設 Qwen/Qwen3-ASR-0.6B
 """
 import base64
 import json
@@ -145,16 +146,24 @@ def load_engines(names, builders, warm):
     return engines
 
 
+DEFAULT_LOADED = "breeze,qwen,qwen06"  # 要與 transcribe.ASR_BACKENDS 的選單值一致（test_asr_backend 會檢查）
+
+
+def _builders() -> dict:
+    return {
+        "breeze": lambda: _breeze_engine(_load_stt_repo()),
+        "qwen": lambda: _qwen_engine(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B")),
+        "qwen06": lambda: _qwen_engine(_setting("VOICE_QWEN06_REPO", "Qwen/Qwen3-ASR-0.6B")),
+    }
+
+
 def main() -> int:
     default = _setting("VOICE_ASR_BACKEND", "breeze")
-    wanted = [n.strip() for n in _setting("VOICE_ASR_BACKENDS", "breeze,qwen").split(",") if n.strip()]
+    wanted = [n.strip() for n in _setting("VOICE_ASR_BACKENDS", DEFAULT_LOADED).split(",") if n.strip()]
     if default not in wanted:
         wanted.append(default)
     warm = (np.random.default_rng(0).standard_normal(16000).astype("float32") * 0.02)
-    engines = load_engines(wanted, {
-        "breeze": lambda: _breeze_engine(_load_stt_repo()),
-        "qwen": lambda: _qwen_engine(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B")),
-    }, warm)
+    engines = load_engines(wanted, _builders(), warm)
     print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}）", file=sys.stderr, flush=True)
 
     buf = bytearray()  # 邊錄邊傳：已收到的 int16 PCM（跨請求保留，final 或整段請求時清空）

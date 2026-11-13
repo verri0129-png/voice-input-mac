@@ -194,6 +194,17 @@ class LocalRoutingTest(unittest.TestCase):
         self.assertEqual((seen, self.calls), ([1], []))
 
 
+class ServerLoadsClientBackendsTest(unittest.TestCase):
+    """回歸：選單能送的每個後端，遠端伺服器預設都要載入；否則 M2 會收到「沒載入」（曾發生於 qwen06）。"""
+
+    def test_every_menu_backend_is_loaded_by_default(self):
+        loaded = {n.strip() for n in asr_server.DEFAULT_LOADED.split(",") if n.strip()}
+        self.assertTrue(set(t.ASR_BACKENDS) <= loaded, f"預設只載入 {sorted(loaded)}，缺 {set(t.ASR_BACKENDS) - loaded}")
+
+    def test_every_menu_backend_has_a_builder(self):
+        self.assertTrue(set(t.ASR_BACKENDS) <= set(asr_server._builders()))
+
+
 class SttTermsTest(unittest.TestCase):
     def test_skips_sentence_fragments_and_caps(self):
         d = {"version": 1, "terms": [{"text": x} for x in
