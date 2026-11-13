@@ -1,11 +1,10 @@
 """健康檢查與工單 emitter 的回歸測試（issue #1）。
 
-釘住五件事：
-1. 探測是**純函式**可測：launchctl／pgrep／local.env／.run.log 的字串進來，判定出去。
-2. `err_lines_since_last_check` 有定義：靠 checkpoint 的 offset，第一次跑只建立基準。
-3. **判準掛在「用過有沒有拿到字」上，不掛在「App 有沒有開著」上**——關掉 App 是靜止狀態。
-4. 一次空白不開單、連續三次才開；真的失敗（transcribe failed／沒有音訊）一次就開。
-5. emitter 的 key／marker／五段 body／去重／編號回寫，用替身 `gh` 跑真的流程，不碰 GitHub。
+釘住四件事：
+1. 探測是**純函式**可測：pgrep／local.env／.run.log 的字串進來，判定出去。
+2. **判準掛在「用過有沒有拿到字」上，不掛在「App 有沒有開著」上**——關掉 App 是靜止狀態。
+3. 一次空白不開單、連續三次才開；真的失敗（transcribe failed／沒有音訊）一次就開。
+4. emitter 的 key／marker／五段 body／去重／編號回寫，用替身 `gh` 跑真的流程，不碰 GitHub。
 """
 
 import hashlib
@@ -80,12 +79,8 @@ def healthy_record(**overrides) -> dict:
     base: dict = dict(
         machine="chumac-studio-1",
         checked_at="2026-11-01T12:00:00+07:00",
-        agent_loaded=True,
-        agent_pid=2769,
-        last_exit=0,
         app_running=True,
         app_pids=[9943],
-        err_lines=0,
         stt_backend="soniox",
         stt_source="local.env:/Users/x/orca/voice-input-mac/local.env",
         runtime=Path("/Users/x/orca/voice-input-mac"),
@@ -93,9 +88,7 @@ def healthy_record(**overrides) -> dict:
         consecutive_no_text=0,
         sources={
             "health": "/Users/x/orca/state/voice-input/health.json",
-            "err_log": "/Users/x/orca/state/voice-toggle-hotkey.err.log",
             "run_log": "/Users/x/orca/voice-input-mac/.run.log",
-            "agent_label": healthcheck.AGENT_LABEL,
         },
     )
     base.update(overrides)
@@ -114,24 +107,6 @@ def failed_record(**overrides) -> dict:
     )
     base.update(overrides)
     return healthy_record(**base)
-
-
-class LaunchctlParseTests(unittest.TestCase):
-    def test_running_agent(self):
-        out = "PID\tStatus\tLabel\n2769\t0\tlocal.hunghanchu.voice-toggle-hotkey\n"
-        self.assertEqual(healthcheck.parse_launchctl(out), (True, 2769, 0))
-
-    def test_loaded_but_not_running(self):
-        out = "-\t0\tlocal.hunghanchu.voice-toggle-hotkey\n"
-        self.assertEqual(healthcheck.parse_launchctl(out), (True, None, 0))
-
-    def test_missing_label(self):
-        out = "2769\t0\tcom.example.other\n"
-        self.assertEqual(healthcheck.parse_launchctl(out), (False, None, None))
-
-    def test_non_numeric_last_exit_is_none(self):
-        out = "-\t-\tlocal.hunghanchu.voice-toggle-hotkey\n"
-        self.assertEqual(healthcheck.parse_launchctl(out), (True, None, None))
 
 
 class PgrepParseTests(unittest.TestCase):
@@ -185,58 +160,23 @@ class SttBackendTests(unittest.TestCase):
         self.assertTrue((resolved / "transcribe.py").exists(), resolved)
 
 
-class ErrLineCountTests(unittest.TestCase):
-    def test_missing_file(self):
-        self.assertEqual(healthcheck.count_new_lines(Path("/nonexistent/x.err.log"), 0), (0, 0))
-
-    def test_counts_only_appended_lines(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "err.log"
-            p.write_text("a\nb\n", encoding="utf-8")
-            count, offset = healthcheck.count_new_lines(p, 0)
-            self.assertEqual((count, offset), (2, 4))
-            with p.open("a", encoding="utf-8") as fh:
-                fh.write("c\n")
-            self.assertEqual(healthcheck.count_new_lines(p, offset), (1, 6))
-
-    def test_partial_trailing_line_is_left_unread(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "err.log"
-            p.write_text("a\nb", encoding="utf-8")
-            count, offset = healthcheck.count_new_lines(p, 0)
-            self.assertEqual((count, offset), (1, 2))
-            with p.open("a", encoding="utf-8") as fh:
-                fh.write("\n")
-            self.assertEqual(healthcheck.count_new_lines(p, offset), (1, 4))
-
-    def test_truncated_file_restarts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "err.log"
-            p.write_text("x\n", encoding="utf-8")
-            self.assertEqual(healthcheck.count_new_lines(p, 999), (1, 2))
-
-    def test_collect_initialises_baseline_then_counts_new_lines(self):
+class CollectTests(unittest.TestCase):
+    def test_collect_uses_injected_pgrep_and_writes_no_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
-            err = Path(tmp) / "hotkey.err.log"
-            err.write_text("old failure\n", encoding="utf-8")
-            kwargs = dict(
-                launchctl_list=lambda: "2769\t0\tlocal.hunghanchu.voice-toggle-hotkey\n",
+            record = healthcheck.collect(
+                runtime=Path(tmp),
+                state_dir=state,
                 pgrep_app=lambda: "9943 /Applications/VoiceInputMac.app/Contents/MacOS/VoiceInputMac\n",
                 machine="m4",
                 now=datetime(2026, 11, 1, 12, 0, 0),
             )
-            first = healthcheck.collect(runtime=Path(tmp), state_dir=state, err_log=err, **kwargs)
-            self.assertEqual(first["err_lines_since_last_check"], 0)  # 第一次只建立基準
-            self.assertTrue((state / "checkpoint.json").exists())
-
-            with err.open("a", encoding="utf-8") as fh:
-                fh.write("new failure 1\nnew failure 2\n")
-            second = healthcheck.collect(runtime=Path(tmp), state_dir=state, err_log=err, **kwargs)
-            self.assertEqual(second["err_lines_since_last_check"], 2)
-
-            third = healthcheck.collect(runtime=Path(tmp), state_dir=state, err_log=err, **kwargs)
-            self.assertEqual(third["err_lines_since_last_check"], 0)
+            self.assertTrue(record["app_running"])
+            self.assertEqual(record["app_pids"], [9943])
+            self.assertEqual(record["errors"], [])
+            for gone in ("agent_loaded", "agent_pid", "last_exit", "err_lines_since_last_check"):
+                self.assertNotIn(gone, record)
+            self.assertFalse((state / "checkpoint.json").exists())
 
 
 class AttemptLogTests(unittest.TestCase):
@@ -312,12 +252,9 @@ class RecordTests(unittest.TestCase):
         self.assertTrue(record["ok"])
         self.assertEqual(record["reasons"], [])
         for field in (
-            "agent_loaded",
-            "last_exit",
             "app_running",
             "last_attempt",
             "consecutive_no_text",
-            "err_lines_since_last_check",
             "stt_backend",
             "checked_at",
         ):
@@ -332,15 +269,12 @@ class RecordTests(unittest.TestCase):
 
     def test_reasons_cover_every_field(self):
         record = healthy_record(
-            agent_loaded=False,
-            last_exit=9,
-            err_lines=3,
             stt_backend="unknown",
             last_attempt={"outcome": "failed"},
         )
         self.assertFalse(record["ok"])
         joined = " | ".join(record["reasons"])
-        for token in ("agent_loaded", "last_exit", "last_attempt", "err_lines", "stt_backend"):
+        for token in ("last_attempt", "stt_backend"):
             self.assertIn(token, joined)
 
 
@@ -406,16 +340,13 @@ class FindingsTests(unittest.TestCase):
     def test_every_unhealthy_field_gets_a_ticket(self):
         findings = healthcheck.collect_findings(
             healthy_record(
-                agent_loaded=False,
-                last_exit=9,
-                err_lines=2,
                 stt_backend="unknown",
                 last_attempt={"outcome": "failed"},
             )
         )
         self.assertEqual(
             [f.field for f in findings],
-            ["last_attempt", "agent_loaded", "last_exit", "err_lines_since_last_check", "stt_backend"],
+            ["last_attempt", "stt_backend"],
         )
         for finding in findings:
             self.assertTrue(finding.done.strip(), finding.field)
@@ -576,16 +507,15 @@ class ResolveTests(unittest.TestCase):
 
     def test_recovered_evidence_needs_positive_signal(self):
         ok = healthcheck.recovered_evidence(healthy_record())
-        for field in ("last_attempt", "consecutive_no_text", "agent_loaded", "last_exit", "stt_backend"):
+        for field in ("last_attempt", "consecutive_no_text", "stt_backend"):
             self.assertIn(field, ok)
         self.assertIn("43 字", ok["last_attempt"])
         # 還沒有任何一輪 → 沒有「上一次有拿到字」的證據，不能關 last_attempt 的單
         none_yet = healthcheck.recovered_evidence(healthy_record(last_attempt=None))
         self.assertNotIn("last_attempt", none_yet)
         self.assertNotIn("consecutive_no_text", none_yet)
-        down = healthcheck.recovered_evidence(healthy_record(agent_loaded=False, last_exit=None))
-        self.assertNotIn("agent_loaded", down)
-        self.assertNotIn("last_exit", down)
+        down = healthcheck.recovered_evidence(healthy_record(stt_backend="unknown"))
+        self.assertNotIn("stt_backend", down)
 
     def test_closes_recovered_same_machine_with_comment(self):
         self._seed([(self._body(failed_record()), "src:health,kind:bug", "OPEN")])
@@ -608,8 +538,8 @@ class ResolveTests(unittest.TestCase):
         self.assertNotIn("CLOSED #", out)
 
     def test_still_failing_field_stays_open(self):
-        self._seed([(self._body(healthy_record(agent_loaded=False, last_exit=None)), "src:health,kind:bug", "OPEN")])
-        rc, out = self._resolve(healthy_record(agent_loaded=False, last_exit=None))
+        self._seed([(self._body(healthy_record(stt_backend="unknown")), "src:health,kind:bug", "OPEN")])
+        rc, out = self._resolve(healthy_record(stt_backend="unknown"))
         self.assertEqual(rc, 0, out)
         self.assertEqual(self._issues()[1]["state"], "OPEN")
         self.assertIn("KEPT_OPEN #1", out)
@@ -642,7 +572,7 @@ class ResolveTests(unittest.TestCase):
 
     def test_still_broken_skips_gh_until_field_recovers(self):
         record_path = self.tmp / "state" / "emitted_issues.json"
-        broken = healthy_record(agent_loaded=False, last_exit=None)
+        broken = healthy_record(stt_backend="unknown")
         self._seed([(self._body(broken), "src:health,kind:bug", "OPEN")])
         rc, out = self._resolve(broken, record_path=record_path)
         self.assertIn("KEPT_OPEN #1", out)
@@ -673,10 +603,6 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(self._issues()[1]["state"], "OPEN")
         self.assertEqual(len(self._issues()), 1)
 
-    def test_err_log_issue_is_not_auto_closed(self):
-        # 錯誤 log 的單要人看過才算數；checkpoint 一前進就是 0，不能當恢復證據
-        self.assertNotIn("err_lines_since_last_check", healthcheck.recovered_evidence(healthy_record()))
-
     def test_gh_failure_is_exit_2(self):
         rc, out = self._resolve(healthy_record(), runner=str(self.tmp / "no-such-gh"))
         self.assertEqual(rc, 2)
@@ -693,7 +619,7 @@ class CliReplayTests(unittest.TestCase):
             state.mkdir()
             copy = state / "mutated.json"
             record = failed_record(
-                sources={"health": str(copy), "err_log": "/tmp/x.err.log", "run_log": "/tmp/.run.log"}
+                sources={"health": str(copy), "run_log": "/tmp/.run.log"}
             )
             copy.write_text(json.dumps(record), encoding="utf-8")
 

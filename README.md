@@ -94,14 +94,12 @@ python3 healthcheck.py --emit --apply  # 真的開 GitHub issue，編號寫回 e
 |---|---|
 | `last_attempt` | `.run.log` 最近一輪的結果：`ok`／`empty`（結果空白）／`no_speech`（exit 3）／`suspect`（exit 4）／`failed`（轉寫失敗）／`no_audio`（沒收到音訊）＋`chars`、`duration_s`、錯誤 `detail`（**不含轉錄文字**） |
 | `consecutive_no_text` | 從最近一次成功之後，連續幾輪沒拿到字 |
-| `agent_loaded` / `last_exit` | 熱鍵 agent 在不在 `launchctl` 清單裡、上次怎麼結束 |
-| `err_lines_since_last_check` | 上次檢查之後 `~/orca/state/voice-toggle-hotkey.err.log` 多了幾行（靠 `checkpoint.json` 的 offset；第一次跑只建立基準） |
 | `stt_backend` | `breeze`／`soniox`／`unknown`，讀**實際在跑的那個 checkout** 的 `local.env`（不讀 shell env：GUI 啟動的 App 看不到） |
 | `app_running` | 僅供參考。要用才開，關著不是故障，**不會**開單 |
 
 開單規則只有一處：`healthcheck.collect_findings`——上一次真的失敗（`failed`／`no_audio`）一次就開；
-連續三次沒拿到字才開（單次空白可能只是沒講話）；另外 agent 沒載入、`last_exit` 非 0、
-error log 有新增行、`VOICE_STT` 認不得也會開。`issue_emitter.py` 是可共用的 core：
+連續三次沒拿到字才開（單次空白可能只是沒講話）；另外
+`VOICE_STT` 認不得也會開。`issue_emitter.py` 是可共用的 core：
 去重 key `<!-- key: health/<date>/<field>/<sha8> -->`、五段 body、gh 去重、編號回寫都在那裡，
 新 repo 只要提供「什麼算 finding」。健康時跑 `--emit` 會印 `EMIT_ISSUES=NONE`。
 

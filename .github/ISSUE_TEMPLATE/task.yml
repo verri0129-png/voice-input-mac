@@ -32,8 +32,8 @@ body:
       label: 證據
       description: 檔案路徑＋行號＋該 commit 的短 sha。可判定的證據，不是印象。
       placeholder: |
-        - ~/orca/state/voice-input/health.json（agent_loaded=false）
-        - ~/orca/state/voice-toggle-hotkey.err.log 最後 20 行
+        - ~/orca/state/voice-input/health.json（last_attempt.outcome=failed）
+        - ~/orca/voice-input-mac/.run.log 最後 20 行
         - git rev-parse --short HEAD = xxxxxxx
     validations:
       required: true
@@ -44,8 +44,8 @@ body:
       description: 別人照貼就能看到同一個現象的一行或幾行命令。
       render: shell
       placeholder: |
-        launchctl list | grep -i voice-toggle-hotkey
-        tail -20 ~/orca/state/voice-toggle-hotkey.err.log
+        tail -40 ~/orca/voice-input-mac/.run.log
+        python3 healthcheck.py
     validations:
       required: true
   - type: textarea
@@ -54,7 +54,7 @@ body:
       label: 完成定義（gate token）
       description: 哪一個可觀測的訊號從什麼變成什麼，才算做完；**並且寫出這個觀測怎麼產生**（重放錄音／實機按一次／重跑測試）。不接受「看起來好了」。
       placeholder: |
-        health.json 的 agent_loaded=true 且 last_exit=0；
+        health.json 的 last_attempt.outcome=ok；
         ./.venv/bin/python transcribe.py --file <wav> 產出文字且延遲 < 1.5s。
         觀測來源：實機按一次 ⌘E（重放既有 wav）。
     validations:
