@@ -9,7 +9,7 @@
      注意：停止後才灌整段時，Soniox 的處理速度大約就是實時 1x，長句會慢
      （實測 12.7s 音檔 → 10.7s），所以這條只適合短句與驗證。
 
-金鑰：環境變數 `VOICE_SONIOX_API_KEY`，或 `~/.hermes/secrets/soniox.env`
+金鑰：環境變數 `VOICE_SONIOX_API_KEY`，或 `~/.config/agent-secrets/soniox.env`
 （沿用字幕專案那一把）。金鑰不會被印出來。
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 
 WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 DEFAULT_MODEL = "stt-rt-v5"
-KEY_FILE = Path(os.path.expanduser("~/.hermes/secrets/soniox.env"))
+KEY_FILE = Path(os.path.expanduser("~/.config/agent-secrets/soniox.env"))
 SAMPLE_RATE = 16000
 CHUNK_BYTES = SAMPLE_RATE * 2 // 10  # 100ms
 
@@ -45,7 +45,7 @@ def api_key() -> str:
     except OSError:
         pass
     raise RuntimeError(
-        "找不到 Soniox API key：設 VOICE_SONIOX_API_KEY 或寫進 ~/.hermes/secrets/soniox.env"
+        "找不到 Soniox API key：設 VOICE_SONIOX_API_KEY 或寫進 ~/.config/agent-secrets/soniox.env"
     )
 
 

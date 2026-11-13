@@ -65,7 +65,7 @@ body:
       label: 不可動範圍
       description: 這次不該碰的東西。動了會在別的機器或別的 session 上出錯。
       value: |
-        不改 Hermes 的 config／skills、不動 `~/.hermes`。
+        不動 `~/.config/agent-secrets`（金鑰）。
         不重啟或重裝 launchd agent（`install.sh`）除非這張單就是要修它。
         不改模型來源與 Vertex 專案設定；不動 `local.env`（含憑證）。
         不把音檔內容、轉錄全文寫進 repo 或 issue。

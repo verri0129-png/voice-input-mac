@@ -44,7 +44,7 @@ enum SonioxProvider {
             if let value = ProcessInfo.processInfo.environment[name], !value.isEmpty { return value }
         }
         let path = (NSHomeDirectory() as NSString)
-            .appendingPathComponent(".hermes/secrets/soniox.env")
+            .appendingPathComponent(".config/agent-secrets/soniox.env")
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         for raw in text.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
@@ -111,7 +111,7 @@ final class SonioxStream {
 
     init?(model: String, terms: [String], language: String = "zh") {
         guard let key = SonioxProvider.apiKey else {
-            Transcriber.log("[soniox] 沒有 API key（~/.hermes/secrets/soniox.env）→ 不走 Soniox")
+            Transcriber.log("[soniox] 沒有 API key（~/.config/agent-secrets/soniox.env）→ 不走 Soniox")
             return nil
         }
         guard let url = URL(string: "wss://stt-rt.soniox.com/transcribe-websocket") else { return nil }

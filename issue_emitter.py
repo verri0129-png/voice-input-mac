@@ -60,7 +60,7 @@ KEY_LINE_PREFIX = "<!-- key: "
 DEFAULT_LIMIT = 300
 
 DEFAULT_FORBIDDEN = """\
-不改 Hermes 的 config／skills、不動 `~/.hermes`。
+不動 `~/.config/agent-secrets`（金鑰）。
 不重啟或重裝 launchd agent（`install.sh`、`com.hunghanchu.*.plist`），除非這張單就是要修它。
 不改模型來源與 Vertex 專案設定；不動 `local.env`（含憑證）。
 不把音檔內容、轉錄全文、個人用語表寫進 repo 或 issue。"""
