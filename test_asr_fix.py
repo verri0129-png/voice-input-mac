@@ -64,5 +64,90 @@ class WiringTest(unittest.TestCase):
             self.assertEqual(t.transcribe_audio(speech), "")
 
 
+class AudioJudgeTest(unittest.TestCase):
+    def test_candidates_ignore_need_but_respect_block(self):
+        self.assertEqual(asr_fix.judge_candidates("麻煩看一下全線"), ["權限"])  # 沒有前後文也要問聲音
+        self.assertEqual(asr_fix.judge_candidates("捷運明天全線通車"), [])  # block 詞在＝原詞是對的
+        self.assertEqual(asr_fix.judge_candidates("下個月去北美洲"), [])
+
+    def test_candidates_skip_opencc_and_include_term_variants(self):
+        rule = mock.Mock(text="Claude", variants=("cloud", "克勞德"))
+        self.assertEqual(asr_fix.judge_candidates("請 cloud 看一下許可權", [rule]), ["Claude"])
+
+    def test_accepts_only_when_heard_and_similar(self):
+        first = "麻煩看一下全線有沒有開好"
+        ok = asr_fix.audio_judge(first, ["權限"], lambda c: "麻煩看一下權限有沒有開好")
+        self.assertEqual(ok, "麻煩看一下權限有沒有開好")
+        self.assertEqual(asr_fix.audio_judge(first, ["權限"], lambda c: first), first)  # 聲音沒聽出候選
+        self.assertEqual(asr_fix.audio_judge(first, ["權限"], lambda c: "權限"), first)  # 照抄熱詞
+
+    def test_rerun_failure_keeps_first_pass(self):
+        def boom(_):
+            raise RuntimeError("ssh 斷了")
+        self.assertEqual(asr_fix.audio_judge("看一下全線", ["權限"], boom), "看一下全線")
+
+
+class _FakeSession:
+    def __init__(self, outputs):
+        self.outputs, self.contexts = list(outputs), []
+
+    def transcribe(self, audio, context, language):
+        self.contexts.append(context)
+        return mock.Mock(text=self.outputs.pop(0))
+
+
+class JudgeWiringTest(unittest.TestCase):
+    def setUp(self):
+        self._keep = dict(t._QWEN_SESSION)
+        on = mock.patch.object(t, "AUDIO_JUDGE", True)  # 預設關，這裡測開啟時的接線
+        on.start()
+        self.addCleanup(on.stop)
+        p = mock.patch.object(t, "stt_terms", return_value=["A詞", "B詞"])
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(t._QWEN_SESSION.update, self._keep)
+
+    def _run(self, outputs, judge):
+        fake = _FakeSession(outputs)
+        t._QWEN_SESSION.update(model="qwen06", obj=fake)
+        return t._local_qwen(np.zeros(1600, dtype="float32"), "zh", "qwen06", judge=judge)["text"], fake
+
+    def test_local_final_pass_reruns_with_candidates_only(self):
+        text, fake = self._run(["麻烦看一下全线有没有开好", "麻烦看一下权限有没有开好"], judge=True)
+        self.assertEqual(text, "麻煩看一下權限有沒有開好")
+        self.assertEqual(fake.contexts[1], "權限")
+
+    def test_rerun_keeps_terms_already_heard(self):
+        rules = [mock.Mock(text="Claude", variants=())]
+        with mock.patch.object(t, "load_term_rules", return_value=rules):
+            _, fake = self._run(["请 Claude 看一下全线", "请 Claude 看一下权限"], judge=True)
+        self.assertEqual(fake.contexts[1], "權限 Claude")
+
+    def test_preview_does_not_rerun(self):
+        text, fake = self._run(["麻烦看一下全线有没有开好"], judge=False)
+        self.assertEqual(text, "麻煩看一下全線有沒有開好")
+        self.assertEqual(len(fake.contexts), 1)
+
+    def test_remote_qwen_reruns_full_segment_with_candidates(self):
+        sent = []
+        def call(req):
+            sent.append(req)
+            return {"text": "看一下全线" if len(sent) == 1 else "看一下权限", "backend": "qwen06"}
+        with mock.patch.object(t, "current_backend", return_value="qwen06"), \
+             mock.patch.object(t, "_remote_call", side_effect=call):
+            t._stream_reset()
+            out = t._remote_whisper(np.zeros(1600, dtype="float32"), "zh", "p", judge=True)
+        self.assertEqual(out["text"], "看一下權限")
+        self.assertEqual(sent[1]["terms"], ["權限"])
+        self.assertNotIn("op", sent[1])  # 整段請求，不走增量
+
+    def test_remote_breeze_does_not_rerun(self):
+        with mock.patch.object(t, "current_backend", return_value="breeze"), \
+             mock.patch.object(t, "_remote_call", return_value={"text": "看一下全線", "backend": "breeze"}) as call:
+            t._stream_reset()
+            t._remote_whisper(np.zeros(1600, dtype="float32"), "zh", "p", judge=True)
+        self.assertEqual(call.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

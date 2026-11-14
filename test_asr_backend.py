@@ -149,7 +149,7 @@ class LocalRoutingTest(unittest.TestCase):
         fake = types.ModuleType("mlx_whisper")
         fake.transcribe = lambda *a, **k: (self.calls.append("whisper"), {"text": "w", "segments": []})[1]
         sys.modules["mlx_whisper"] = fake
-        t._local_qwen = lambda audio, lang, model="qwen": (self.calls.append(model), {"text": "q", "segments": []})[1]
+        t._local_qwen = lambda audio, lang, model="qwen", judge=False: (self.calls.append(model), {"text": "q", "segments": []})[1]
 
     def tearDown(self):
         import sys

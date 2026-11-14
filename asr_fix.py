@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import difflib
 import re
 
 # 0.05 秒小段 RMS 的最大值低於這個（約 -30.5 dBFS）＝整段都很小聲；與櫃檯小妹的 QUIET_PEAK=0.03 相同
@@ -74,3 +75,49 @@ def fix_context(text: str) -> str:
         text = re.sub(re.escape(heard), to, text, flags=re.I)
         low = text.lower()
     return text
+
+
+# ── 聲音裁判 ─────────────────────────────────────────────────────────────────
+# 文字規則只能猜；同一段音檔只放候選詞當熱詞再聽一次，聽出候選詞才採用。
+# 2026-11-14 M2 實測（144 段合成語音）：拿掉前後文條件強制觸發 24 段反例，聲音擋下 22 段；第二輪約 0.17 秒。
+# OpenCC 誤轉不是聽錯，聲音分不出來，不送裁判。
+JUDGE_SKIP = frozenset({"許可權", "型別", "賬"})
+JUDGE_MAX_TERMS = 8
+
+
+def judge_candidates(text: str, term_rules=()) -> list[str]:
+    """第一輪文字裡出現「聽成」的詞 → 回傳要送去給聲音確認的正字（不看 need 條件，由聲音決定）。
+    來源：ASR_RULES 與個人詞庫的變體（rule.variants → rule.text）。"""
+    low = text.lower()
+    cands: list[str] = []
+    for heard, to, _need, block in ASR_RULES:
+        # 不看 need（缺前後文正是要問聲音的情況），但 block 詞在就代表原詞是對的（北美洲、全線通車）
+        if heard not in JUDGE_SKIP and heard.lower() in low and not any(b.lower() in low for b in block):
+            cands.append(to)
+    for rule in term_rules or ():
+        target = getattr(rule, "text", "")
+        for variant in getattr(rule, "variants", ()) or ():
+            if variant and variant != target and variant in text:
+                cands.append(target)
+                break
+    return list(dict.fromkeys(c for c in cands if c and c not in text))[:JUDGE_MAX_TERMS]
+
+
+JUDGE_MIN_SIMILAR = 0.6  # 第二輪應是同一句話只改幾個字；差太多＝照抄熱詞或聽成別的，不採用
+
+
+def audio_judge(text: str, cands: list[str], rerun) -> str:
+    """rerun(cands) 用同一段音檔、只放 cands 當熱詞再辨識一次。聽出任一候選詞、且整句和第一輪大致相同，才採用第二輪。
+    rerun 失敗（例外或空字串）就維持第一輪。"""
+    if not cands:
+        return text
+    try:
+        second = rerun(cands) or ""
+    except Exception:  # noqa: BLE001 — 裁判是加分項，失敗不能讓整句不見
+        return text
+    if not any(c in second for c in cands):
+        return text
+    a, b = _PUNCT.sub("", text), _PUNCT.sub("", second)
+    if difflib.SequenceMatcher(None, a, b).ratio() < JUDGE_MIN_SIMILAR:
+        return text
+    return second

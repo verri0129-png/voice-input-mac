@@ -3,7 +3,7 @@ import argparse, base64, difflib, hashlib, subprocess, sys, tempfile, os, time, 
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from asr_fix import QUIET_LEVEL_DB, drop_phantom, fix_context, opencc_convert
+from asr_fix import QUIET_LEVEL_DB, audio_judge, drop_phantom, fix_context, judge_candidates, opencc_convert
 
 from rewrite_cloud import (
     RewriteConfig,
@@ -85,6 +85,9 @@ def current_backend() -> str:
 def _local_qwen_model() -> str:
     b = current_backend()
     return b if b in QWEN_REPOS else "qwen06"
+# 聲音裁判（asr_fix.audio_judge）：第一輪有疑似聽錯的詞才重聽一次。預設關：2026-11-14 M4 壓力測試
+# （320 段、規則不設條件）觸發 108 段、救回 0、改壞 11（同音字聲音分不出），效果未證實前不開
+AUDIO_JUDGE = _setting("VOICE_AUDIO_JUDGE", "0").strip() == "1"
 # Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
 STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
 _REMOTE_PROC = None
@@ -161,7 +164,7 @@ def remote_stream_append(pcm):
         else:
             _stream_reset()
 
-def _remote_whisper(samples, language, prompt):
+def _remote_whisper(samples, language, prompt, judge=False):
     """把 16 kHz 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。
     錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
     pcm = _pcm16(samples)
@@ -195,6 +198,13 @@ def _remote_whisper(samples, language, prompt):
     # 所以在遠端結果的邊界就繁化，所有後端走同一條路（Breeze 本來就是繁體，等於 no-op）。
     if resp.get("text"):
         resp["text"] = to_taiwan_traditional(resp["text"])
+    if judge and backend in QWEN_REPOS:  # Breeze 不吃 terms，重送只會得到同一句
+        def rerun(cands):
+            with _REMOTE_LOCK:
+                _stream_reset()  # 整段請求會清掉 M4 端的緩衝區
+                again = _remote_call(dict(base, audio=_b64(pcm), terms=cands))
+            return to_taiwan_traditional(again.get("text") or "")
+        resp["text"] = _judge(resp.get("text") or "", rerun, f"remote:{backend}")
     return resp
 
 _QWEN_SESSION = {"model": None, "obj": None}
@@ -211,7 +221,7 @@ def _qwen_session(model):
         print(f"[local-qwen] 載入 Qwen3-ASR {model}（{time.time() - t0:.1f}s）", file=sys.stderr)
     return _QWEN_SESSION["obj"]
 
-def _local_qwen(audio, language, model="qwen06"):
+def _local_qwen(audio, language, model="qwen06", judge=False):
     """本機的 Qwen3-ASR（1.7B 或 0.6B，由選單決定）。第一次用到才載入，常駐在這個程序裡。
     回傳與 mlx_whisper 同形；Qwen 以 zh 輸出簡體，這裡先繁化（理由同 _remote_whisper）。"""
     session = _qwen_session(model)
@@ -227,7 +237,29 @@ def _local_qwen(audio, language, model="qwen06"):
         if _qwen_echoes_context(text, terms):
             print(f"[local-qwen:{model}] 無熱詞重跑仍照抄，丟棄這段輸出", file=sys.stderr)
             text = ""
+    if judge:
+        text = _judge(text, lambda cands: run(" ".join(cands)), model)
     return {"text": text, "segments": [], "backend": model}
+
+def _judge(text, rerun, label):
+    """聲音裁判：第一輪有「聽成」的詞，就只放候選正字再聽一次，聽出來才採用（見 asr_fix.audio_judge）。
+    只在定版那一次跑（process_wav_file），錄音中的預覽不跑。"""
+    if not (AUDIO_JUDGE and text):
+        return text
+    try:
+        rules = load_term_rules(REWRITE_TERMS_FILE)
+    except Exception:  # noqa: BLE001
+        rules = []
+    cands = judge_candidates(text, rules)
+    if not cands:
+        return text
+    # 第一輪已經聽對的詞庫正字也放進熱詞，免得第二輪把它們聽回錯字（採用與否仍只看候選詞）
+    kept = [w for w in dict.fromkeys(r.text.strip() for r in rules) if w and w in text]
+    t0 = time.time()
+    out = audio_judge(text, cands, lambda c: rerun(c + kept))
+    verdict = "採用" if out != text else "維持原文"
+    print(f"[judge:{label}] 候選 {cands} → {verdict}（{time.time() - t0:.2f}s）：{out}", file=sys.stderr)
+    return out
 
 def _qwen_echoes_context(text, terms):
     """輸出是否照抄了熱詞清單：(a) 清單開頭（前 4 詞連續出現）；或 (b) 一句話裡出現 6 個以上不同熱詞
@@ -238,7 +270,7 @@ def _qwen_echoes_context(text, terms):
         return True
     return sum(1 for w in terms if "".join(w.split()) in flat) >= 6
 
-def _whisper(language, audio=None, path=None):
+def _whisper(language, audio=None, path=None, judge=False):
     """統一的 Whisper 入口：遠端啟用時送到 M4；否則用本機模型（預設行為與原本相同）。"""
     prompt = stt_initial_prompt()
     if STT_REMOTE_HOST:
@@ -246,13 +278,13 @@ def _whisper(language, audio=None, path=None):
             audio = wav_samples(path)
         if audio is None:
             raise RuntimeError("遠端 ASR 需要可讀取的音訊")
-        return _remote_whisper(audio, language, prompt)
+        return _remote_whisper(audio, language, prompt, judge)
     # 本機一律 Qwen3-ASR（Breeze 已停用，不再載入 mlx_whisper）
     if audio is None and path:
         audio = wav_samples(path)
     if audio is None:
         raise RuntimeError("本機 ASR 需要可讀取的音訊")
-    return _local_qwen(audio, language, _local_qwen_model())
+    return _local_qwen(audio, language, _local_qwen_model(), judge)
 
 # ── STT provider ──────────────────────────────────────────────────────────────
 # breeze（預設）：本地 Breeze-ASR-25，完全離線。
@@ -1314,7 +1346,7 @@ def process_wav_file(
               f" → 不跑 Whisper（避免幻覺）", file=sys.stderr)
         return {"status": "silence", "text": ""}
     lang = None if language == "auto" else language
-    result = _whisper(lang, audio=a, path=path)
+    result = _whisper(lang, audio=a, path=path, judge=True)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
     raw = _drop_phantom(cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip())), a)
