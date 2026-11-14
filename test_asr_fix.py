@@ -13,6 +13,14 @@ class FixContextTest(unittest.TestCase):
         # 真的 OpenCC s2twp：权限 → 許可權，to_taiwan_traditional 收尾要改回權限
         self.assertEqual(t.to_taiwan_traditional("检查一下权限有没有开好"), "檢查一下權限有沒有開好")
 
+    def test_account_uses_taiwan_character(self):
+        self.assertEqual(t.to_taiwan_traditional("账号和转账"), "帳號和轉帳")
+
+    def test_document_is_not_turned_into_file(self):
+        self.assertEqual(t.to_taiwan_traditional("帮我摘要这份长文件，再整理文件"), "幫我摘要這份長文件，再整理文件")
+        self.assertEqual(t.to_taiwan_traditional("打开档案"), "開啟檔案")  # 本來就講檔案的不動
+        self.assertEqual(t.to_taiwan_traditional("放进文件夹"), "放進資料夾")  # 文件夾→資料夾照舊
+
     def test_needs_context_word(self):
         self.assertEqual(asr_fix.fix_context("帳號的全線要設定"), "帳號的權限要設定")
         self.assertEqual(asr_fix.fix_context("麻煩看一下全線"), "麻煩看一下全線")

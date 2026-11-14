@@ -3,7 +3,7 @@ import argparse, base64, difflib, hashlib, subprocess, sys, tempfile, os, time, 
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from asr_fix import QUIET_LEVEL_DB, drop_phantom, fix_context
+from asr_fix import QUIET_LEVEL_DB, drop_phantom, fix_context, opencc_convert
 
 from rewrite_cloud import (
     RewriteConfig,
@@ -606,8 +606,8 @@ def to_taiwan_traditional(text: str) -> str:
             print(f"[opencc] 無法載入 opencc: {e!r}", file=sys.stderr)
     if _OPENCC is None:
         raise SystemExit(f"[opencc] opencc 不可用（{_OPENCC_ERROR}）——為避免輸出簡體，中止")
-    # 繁化後再修：OpenCC 誤轉（权限→許可權）與看前後文才改的聽錯詞；每條路徑都經過這裡
-    return fix_context(_OPENCC.convert(text))
+    # 繁化前遮住會被換掉意思的詞（文件），繁化後再修 OpenCC 誤轉（权限→許可權）與看前後文才改的聽錯詞；每條路徑都經過這裡
+    return fix_context(opencc_convert(_OPENCC.convert, text))
 
 def _text_only(s: str) -> str:
     """只留文字（去掉標點、空白、符號）。用來驗證潤飾「一個字都沒動」。"""
