@@ -21,6 +21,22 @@ class FixContextTest(unittest.TestCase):
         self.assertEqual(t.to_taiwan_traditional("打开档案"), "開啟檔案")  # 本來就講檔案的不動
         self.assertEqual(t.to_taiwan_traditional("放进文件夹"), "放進資料夾")  # 文件夾→資料夾照舊
 
+    def test_opencc_word_swaps_are_blocked(self):
+        self.assertEqual(t.to_taiwan_traditional("自动绑定，说满对话框，换个字体，通过测试"),
+                         "自動綁定，說滿對話框，換個字體，通過測試")
+        self.assertEqual(t.to_taiwan_traditional("透过窗户"), "透過窗戶")  # 本來就講透過的不動
+
+    def test_opencc_char_mistranslations_from_log(self):
+        self.assertEqual(t.to_taiwan_traditional("还是只有，游标，能不能去克制，你查查看"), "還是只有，游標，能不能去克制，你查查看")
+        self.assertEqual(t.to_taiwan_traditional("那三只要打针"), "那三隻要打針")  # 量詞的隻不動
+
+    def test_homophone_rules_from_log(self):
+        self.assertEqual(asr_fix.fix_context("模型可以有認識的功能"), "模型可以有潤飾的功能")
+        self.assertEqual(asr_fix.fix_context("我不認識那個模型的作者"), "我不認識那個模型的作者")
+        self.assertEqual(asr_fix.fix_context("在cloud訂閱了200美元"), "在Claude訂閱了200美元")
+        self.assertEqual(asr_fix.fix_context("iCloud 訂閱滿了"), "iCloud 訂閱滿了")
+        self.assertEqual(asr_fix.fix_context("cloud code 訂閱"), "cloud code 訂閱")  # 留給詞庫
+
     def test_needs_context_word(self):
         self.assertEqual(asr_fix.fix_context("帳號的全線要設定"), "帳號的權限要設定")
         self.assertEqual(asr_fix.fix_context("麻煩看一下全線"), "麻煩看一下全線")
