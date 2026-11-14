@@ -3,6 +3,7 @@ import argparse, base64, difflib, hashlib, subprocess, sys, tempfile, os, time, 
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
+from asr_fix import QUIET_LEVEL_DB, drop_phantom, fix_context
 
 from rewrite_cloud import (
     RewriteConfig,
@@ -553,6 +554,14 @@ def wav_samples(path):
     pcm = wav_pcm16(path)
     return None if pcm is None else pcm.astype("float32") / 32768.0
 
+def _drop_phantom(text, audio=None):
+    """去掉辨識模型憑空生出的「謝謝收看」這類假字（Qwen 沒有 segments，下面的低信心檢查對它無效）。"""
+    quiet = None if audio is None else speech_level_db(audio, window_s=0.05) < QUIET_LEVEL_DB
+    out = drop_phantom(text, quiet) if text else text
+    if text and not out:
+        print(f"[phantom] 假字，丟棄：{text!r}", file=sys.stderr)
+    return out
+
 def transcribe_audio(audio, language="zh"):
     import numpy as np
     # normalize to float32 in [-1,1] if int16
@@ -565,7 +574,7 @@ def transcribe_audio(audio, language="zh"):
     # Use word_timestamps=False for speed; rely on gate for hallucination
     # Use suppress_blank / no_speech handling via temperature fallback
     result = _whisper(language if language else None, audio=audio)
-    text = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
+    text = _drop_phantom(cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip())), audio)
     # extra guard: 低信心短句視為幻覺（注意：Whisper 對幻覺也可能很有信心，
     # 實測全 0 音檔的幻覺 no_speech_prob=0.000，所以主要防線仍是能量門檻）
     segs = result.get("segments") or []
@@ -597,7 +606,8 @@ def to_taiwan_traditional(text: str) -> str:
             print(f"[opencc] 無法載入 opencc: {e!r}", file=sys.stderr)
     if _OPENCC is None:
         raise SystemExit(f"[opencc] opencc 不可用（{_OPENCC_ERROR}）——為避免輸出簡體，中止")
-    return _OPENCC.convert(text)
+    # 繁化後再修：OpenCC 誤轉（权限→許可權）與看前後文才改的聽錯詞；每條路徑都經過這裡
+    return fix_context(_OPENCC.convert(text))
 
 def _text_only(s: str) -> str:
     """只留文字（去掉標點、空白、符號）。用來驗證潤飾「一個字都沒動」。"""
@@ -1307,7 +1317,7 @@ def process_wav_file(
     result = _whisper(lang, audio=a, path=path)
     # 音訊面 + Whisper 面的證據一起投票（單一票不攔，避免誤殺真人說話）
     votes = suspect_reason(a, result) if a is not None else suspect_reason(result=result)
-    raw = cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip()))
+    raw = _drop_phantom(cleanup_disfluencies(normalize_spacing((result.get("text") or "").strip())), a)
     if not raw:
         print("[stt] 沒有辨識到內容（靜音，或麥克風根本沒收到訊號）", file=sys.stderr)
     print(f"[raw] {raw}", file=sys.stderr)
