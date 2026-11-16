@@ -119,7 +119,7 @@ enum Transcriber {
     private static var _serverOut: FileHandle?
     /// 暖機程序同時間只准有一個請求在飛：預覽與正式結果共用同一條 stdin/stdout，
     /// 兩個讀者同時讀會把「誰的回應」讀錯（等於拿到別人的文字）。這把鎖讓請求排隊。
-    private static let requestLock = NSLock()
+    private static let requestLock = DispatchSemaphore(value: 1)
     /// 暖機完成了沒（模型載入完才准送預覽請求）。
     /// 沒這個開關的話：錄音一開始就送預覽 → 那個請求卡在「模型還在載」的管子裡，
     /// 使用者講 3 秒就按停止時，正式結果得排在它後面等 6 秒載完模型（實測就是這個病）。
@@ -202,28 +202,60 @@ enum Transcriber {
 
     /// 送一個請求並等一行回應。**同時只准一個在飛**（requestLock）：預覽與正式結果共用同一條
     /// stdin/stdout，兩個讀者並行會把回應讀錯（等於拿到別人的文字）。
-    private static func serverRequest(_ request: String, timeout: TimeInterval) -> String? {
+    /// `killOnTimeout`：逾時要不要收掉暖機程序。正式結果要（退回一次性路徑）；預覽不要 ——
+    /// 11-16 的事故：伺服器只是慢（>20s），預覽逾時就殺掉暖機程序，排在後面的正式結果全部掉進
+    /// 冷啟動的一次性路徑（又多 35s）。預覽逾時改成「放棄等待、但留著鎖直到那一行回來」，
+    /// 這樣下一個請求不會讀到上一個的回應，也不必重載模型。
+    /// 預覽拿不到鎖（前一個還在飛）就直接略過，不排隊；正式結果最多等 `timeout` 秒拿鎖。
+    private static func serverRequest(_ request: String, timeout: TimeInterval,
+                                      killOnTimeout: Bool = true) -> String? {
         guard let (_, stdin, stdout) = serverHandles() else { return nil }
-        requestLock.lock()
-        defer { requestLock.unlock() }
+        let lockWait: TimeInterval = killOnTimeout ? timeout : 0
+        guard requestLock.wait(timeout: .now() + lockWait) == .success else {
+            if killOnTimeout {
+                Transcriber.log("[serve] 等 \(Int(timeout))s 拿不到通道（前一個請求沒回）→ 收掉暖機程序，退回一次性路徑")
+                killServer(reason: "通道被佔用")
+            }
+            return nil
+        }
         do {
             try stdin.write(contentsOf: Data((request + "\n").utf8))
         } catch {
+            requestLock.signal()
             Transcriber.log("[serve] 寫入請求失敗: \(error.localizedDescription)")
             killServer(reason: "寫入失敗")
             return nil
         }
         var line: String?
         let sem = DispatchSemaphore(value: 0)
+        let state = NSLock()
+        var readerDone = false, abandoned = false
         DispatchQueue.global(qos: .userInitiated).async {
             line = readLine(stdout)
             sem.signal()
+            state.lock()
+            readerDone = true
+            // 呼叫端已放棄等待：鎖由這裡放，下一個請求才不會讀到這一行
+            if abandoned { requestLock.signal() }
+            state.unlock()
         }
         if sem.wait(timeout: .now() + timeout) == .timedOut {
-            Transcriber.log("[serve] 等 \(Int(timeout))s 沒回應 → 收掉暖機程序，退回一次性路徑")
-            killServer(reason: "請求逾時")
-            return nil
+            if killOnTimeout {
+                Transcriber.log("[serve] 等 \(Int(timeout))s 沒回應 → 收掉暖機程序，退回一次性路徑")
+                killServer(reason: "請求逾時")
+                requestLock.signal()
+                return nil
+            }
+            state.lock()
+            if !readerDone {
+                abandoned = true
+                state.unlock()
+                Transcriber.log("[serve] 預覽 \(Int(timeout))s 沒回應 → 略過這次，不動暖機程序（伺服器可能在忙）")
+                return nil
+            }
+            state.unlock()
         }
+        requestLock.signal()
         return line
     }
 
@@ -518,7 +550,7 @@ enum Transcriber {
     /// 預覽不值得為它去載 6GB 模型（一次性路徑是給正式結果用的）。
     /// 回傳 nil = 這次預覽拿不到（逾時、格式不對、或暖機還沒好）。
     static func partialText(wavURL: URL) -> String? {
-        guard let raw = serverRequest("partial " + wavURL.path, timeout: 20) else { return nil }
+        guard let raw = serverRequest("partial " + wavURL.path, timeout: 20, killOnTimeout: false) else { return nil }
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (obj["status"] as? String) == "partial" else {
