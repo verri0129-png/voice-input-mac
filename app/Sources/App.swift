@@ -24,9 +24,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 遠端模式（VOICE_STT_REMOTE）選的是遠端那台的模型；本機模式選 qwen 則在本機載入 Qwen。
     private var backendItems: [String: NSMenuItem] = [:]
     private static let backendFile = NSString(string: "~/orca/state/voice-input/asr-backend").expandingTildeInPath
-    // Breeze 已停用（不在選單）；本機只跑 Qwen3-ASR，0.6B 為預設（2026-11-13 起）。
+    // Breeze 已停用（不在選單）。預設 OctoASR，跟櫃檯小妹共用 M4 上同一份（2026-11-16 起）；
+    // Qwen3-ASR 仍可選，選了才載入。
     private static let backends: [(id: String, title: String)] = [
-        ("qwen06", "Qwen3-ASR 0.6B（預設）"),
+        ("octo", "OctoASR 1.7B（預設）"),
+        ("qwen06", "Qwen3-ASR 0.6B"),
         ("qwen", "Qwen3-ASR 1.7B"),
     ]
     // 有沒有收到過真正的 Cmd 修飾鍵事件。某些環境（合成事件、遠端桌面）完全收不到
@@ -412,11 +414,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 目前選的模型；沒選過（沒有檔案）或舊值 breeze＝預設 qwen06（0.6B）。
+    /// 目前選的模型；沒選過（沒有檔案）或舊值 breeze＝預設 octo。
     static func readBackend() -> String {
         let v = (try? String(contentsOfFile: backendFile, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        return backends.contains(where: { $0.id == v }) ? v : "qwen06"
+        return backends.contains(where: { $0.id == v }) ? v : "octo"
     }
     private func refreshBackendChecks() {
         let cur = Self.readBackend()

@@ -53,7 +53,7 @@ class RewriteConfig:
     project may be empty: in that case ADC quota_project_id is used.
     """
 
-    backend: str = "cloud"
+    backend: str = "local-brain"
     model: str = "gemini-3.8-flash"
     location: str = "global"
     project: str = ""
@@ -975,6 +975,38 @@ def rewrite_draft(
     )
 
 
+def rewrite_local_brain(
+    draft: str,
+    context: dict | None = None,
+    terms: list[TermRule] | None = None,
+    config: RewriteConfig | None = None,
+    *,
+    complete,
+    allowed_deletions: set[str] | frozenset[str] = frozenset(),
+) -> RewriteResult:
+    """同一套提示詞與守門，模型換成本機大腦（櫃檯小妹的 e128-ha）。
+    complete(system, user) -> (text, brain_name)；大腦沒開、忙、逾時就丟例外（呼叫端退回雲端）。"""
+    active = config or RewriteConfig()
+    started = time.perf_counter()
+    clean_context = sanitize_context(context)
+    active_terms = select_terms(draft, clean_context, terms or [], active.max_terms)
+    system, user = build_prompt(draft, clean_context, active_terms)
+    text, brain = complete(system, user)
+    ok, reason, changed, final_text = validate_and_repair_rewrite(
+        draft, text, allowed_deletions=allowed_deletions, declared_terms=active_terms,
+    )
+    if not ok:
+        raise RewriteRejected(reason, model_text=text)
+    return RewriteResult(
+        text=final_text,
+        backend=f"local-brain:{brain}",
+        changed_chars=changed,
+        checked_chars=len(_content_chars(canonical_draft(draft))),
+        milliseconds=int((time.perf_counter() - started) * 1000),
+        reason=reason,
+    )
+
+
 __all__ = [
     "DEFAULT_CONTEXT_CHARS",
     "DEFAULT_MAX_TERMS",
@@ -993,6 +1025,7 @@ __all__ = [
     "merge_term_candidates",
     "mint_access_token",
     "rewrite_draft",
+    "rewrite_local_brain",
     "sanitize_context",
     "select_terms",
     "validate_rewrite",

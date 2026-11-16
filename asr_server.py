@@ -13,15 +13,18 @@
         或 {"error": "..."}
 
 啟動方式（由 M2 的 transcribe.py 透過 ssh 拉起，也可以手動測試）：
-  <repo>/.venv/bin/python <repo>/asr_server.py
+  <repo>/.venv/bin/python <repo>/asr_server.py            自己載模型
+  ... asr_server.py --listen   另開 Unix socket（VOICE_ASR_SOCKET），讓別人共用這份模型（櫃檯小妹的那一份）
+  ... asr_server.py --attach   接到 --listen 的那一份；沒有就自己載（⌘E 本機與 M2 經 ssh 都用這個）
+  op=llm 請求 {"op": "llm", "system", "user", "max_tokens"}：轉給本機大腦（VOICE_LOCAL_BRAIN_URL）。
 
 設定讀取順序：環境變數 → 本機的 local.env → 預設值。
   VOICE_STT_REPO      Breeze（mlx_whisper）模型路徑
-  VOICE_ASR_BACKEND   請求沒指定 backend 時用哪個（breeze | qwen），預設 breeze
-  VOICE_ASR_BACKENDS  啟動時要載入哪些，預設 DEFAULT_LOADED（三個都載，切換不用重啟）
+  VOICE_ASR_BACKEND   請求沒指定 backend 時用哪個，預設 octo
+  VOICE_ASR_BACKENDS  啟動時要載入哪些，預設 DEFAULT_LOADED（只有 octo；其他用到才載）
   VOICE_QWEN_REPO     Qwen3-ASR 1.7B 模型，預設 Qwen/Qwen3-ASR-1.7B
   VOICE_QWEN06_REPO   Qwen3-ASR 0.6B 模型（後端名 qwen06），預設 Qwen/Qwen3-ASR-0.6B
-  VOICE_OCTO_REPO     OctoASR 模型（後端名 octo，預設不載入），預設 Mininglamp-2718/OctoASR-1.7B-Instruct-1.0-MLX-8bit
+  VOICE_OCTO_REPO     OctoASR 模型（後端名 octo，預設載入），預設 Mininglamp-2718/OctoASR-1.7B-Instruct-1.0-MLX-8bit
   VOICE_OCTO_VAD_REPO octo 用的 VAD，預設 Mininglamp-2718/fsmn-vad-mlx（兩個都只讀本機 HF cache，不下載）
   VOICE_OCTO_SRC      OctoASR 引擎原始碼（審過、pin 住的 clone，不在這個 repo），預設 ~/orca/vendor/OctoASR
 """
@@ -55,11 +58,15 @@ def _load_stt_repo() -> str:
     return _setting("VOICE_STT_REPO", "mlx-community/whisper-large-v3-turbo")
 
 
-def run_backend(engines: dict, default: str, req: dict, audio):
+def run_backend(engines: dict, default: str, req: dict, audio, builders: dict | None = None):
     """依 req["backend"] 挑引擎辨識。engines: 名稱 → fn(audio, req) -> {"text", "segments"}。
-    回傳回應 dict；要求的後端沒載入就回 error（不偷偷換成別的模型，免得使用者以為在比較）。"""
+    要求的後端沒載入：有 builders 就當場載入（之後常駐，選單切到沒預載的模型也能用）；
+    載不起來或沒給 builders 就回 error（不偷偷換成別的模型，免得使用者以為在比較）。"""
     name = req.get("backend") or default
     engine = engines.get(name)
+    if engine is None and builders and name in builders:
+        engines.update(load_engines([name], builders, None))
+        engine = engines.get(name)
     if engine is None:
         return {"error": f"backend {name!r} 沒載入（有：{sorted(engines)}）"}
     out = engine(audio, req)
@@ -189,6 +196,8 @@ def load_engines(names, builders, warm):
         except Exception as e:  # noqa: BLE001
             print(f"[asr-server] backend={name} 載入失敗: {e!r}", file=sys.stderr, flush=True)
             continue
+        if warm is None:  # 用到才載入（run_backend）：不暖機，這次請求本身就是第一次推論
+            continue
         try:
             # 先跑一段非靜音的雜訊，讓權重真的進記憶體（與 transcribe.py 的 serve 相同做法）
             engines[name](warm, {"language": "zh"})
@@ -197,9 +206,9 @@ def load_engines(names, builders, warm):
     return engines
 
 
-# 要涵蓋 transcribe.ASR_BACKENDS 的選單值（test_asr_backend 會檢查）。octo 不在選單、也不預設載入：
-# 只有明確指定 VOICE_ASR_BACKENDS=octo（例如 duplex 的 ASR=octo）才載，⌘E 打字工具不多佔記憶體。
-DEFAULT_LOADED = "breeze,qwen,qwen06"
+# 預設只載 octo（11-16 決定：⌘E 與櫃檯小妹共用 OctoASR）。選單的其他值（qwen06、qwen、breeze）
+# 檔案留著、第一次被要求時才載入（run_backend 的 builders），平常不佔記憶體。
+DEFAULT_LOADED = "octo"
 
 
 def _builders() -> dict:
@@ -211,29 +220,205 @@ def _builders() -> dict:
     }
 
 
-def main() -> int:
-    default = _setting("VOICE_ASR_BACKEND", "breeze")
+LLM_URL_DEFAULT = "http://127.0.0.1:7871/complete"
+
+
+def llm_proxy(req: dict, post=None) -> dict:
+    """op=llm：把改寫請求轉給本機大腦（localllm_server 的 /complete）。給 M2 用：M2 經這條 ssh 通道
+    借 M4 的大腦，不另開連線。回應 {"text"} 或 {"error"}；大腦忙、沒開、逾時都回 error，客戶端退回雲端。"""
+    import urllib.request
+    body = {k: req[k] for k in ("system", "user", "max_tokens", "wait_s", "timeout_s") if k in req}
+    timeout = float(req.get("timeout") or 30)
+    url = _setting("VOICE_LOCAL_BRAIN_URL", LLM_URL_DEFAULT)
+    try:
+        if post is not None:
+            return post(url, body, timeout)
+        r = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"local brain: {e!r}"[:300]}
+
+
+def serve_line(line: str, buf: bytearray, recognise) -> dict:
+    """一行請求 → 一個回應。recognise(req, audio) 跑模型（listen 模式下排進主執行緒）。"""
+    try:
+        req = json.loads(line)
+        if req.get("op") == "llm":
+            return llm_proxy(req)
+        out, audio = handle_request(req, buf)
+        return recognise(req, audio) if audio is not None else out
+    except Exception as e:  # noqa: BLE001
+        print(f"[asr-server] 處理失敗: {e!r}", file=sys.stderr, flush=True)
+        return {"error": repr(e)}
+
+
+SOCKET_DEFAULT = "~/orca/state/voice-input/asr.sock"
+
+
+def socket_path() -> Path:
+    return Path(_setting("VOICE_ASR_SOCKET", SOCKET_DEFAULT)).expanduser()
+
+
+def _socket_alive(path: Path) -> bool:
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def open_listener(path: Path):
+    """綁 Unix socket（0600，只有本人能連）。已經有活的伺服器在聽就不搶（例如私有埠的測試小妹），回 None。"""
+    import socket
+    if path.exists():
+        if _socket_alive(path):
+            print(f"[asr-server] {path} 已有別的伺服器在聽，這個程序不共用", file=sys.stderr, flush=True)
+            return None
+        path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o177)
+    try:
+        srv.bind(str(path))
+    finally:
+        os.umask(old)
+    srv.listen(4)
+    return srv
+
+
+def accept_loop(srv, recognise) -> None:
+    """每條連線一個執行緒、各自的邊錄邊傳緩衝區；辨識一律交給 recognise（主執行緒）。"""
+    import threading
+
+    def client(conn):
+        try:
+            with conn, conn.makefile("rwb") as f:
+                buf = bytearray()
+                for raw in f:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        f.write((json.dumps(serve_line(line, buf, recognise), ensure_ascii=False) + "\n").encode())
+                        f.flush()
+        except OSError:  # 客戶端中途斷線（App 結束、ssh 斷）：只結束這條連線
+            pass
+
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=client, args=(conn,), daemon=True).start()
+
+
+def attach(path: Path) -> int | None:
+    """--attach：把 stdin／stdout 接到常駐伺服器的 socket（M4 只留一份模型）。連不上回 None，呼叫端自己載模型。"""
+    import socket
+    import threading
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(path))
+    except OSError:
+        s.close()
+        return None
+    print(f"[asr-server] 接上常駐伺服器 {path}（不另外載模型）", file=sys.stderr, flush=True)
+
+    def up():
+        try:
+            for line in sys.stdin.buffer:
+                s.sendall(line)
+        except OSError:
+            pass
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    threading.Thread(target=up, daemon=True).start()
+    out = sys.stdout.buffer
+    with s.makefile("rb") as f:
+        for line in f:
+            out.write(line)
+            out.flush()
+    return 0
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--attach" in argv:
+        rc = attach(socket_path())
+        if rc is not None:
+            return rc
+        print("[asr-server] 沒有常駐伺服器，自己載模型", file=sys.stderr, flush=True)
+    default = _setting("VOICE_ASR_BACKEND", "octo")
     wanted = [n.strip() for n in _setting("VOICE_ASR_BACKENDS", DEFAULT_LOADED).split(",") if n.strip()]
     if default not in wanted:
         wanted.append(default)
     warm = (np.random.default_rng(0).standard_normal(16000).astype("float32") * 0.02)
-    engines = load_engines(wanted, _builders(), warm)
-    print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}）", file=sys.stderr, flush=True)
+    builders = _builders()
+    engines = load_engines(wanted, builders, warm)
 
-    buf = bytearray()  # 邊錄邊傳：已收到的 int16 PCM（跨請求保留，final 或整段請求時清空）
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-            out, audio = handle_request(req, buf)
-            if audio is not None:
-                out = run_backend(engines, default, req, audio)
-        except Exception as e:  # noqa: BLE001
-            print(f"[asr-server] 處理失敗: {e!r}", file=sys.stderr, flush=True)
-            out = {"error": repr(e)}
-        print(json.dumps(out, ensure_ascii=False), flush=True)
+    def run(req, audio):
+        return run_backend(engines, default, req, audio, builders)
+
+    if "--listen" not in argv:
+        print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}）", file=sys.stderr, flush=True)
+        buf = bytearray()  # 邊錄邊傳：已收到的 int16 PCM（跨請求保留，final 或整段請求時清空）
+        for line in sys.stdin:
+            if line.strip():
+                print(json.dumps(serve_line(line, buf, run), ensure_ascii=False), flush=True)
+        return 0
+    return serve_shared(engines, default, run)
+
+
+def serve_shared(engines, default, run) -> int:
+    """--listen：stdin（擁有者，例如櫃檯小妹）之外再開 Unix socket 給 ⌘E 與 M2 共用同一份模型。
+    MLX 的模型只在載入它的執行緒用：所有辨識排進佇列由主執行緒跑；stdin 關掉（擁有者結束）就整個結束。"""
+    import queue
+    import threading
+    jobs: queue.Queue = queue.Queue()
+
+    def recognise(req, audio):
+        done: queue.Queue = queue.Queue(1)
+        jobs.put((req, audio, done))
+        return done.get()
+
+    path = socket_path()
+    srv = open_listener(path)
+    mine = path.stat().st_ino if srv is not None else None
+    if srv is not None:
+        threading.Thread(target=accept_loop, args=(srv, recognise), daemon=True).start()
+
+    def owner():
+        buf = bytearray()
+        for line in sys.stdin:
+            if line.strip():
+                print(json.dumps(serve_line(line, buf, recognise), ensure_ascii=False), flush=True)
+        jobs.put(None)
+
+    threading.Thread(target=owner, daemon=True).start()
+    print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}，"
+          f"共用 socket={path if srv is not None else '無'}）", file=sys.stderr, flush=True)
+    try:
+        while (job := jobs.get()) is not None:
+            req, audio, done = job
+            try:
+                done.put(run(req, audio))
+            except Exception as e:  # noqa: BLE001
+                print(f"[asr-server] 處理失敗: {e!r}", file=sys.stderr, flush=True)
+                done.put({"error": repr(e)})
+    finally:
+        if srv is not None:
+            srv.close()
+            try:
+                if path.stat().st_ino == mine:  # 只刪自己綁的那個
+                    path.unlink()
+            except OSError:
+                pass
     return 0
 
 

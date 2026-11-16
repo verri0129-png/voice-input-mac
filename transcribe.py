@@ -14,6 +14,7 @@ from rewrite_cloud import (
     load_term_rules,
     merge_term_candidates,
     rewrite_draft,
+    rewrite_local_brain,
     sanitize_context,
 )
 
@@ -67,9 +68,10 @@ STT_REMOTE_BACKEND = (_setting("VOICE_STT_REMOTE_BACKEND", "") or "").strip().lo
 # 檔案不存在或內容不認得就退回上面的設定。遠端模式選的是遠端那台的模型；本機模式選 qwen 則在
 # 本機載入 Qwen3-ASR（第一次用到才載入），選 breeze 或沒選＝原本的本機 Breeze，行為不變。
 ASR_BACKEND_FILE = Path(_setting("VOICE_ASR_BACKEND_FILE", "~/orca/state/voice-input/asr-backend")).expanduser()
-ASR_BACKENDS = ("breeze", "qwen", "qwen06")
-# 本機模式只用 Qwen3-ASR（Breeze 已停用）：qwen06＝0.6B（預設），qwen＝1.7B。
-# 檔案寫 breeze 或不認得的值，本機一律走預設 0.6B。
+ASR_BACKENDS = ("octo", "breeze", "qwen", "qwen06")
+# 預設 octo（OctoASR 1.7B，跟櫃檯小妹同一份）：本機也經 asr_server.py --attach 接到小妹常駐的那一份，
+# 不在這個程序另載。qwen06＝0.6B、qwen＝1.7B 仍可從選單選，在本機程序裡用到才載入。
+# 檔案寫 breeze 或不認得的值，本機走 octo。
 QWEN_REPOS = {
     "qwen": _setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B"),
     "qwen06": _setting("VOICE_QWEN06_REPO", "Qwen/Qwen3-ASR-0.6B"),
@@ -82,9 +84,10 @@ def current_backend() -> str:
         chosen = ""
     return chosen if chosen in ASR_BACKENDS else STT_REMOTE_BACKEND
 
-def _local_qwen_model() -> str:
+def _local_qwen_model() -> str | None:
+    """本機要在這個程序裡載的 Qwen3-ASR；None＝走 octo（共用小妹那一份）。"""
     b = current_backend()
-    return b if b in QWEN_REPOS else "qwen06"
+    return b if b in QWEN_REPOS else None
 # 聲音裁判（asr_fix.audio_judge）：第一輪有疑似聽錯的詞才重聽一次。預設關：2026-11-14 M4 壓力測試
 # （320 段、規則不設條件）觸發 108 段、救回 0、改壞 11（同音字聲音分不出），效果未證實前不開
 AUDIO_JUDGE = _setting("VOICE_AUDIO_JUDGE", "0").strip() == "1"
@@ -97,12 +100,15 @@ def _remote_proc():
     """長駐一條 ssh 連線（遠端的模型因此只載入一次）；斷線時自動重連。"""
     global _REMOTE_PROC
     if _REMOTE_PROC is None or _REMOTE_PROC.poll() is not None:
-        cmd = f"{STT_REMOTE_PY} {STT_REMOTE_SCRIPT}"
-        print(f"[remote-stt] 連線 {STT_REMOTE_HOST}（模型在遠端，本機不載入）", file=sys.stderr)
-        _REMOTE_PROC = subprocess.Popen(
-            ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", STT_REMOTE_HOST, cmd],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-        )
+        # --attach：接到 M4 上櫃檯小妹常駐的 asr_server（同一份 OctoASR）；小妹沒開才自己載
+        if STT_REMOTE_HOST:
+            print(f"[remote-stt] 連線 {STT_REMOTE_HOST}（模型在遠端，本機不載入）", file=sys.stderr)
+            argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", STT_REMOTE_HOST,
+                    f"{STT_REMOTE_PY} {STT_REMOTE_SCRIPT} --attach"]
+        else:
+            print("[local-asr] 接上本機 asr_server（octo，跟櫃檯小妹共用一份）", file=sys.stderr)
+            argv = [sys.executable, str(Path(__file__).with_name("asr_server.py")), "--attach"]
+        _REMOTE_PROC = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
     return _REMOTE_PROC
 
 def _pcm16(samples):
@@ -110,8 +116,9 @@ def _pcm16(samples):
     import numpy as np
     return np.clip(np.rint(np.asarray(samples, dtype="float32") * 32768.0), -32768, 32767).astype("<i2")
 
-def _remote_call(req):
-    """送一行 JSON、讀一行回應（呼叫端要先拿著 _REMOTE_LOCK）。斷線就重連並丟 RuntimeError。"""
+def _remote_call(req, retry=True):
+    """送一行 JSON、讀一行回應（呼叫端要先拿著 _REMOTE_LOCK）。斷線就重連重送一次，再失敗丟 RuntimeError。
+    （小妹重啟時共用的 asr_server 會換一個，舊連線讀到 EOF；增量請求重送會得到 error=offset → 改送整段。）"""
     global _REMOTE_PROC
     line = ""
     try:
@@ -129,6 +136,8 @@ def _remote_call(req):
                 pass
         _REMOTE_PROC = None
         _stream_reset()  # 遠端緩衝區跟著沒了
+        if retry:
+            return _remote_call(req, retry=False)
         raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
     return json.loads(line)
 
@@ -164,12 +173,12 @@ def remote_stream_append(pcm):
         else:
             _stream_reset()
 
-def _remote_whisper(samples, language, prompt, judge=False):
+def _remote_whisper(samples, language, prompt, judge=False, backend=None):
     """把 16 kHz 音訊送到遠端 asr_server.py，回傳與 mlx_whisper 同形的結果。
     錄音中已經預先傳過的前綴不重傳（見 _STREAM）。"""
     pcm = _pcm16(samples)
     base = {"fmt": "i2", "language": language, "prompt": prompt}
-    backend = current_backend()
+    backend = current_backend() if backend is None else backend  # 本機模式由 _whisper 指定 octo
     if backend:
         base["backend"] = backend
         base["terms"] = stt_terms()
@@ -279,12 +288,15 @@ def _whisper(language, audio=None, path=None, judge=False):
         if audio is None:
             raise RuntimeError("遠端 ASR 需要可讀取的音訊")
         return _remote_whisper(audio, language, prompt, judge)
-    # 本機一律 Qwen3-ASR（Breeze 已停用，不再載入 mlx_whisper）
+    # 本機：預設 octo（接到小妹常駐的 asr_server）；選單選 qwen／qwen06 才在這個程序載 Qwen3-ASR
     if audio is None and path:
         audio = wav_samples(path)
     if audio is None:
         raise RuntimeError("本機 ASR 需要可讀取的音訊")
-    return _local_qwen(audio, language, _local_qwen_model(), judge)
+    model = _local_qwen_model()
+    if model is None:
+        return _remote_whisper(audio, language, prompt, judge, backend="octo")
+    return _local_qwen(audio, language, model, judge)
 
 # ── STT provider ──────────────────────────────────────────────────────────────
 # breeze（預設）：本地 Breeze-ASR-25，完全離線。
@@ -345,7 +357,12 @@ def stt_terms(terms_file: str | None = None) -> list[str]:
     return list(dict.fromkeys(words))[:STT_QWEN_MAX_TERMS]
 
 
-REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "cloud")
+# local-brain（預設，11-16 起）：櫃檯小妹的本機大腦 e128-ha（M4 的 localllm_server /complete；M2 經 ssh 通道借用），
+# 大腦沒開、忙或逾時就退回雲端（Gemini）。cloud＝直接雲端。
+REWRITE_BACKEND = _setting("VOICE_REWRITE_BACKEND", "local-brain")
+LOCAL_BRAIN_URL = _setting("VOICE_LOCAL_BRAIN_URL", "http://127.0.0.1:7871/complete")
+LOCAL_BRAIN_TIMEOUT = float(_setting("VOICE_LOCAL_BRAIN_TIMEOUT", "12"))
+LOCAL_BRAIN_WAIT = float(_setting("VOICE_LOCAL_BRAIN_WAIT", "3"))  # 小妹正在講話（大腦被佔用）最多等幾秒
 # local-qwen 實驗用的本地定版模型路徑（空字串＝rewrite_local 的預設位置）
 LOCAL_REWRITE_REPO = _setting("VOICE_LOCAL_REWRITE_REPO", "")
 CLOUD_REWRITE_MODEL = _setting("VOICE_CLOUD_REWRITE_MODEL", "gemini-3.8-flash")
@@ -899,7 +916,7 @@ def rewrite_settings(
     cloud_priority: bool | None = None,
 ) -> RewriteConfig:
     return RewriteConfig(
-        backend=(backend or REWRITE_BACKEND or "cloud").strip().lower(),
+        backend=(backend or REWRITE_BACKEND or "local-brain").strip().lower(),
         model=(cloud_model or CLOUD_REWRITE_MODEL).strip(),
         location=(cloud_location or CLOUD_REWRITE_LOCATION).strip() or "global",
         project=(cloud_project if cloud_project is not None else CLOUD_REWRITE_PROJECT).strip(),
@@ -1065,6 +1082,29 @@ def rules_rewrite_text(text: str, rules=()) -> str:
     return finalize_punctuation(normalize_punct_only(convert_numerals(apply_terms(text, rules))))
 
 
+def local_brain_complete(system: str, user: str) -> tuple[str, str]:
+    """問本機大腦（localllm_server /complete）。M2（遠端 ASR 模式）經同一條 ssh 通道的 op=llm 轉過去。
+    回 (文字, 大腦名)；失敗丟例外。"""
+    body = {"system": system, "user": user, "max_tokens": max(128, 2 * len(user) + 64),
+            "wait_s": LOCAL_BRAIN_WAIT, "timeout_s": LOCAL_BRAIN_TIMEOUT}
+    http_timeout = LOCAL_BRAIN_WAIT + LOCAL_BRAIN_TIMEOUT + 2
+    if STT_REMOTE_HOST:
+        with _REMOTE_LOCK:
+            resp = _remote_call(dict(body, op="llm", timeout=http_timeout))
+    else:
+        import urllib.request
+        req = urllib.request.Request(LOCAL_BRAIN_URL, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=http_timeout) as r:
+                resp = json.loads(r.read())
+        except urllib.error.HTTPError as e:  # 503＝大腦忙或正在換模型
+            raise RuntimeError(f"HTTP {e.code}") from None
+    if resp.get("error") or not isinstance(resp.get("text"), str):
+        raise RuntimeError(resp.get("error") or "大腦沒回文字")
+    return resp["text"], str(resp.get("brain") or "local")
+
+
 def apply_rewrite(
     text: str,
     *,
@@ -1118,13 +1158,30 @@ def apply_rewrite(
         return final, info
 
     try:
-        result = rewrite_draft(
-            text,
-            context=clean_context,
-            terms=rules,
-            config=settings,
-            allowed_deletions=_allowed_rewrite_deletions(),
-        )
+        result = None
+        if settings.backend == "local-brain":
+            try:
+                result = rewrite_local_brain(
+                    text,
+                    context=clean_context,
+                    terms=rules,
+                    config=settings,
+                    complete=local_brain_complete,
+                    allowed_deletions=_allowed_rewrite_deletions(),
+                )
+            except RewriteRejected:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 大腦沒開／忙／逾時：退回雲端
+                print(f"[rewrite] 本機大腦沒回應（{str(exc)[:160]}）→ 改用雲端", file=sys.stderr)
+                info["local_brain_error"] = str(exc)[:300]
+        if result is None:
+            result = rewrite_draft(
+                text,
+                context=clean_context,
+                terms=rules,
+                config=settings,
+                allowed_deletions=_allowed_rewrite_deletions(),
+            )
     except RewriteRejected as exc:
         # 守門拒絕：模型改了字／刪了不該刪的。以前整段放棄 → 使用者只看到沒有標點的
         # 規則版。現在退成「只搬標點」：字一律用原話，只採用模型標的標點。
@@ -1133,10 +1190,10 @@ def apply_rewrite(
             moved = transfer_punctuation(text, model_text)
             if moved and moved != text:
                 print(
-                    f"[rewrite] 雲端被守門拒絕（{exc.reason}）→ 只搬標點，字不動",
+                    f"[rewrite] {settings.backend} 被守門拒絕（{exc.reason}）→ 只搬標點，字不動",
                     file=sys.stderr,
                 )
-                info["backend"] = "cloud:punct-only"
+                info["backend"] = f"{settings.backend}:punct-only"
                 info["reason"] = str(exc.reason)[:300]
                 info["traffic_type"] = str(getattr(exc, "traffic_type", "") or "")
                 return finalize_punctuation(
@@ -1153,7 +1210,7 @@ def apply_rewrite(
         return rules_rewrite_text(text, rules), info
 
     print(
-        "[rewrite] 雲端通過："
+        "[rewrite] 通過："
         f"{result.backend} {result.milliseconds}ms {result.reason} "
         f"token in/out={result.input_tokens}/{result.output_tokens}"
         + (f" traffic={result.traffic_type}" if result.traffic_type else ""),
@@ -2200,7 +2257,7 @@ def main():
     ap.add_argument("--no-polish", action="store_true", help="只做 ASR，不做任何重寫")
     ap.add_argument(
         "--rewrite-backend",
-        choices=["cloud", "rules", "off", "local-qwen"],
+        choices=["local-brain", "cloud", "rules", "off", "local-qwen"],
         default=None,
         help="預設走 VOICE_REWRITE_BACKEND，一般不用加；local-qwen = 本地 Qwen2.5-3B 實驗",
     )

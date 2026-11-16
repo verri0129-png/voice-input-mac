@@ -1,7 +1,7 @@
 #!/bin/bash
 # 由 M4 的 launchd 於每天 09:00 觸發（見 ~/Library/LaunchAgents/orca.voice-input.m2-sync.plist）。
 # 做法：等到 M2 連得上（使用者在 M2 的時段），讓 M2 自己 fast-forward 到 origin/main、
-# 跑單元測試、重裝 App、把 ASR 預設設成 qwen06、預先下載 0.6B 模型。
+# 跑單元測試、重裝 App、把 ASR 預設設成 octo（模型在 M4，M2 不下載）。
 # rewrite_terms.json 被 gitignore，所以從 M4 複製過去；local.env 不碰（各機器自己的設定）。
 # 10:00 還連不上就放棄，結果寫在 ~/orca/state/voice-input/m2-sync.log。
 set -u
@@ -32,11 +32,10 @@ echo "[m2] HEAD $(git log --oneline -1)"
 VOICE_ASR_BACKEND_FILE=/tmp/no-such-asr-backend ./.venv/bin/python -m unittest discover -s . -p 'test_*.py' > /tmp/m2-test.out 2>&1
 grep -E '^(Ran |OK|FAILED)' /tmp/m2-test.out
 mkdir -p "$HOME/orca/state/voice-input"
-echo qwen06 > "$HOME/orca/state/voice-input/asr-backend"
-./.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-0.6B')"
+echo octo > "$HOME/orca/state/voice-input/asr-backend"
 (cd app && ./install.sh --no-open)
 echo "[m2] done"
 REMOTE
 rc=$?
-if [ $rc -eq 0 ]; then log "完成：M2 已更新到 origin/main、預設 qwen06"; else log "失敗：M2 遠端步驟 exit=$rc（見上方輸出）"; fi
+if [ $rc -eq 0 ]; then log "完成：M2 已更新到 origin/main、預設 octo"; else log "失敗：M2 遠端步驟 exit=$rc（見上方輸出）"; fi
 exit $rc

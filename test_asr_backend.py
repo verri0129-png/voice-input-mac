@@ -135,7 +135,8 @@ class MenuChoiceFileTest(unittest.TestCase):
 
 
 class LocalRoutingTest(unittest.TestCase):
-    """本機模式（沒有遠端）：Breeze 已停用，一律走 Qwen3-ASR；選單的 qwen／qwen06 決定 1.7B 或 0.6B。"""
+    """本機模式（沒有遠端）：預設 octo，經 asr_server --attach 共用小妹那一份（不在本程序載）；
+    選單的 qwen／qwen06 才在本程序載 Qwen3-ASR；Breeze 已停用。"""
 
     def setUp(self):
         import sys
@@ -150,10 +151,14 @@ class LocalRoutingTest(unittest.TestCase):
         fake.transcribe = lambda *a, **k: (self.calls.append("whisper"), {"text": "w", "segments": []})[1]
         sys.modules["mlx_whisper"] = fake
         t._local_qwen = lambda audio, lang, model="qwen", judge=False: (self.calls.append(model), {"text": "q", "segments": []})[1]
+        self._rw = t._remote_whisper
+        t._remote_whisper = lambda a, lang, prompt, judge=False, backend=None: (
+            self.calls.append(f"server:{backend}"), {"text": "o", "segments": []})[1]
 
     def tearDown(self):
         import sys
         t.ASR_BACKEND_FILE, t.STT_REMOTE_BACKEND, t.STT_REMOTE_HOST, t._local_qwen, mod = self._keep
+        t._remote_whisper = self._rw
         if mod is None:
             sys.modules.pop("mlx_whisper", None)
         else:
@@ -164,14 +169,14 @@ class LocalRoutingTest(unittest.TestCase):
         import numpy as np
         return t._whisper("zh", audio=np.zeros(1600, dtype="float32"))
 
-    def test_default_is_qwen06_never_whisper(self):
+    def test_default_is_octo_via_shared_server_never_whisper(self):
         self._run()
-        self.assertEqual(self.calls, ["qwen06"])
+        self.assertEqual(self.calls, ["server:octo"])
 
-    def test_breeze_is_disabled_and_falls_back_to_qwen(self):
+    def test_breeze_is_disabled_and_falls_back_to_octo(self):
         t.ASR_BACKEND_FILE.write_text("breeze")
         self._run()
-        self.assertEqual(self.calls, ["qwen06"])
+        self.assertEqual(self.calls, ["server:octo"])
         self.assertNotIn("whisper", self.calls)
 
     def test_qwen_choice_routes_to_17b_and_back(self):
@@ -185,21 +190,32 @@ class LocalRoutingTest(unittest.TestCase):
         t.STT_REMOTE_HOST = "m4"
         t.ASR_BACKEND_FILE.write_text("qwen06")
         seen = []
-        orig = t._remote_whisper
-        t._remote_whisper = lambda *a, **k: (seen.append(1), {"text": "r", "segments": []})[1]
-        try:
-            self._run()
-        finally:
-            t._remote_whisper = orig
-        self.assertEqual((seen, self.calls), ([1], []))
+        t._remote_whisper = lambda *a, **k: (seen.append(k.get("backend")), {"text": "r", "segments": []})[1]
+        self._run()
+        self.assertEqual((seen, self.calls), ([None], []))  # 遠端：backend 由選單檔決定（None＝讀檔）
 
 
 class ServerLoadsClientBackendsTest(unittest.TestCase):
-    """回歸：選單能送的每個後端，遠端伺服器預設都要載入；否則 M2 會收到「沒載入」（曾發生於 qwen06）。"""
+    """回歸：選單能送的每個後端，伺服器都要服務得了；否則 M2 會收到「沒載入」（曾發生於 qwen06）。
+    11-16 起只預載 octo，其他用到才載（run_backend 的 builders）。"""
 
-    def test_every_menu_backend_is_loaded_by_default(self):
-        loaded = {n.strip() for n in asr_server.DEFAULT_LOADED.split(",") if n.strip()}
-        self.assertTrue(set(t.ASR_BACKENDS) <= loaded, f"預設只載入 {sorted(loaded)}，缺 {set(t.ASR_BACKENDS) - loaded}")
+    def test_only_octo_is_loaded_by_default(self):
+        self.assertEqual(asr_server.DEFAULT_LOADED, "octo")
+
+    def test_menu_backend_not_preloaded_is_loaded_on_first_request(self):
+        built = []
+        builders = {"qwen06": lambda: (built.append("qwen06"), lambda a, req: {"text": "q6", "segments": []})[1]}
+        engines = {"octo": lambda a, req: {"text": "o", "segments": []}}
+        out = asr_server.run_backend(engines, "octo", {"backend": "qwen06"}, None, builders)
+        again = asr_server.run_backend(engines, "octo", {"backend": "qwen06"}, None, builders)
+        self.assertEqual((out["text"], out["backend"], again["text"], built), ("q6", "qwen06", "q6", ["qwen06"]))
+
+    def test_lazy_load_failure_is_an_error_not_a_swap(self):
+        def broken():
+            raise OSError("權重載不進來")
+        out = asr_server.run_backend({"octo": lambda a, r: {"text": "o"}}, "octo", {"backend": "qwen"}, None,
+                                     {"qwen": broken})
+        self.assertIn("error", out)
 
     def test_every_menu_backend_has_a_builder(self):
         self.assertTrue(set(t.ASR_BACKENDS) <= set(asr_server._builders()))
@@ -301,10 +317,9 @@ class OctoBackendTest(unittest.TestCase):
                     else:
                         os.environ[k] = v
 
-    def test_octo_is_a_builder_but_not_loaded_by_default_nor_in_menu(self):
+    def test_octo_is_the_default_and_in_menu(self):
         self.assertIn("octo", asr_server._builders())
-        self.assertNotIn("octo", asr_server.DEFAULT_LOADED.split(","))  # ⌘E 的伺服器不多載 1.7B 模型
-        self.assertNotIn("octo", t.ASR_BACKENDS)
+        self.assertIn("octo", t.ASR_BACKENDS)
 
 
 if __name__ == "__main__":
