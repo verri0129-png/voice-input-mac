@@ -7,8 +7,8 @@
 協定（stdin／stdout 一行一個 JSON，診斷一律走 stderr）：
   請求：{"audio": "<base64 的 PCM，16 kHz 單聲道>", "fmt": "i2"（int16 LE；省略＝float32 LE，舊客戶端）,
          "language": "zh" | null, "prompt": "<initial_prompt>",
-         "backend": "breeze" | "qwen"（省略＝本機 VOICE_ASR_BACKEND，預設 breeze）,
-         "terms": ["熱詞", ...]（qwen 用：空白串成 context；breeze 用 prompt，不看 terms）}
+         "backend": "breeze" | "qwen" | "qwen06" | "octo"（省略＝本機 VOICE_ASR_BACKEND，預設 breeze）,
+         "terms": ["熱詞", ...]（qwen 用：空白串成 context；octo 用：hotwords；breeze 用 prompt，不看 terms）}
   回應：{"text": "...", "segments": [...]}   （與 mlx_whisper.transcribe 的結果同形）
         或 {"error": "..."}
 
@@ -21,11 +21,16 @@
   VOICE_ASR_BACKENDS  啟動時要載入哪些，預設 DEFAULT_LOADED（三個都載，切換不用重啟）
   VOICE_QWEN_REPO     Qwen3-ASR 1.7B 模型，預設 Qwen/Qwen3-ASR-1.7B
   VOICE_QWEN06_REPO   Qwen3-ASR 0.6B 模型（後端名 qwen06），預設 Qwen/Qwen3-ASR-0.6B
+  VOICE_OCTO_REPO     OctoASR 模型（後端名 octo，預設不載入），預設 Mininglamp-2718/OctoASR-1.7B-Instruct-1.0-MLX-8bit
+  VOICE_OCTO_VAD_REPO octo 用的 VAD，預設 Mininglamp-2718/fsmn-vad-mlx（兩個都只讀本機 HF cache，不下載）
+  VOICE_OCTO_SRC      OctoASR 引擎原始碼（審過、pin 住的 clone，不在這個 repo），預設 ~/orca/vendor/OctoASR
 """
 import base64
 import json
 import os
 import sys
+import tempfile
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +100,52 @@ def _qwen_engine(model: str):
     return run
 
 
+OCTO_SRC_DEFAULT = str(Path.home() / "orca/vendor/OctoASR")
+
+
+def _local_snapshot(repo: str) -> str:
+    """本機資料夾直接用；否則只從 HF cache 找，不上網下載（缺模型就大聲失敗）。"""
+    if Path(repo).expanduser().is_dir():
+        return str(Path(repo).expanduser())
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo, local_files_only=True)
+
+
+def _octo_engine(repo: str):
+    """OctoASR（Qwen3-ASR 架構微調，MLX 8bit）＋ fsmn-vad。引擎原始碼在 VOICE_OCTO_SRC，用到才 import，
+    其他後端不受影響。引擎只吃檔案路徑，所以每次寫成暫存 wav、辨識完就刪。
+    回傳原文（可能是簡體）：跟 qwen 一樣，繁體化與修字表由客戶端（transcribe.py／duplex fix_text）做。"""
+    src = _setting("VOICE_OCTO_SRC", OCTO_SRC_DEFAULT)
+    if src not in sys.path:
+        sys.path.insert(0, src)  # 引擎的頂層套件叫 core／utils，放最前面才不會被同名套件搶走
+    from core.auto_model import AutoModel
+
+    model = AutoModel(model=_local_snapshot(repo),
+                      vad_model=_local_snapshot(_setting("VOICE_OCTO_VAD_REPO", "Mininglamp-2718/fsmn-vad-mlx")))
+    return _octo_runner(model)
+
+
+def _octo_runner(model):
+    def run(audio, req):
+        # language 不傳：引擎要的是 "Chinese" 這種名稱，傳 "zh" 會被原樣塞進 prompt；自動偵測已實測可用
+        terms = [t for t in (req.get("terms") or []) if t]
+        pcm = (np.clip(np.asarray(audio, dtype="float32"), -1.0, 1.0) * 32767.0).astype("<i2")
+        fd, path = tempfile.mkstemp(prefix="octo-", suffix=".wav")
+        os.close(fd)
+        try:
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm.tobytes())
+            r = model.generate(path, hotwords=terms or None, merge_vad=True)
+        finally:
+            os.unlink(path)
+        text = r.get("text", "") if isinstance(r, dict) else r
+        return {"text": text or "", "segments": []}
+    return run
+
+
 def handle_request(req: dict, buf: bytearray):
     """解一個請求。回傳 (回應, 要辨識的音訊)；音訊為 None 代表不用跑模型，直接回「回應」。
 
@@ -146,7 +197,9 @@ def load_engines(names, builders, warm):
     return engines
 
 
-DEFAULT_LOADED = "breeze,qwen,qwen06"  # 要與 transcribe.ASR_BACKENDS 的選單值一致（test_asr_backend 會檢查）
+# 要涵蓋 transcribe.ASR_BACKENDS 的選單值（test_asr_backend 會檢查）。octo 不在選單、也不預設載入：
+# 只有明確指定 VOICE_ASR_BACKENDS=octo（例如 duplex 的 ASR=octo）才載，⌘E 打字工具不多佔記憶體。
+DEFAULT_LOADED = "breeze,qwen,qwen06"
 
 
 def _builders() -> dict:
@@ -154,6 +207,7 @@ def _builders() -> dict:
         "breeze": lambda: _breeze_engine(_load_stt_repo()),
         "qwen": lambda: _qwen_engine(_setting("VOICE_QWEN_REPO", "Qwen/Qwen3-ASR-1.7B")),
         "qwen06": lambda: _qwen_engine(_setting("VOICE_QWEN06_REPO", "Qwen/Qwen3-ASR-0.6B")),
+        "octo": lambda: _octo_engine(_setting("VOICE_OCTO_REPO", "Mininglamp-2718/OctoASR-1.7B-Instruct-1.0-MLX-8bit")),
     }
 
 
