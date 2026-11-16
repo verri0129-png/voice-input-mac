@@ -388,6 +388,34 @@ CLOUD_REWRITE_PRIORITY = _setting("VOICE_CLOUD_PRIORITY", "1").strip().lower() n
 # Typeless 式定版：先貼規則版，雲端在背景重寫，完成後由 App 原地替換。
 # 這是「貼上之後最多等多久才定版」的上限，不再擋住貼字。
 REFINE_WAIT_SECONDS = float(_setting("VOICE_REFINE_WAIT", "8"))
+# 「先等潤稿再貼上」（預設關）：開了就在貼字前最多等 N 秒；等到潤稿就直接貼潤稿版，
+# 等不到就照舊先貼規則版、背景定版。給讀不到前景欄位、無法原地替換的 App（例如 Claude App）用。
+# 選單列「先等潤稿再貼上」寫 WAIT_REFINE_FILE（內容 off／秒數），每次辨識重讀、蓋過下面兩個設定；
+# 檔案不存在或內容不認得才看 VOICE_WAIT_REFINE（0/1）與 VOICE_WAIT_REFINE_MAX（秒）。
+WAIT_REFINE_FILE = Path(_setting("VOICE_WAIT_REFINE_FILE", "~/orca/state/voice-input/wait-refine")).expanduser()
+WAIT_REFINE_ENABLED = _setting("VOICE_WAIT_REFINE", "0").strip().lower() in ("1", "on", "true", "yes")
+WAIT_REFINE_MAX = float(_setting("VOICE_WAIT_REFINE_MAX", "1.5"))
+WAIT_REFINE_CAP = 5.0  # 等更久 ⌘E 就像壞掉了
+
+
+def wait_refine_seconds() -> float:
+    """這一次貼字前最多等潤稿幾秒；0 = 不等（原行為）。"""
+    env = WAIT_REFINE_MAX if WAIT_REFINE_ENABLED else 0.0
+    try:
+        value = WAIT_REFINE_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        value = ""
+    if value in ("off", "0", "no", "false"):
+        return 0.0
+    if value == "on":
+        seconds = WAIT_REFINE_MAX
+    else:
+        try:
+            seconds = float(value)
+        except ValueError:
+            seconds = env
+    return max(0.0, min(seconds, WAIT_REFINE_CAP))
+
 REWRITE_TERMS_FILE = _setting(
     "VOICE_REWRITE_TERMS_FILE", str(Path(__file__).with_name("rewrite_terms.json"))
 )
@@ -1466,7 +1494,16 @@ def process_wav_file(
                 path, raw, settings, seconds=seconds, refine_path=refine_path
             )
     if defer_cloud:
-        start_refinement(raw, context, settings, refine_path, final)
+        worker = start_refinement(raw, context, settings, refine_path, final)
+        wait = wait_refine_seconds()
+        if wait > 0:
+            settled = _await_refine_before_paste(worker, refine_path, wait, settings)
+            if settled is not None:
+                if settled:
+                    rewrite = {**rewrite, "backend": "refined-before-paste", "refine_pending": False}
+                    return {"status": "ok", "text": settled, "rewrite": rewrite, **extra}
+                rewrite = {**rewrite, "refine_pending": False}
+                return {"status": "ok", "text": final, "rewrite": rewrite, **extra}
         return {"status": "ok", "text": final, "rewrite": rewrite,
                 "refine_pending": True, **extra}
     return {"status": "ok", "text": final, "rewrite": rewrite, **extra}
@@ -1557,6 +1594,37 @@ def refine_in_background(raw, context, settings, refine_path, pasted_text):
         f"{payload.get('reason', '')[:120]}",
         file=sys.stderr,
     )
+
+
+def _await_refine_before_paste(worker, refine_path, wait, settings):
+    """「先等潤稿再貼上」：最多等 wait 秒。
+
+    回傳潤稿文字＝等到了，直接貼它；""＝潤稿已放棄，貼規則版、不用再等定版；
+    None＝沒等到，照舊先貼規則版，背景執行緒繼續跑、App 照舊原地定版。
+    refine 檔不刪：第二意見也會讀它，App 之後自己清。
+    """
+    started = time.perf_counter()
+    worker.join(wait)
+    waited_ms = int((time.perf_counter() - started) * 1000)
+    if worker.is_alive():
+        print(f"[wait-refine] 等 {waited_ms}ms 沒等到（上限 {wait:g}s）→ 先貼規則版，背景照舊定版",
+              file=sys.stderr)
+        return None
+    try:
+        payload = json.loads(Path(refine_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = {}
+    text = payload.get("text") if isinstance(payload, dict) and payload.get("ok") else None
+    if not text:
+        reason = (payload.get("reason") if isinstance(payload, dict) else "") or "讀不到潤稿檔"
+        print(f"[wait-refine] 潤稿放棄 {waited_ms}ms（{str(reason)[:120]}）→ 貼規則版", file=sys.stderr)
+        return ""
+    # 跟規則版同一道收尾：繁化＋詞庫，不讓簡體或錯字漏出去
+    text = apply_terms(to_taiwan_traditional(normalize_spacing(str(text))),
+                       load_term_rules(settings.terms_file))
+    print(f"[wait-refine] 等到潤稿 {waited_ms}ms（上限 {wait:g}s）→ 貼潤稿版 "
+          f"{payload.get('backend', '')}：{text}", file=sys.stderr)
+    return text
 
 
 def start_refinement(raw, context, settings, refine_path, pasted_text):

@@ -31,6 +31,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ("qwen06", "Qwen3-ASR 0.6B"),
         ("qwen", "Qwen3-ASR 1.7B"),
     ]
+    // 「先等潤稿再貼上」子選單：寫 off 或最多等幾秒，transcribe.py 每次辨識重讀（蓋過 local.env 的
+    // VOICE_WAIT_REFINE／VOICE_WAIT_REFINE_MAX）。選「跟隨 local.env」＝刪掉檔案。預設關＝先貼規則版。
+    private var waitRefineItems: [String: NSMenuItem] = [:]
+    private static let waitRefineFile = NSString(string: "~/orca/state/voice-input/wait-refine").expandingTildeInPath
+    private static let waitRefineChoices: [(id: String, title: String)] = [
+        ("", "跟隨 local.env（沒設＝關）"),
+        ("off", "關：先貼規則版、背景定版（預設）"),
+        ("1", "開：最多等 1 秒"),
+        ("1.5", "開：最多等 1.5 秒"),
+        ("2", "開：最多等 2 秒"),
+        ("3", "開：最多等 3 秒"),
+    ]
     // 有沒有收到過真正的 Cmd 修飾鍵事件。某些環境（合成事件、遠端桌面）完全收不到
     // flagsChanged；那種情況下才降級放行，否則嚴格只認左 Cmd。
     private var sawCmdFlags = false
@@ -95,6 +107,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         backendParent.submenu = backendMenu
         menu.addItem(backendParent)
         refreshBackendChecks()
+        let waitMenu = NSMenu()
+        for c in Self.waitRefineChoices {
+            let item = NSMenuItem(title: c.title, action: #selector(selectWaitRefine(_:)), keyEquivalent: "")
+            item.representedObject = c.id
+            waitRefineItems[c.id] = item
+            waitMenu.addItem(item)
+        }
+        let waitParent = NSMenuItem(title: "先等潤稿再貼上", action: nil, keyEquivalent: "")
+        waitParent.submenu = waitMenu
+        menu.addItem(waitParent)
+        refreshWaitRefineChecks()
         menu.delegate = self
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "開啟 VoiceInputMac 檔案位置", action: #selector(revealInFinder), keyEquivalent: ""))
@@ -296,6 +319,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     settled = refined
                                 }
                                 try? FileManager.default.removeItem(at: refineURL)
+                            } else {
+                                // 先等潤稿模式等到了／潤稿放棄：refine 檔已寫出，第二意見可能還要讀，晚點再清
+                                DispatchQueue.global().asyncAfter(deadline: .now() + 20) {
+                                    try? FileManager.default.removeItem(at: refineURL)
+                                }
                             }
                             // 用「定版後」的文字記帳，否則 20 秒後的比對會把定版本身
                             // 當成使用者手改，學到錯誤的詞。
@@ -425,7 +453,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (id, item) in backendItems { item.state = (id == cur) ? .on : .off }
     }
     // 每次打開選單都重讀，檔案被別的方式改掉時勾選也不會過期
-    func menuWillOpen(_ menu: NSMenu) { refreshBackendChecks() }
+    func menuWillOpen(_ menu: NSMenu) { refreshBackendChecks(); refreshWaitRefineChecks() }
+    /// 目前「先等潤稿再貼上」的選項；沒有檔案＝跟隨 local.env（""）。不認得的值也當跟隨。
+    static func readWaitRefine() -> String {
+        guard let v = (try? String(contentsOfFile: waitRefineFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return "" }
+        return waitRefineChoices.contains(where: { $0.id == v }) ? v : ""
+    }
+    private func refreshWaitRefineChecks() {
+        let cur = Self.readWaitRefine()
+        for (id, item) in waitRefineItems { item.state = (id == cur) ? .on : .off }
+    }
+    @objc func selectWaitRefine(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        do {
+            if id.isEmpty {
+                if FileManager.default.fileExists(atPath: Self.waitRefineFile) {
+                    try FileManager.default.removeItem(atPath: Self.waitRefineFile)
+                }
+            } else {
+                let dir = (Self.waitRefineFile as NSString).deletingLastPathComponent
+                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                try id.write(toFile: Self.waitRefineFile, atomically: true, encoding: .utf8)
+            }
+            Transcriber.log("[wait-refine] 選單切換 → \(id.isEmpty ? "跟隨 local.env" : id)（下一次辨識生效）")
+        } catch {
+            Transcriber.log("[wait-refine] 切換失敗：\(error.localizedDescription)")
+        }
+        refreshWaitRefineChecks()
+    }
     @objc func selectBackend(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         let dir = (Self.backendFile as NSString).deletingLastPathComponent
