@@ -1505,13 +1505,27 @@ def refine_in_background(raw, context, settings, refine_path, pasted_text):
     try:
         clean_context = sanitize_context(context)
         rules = load_term_rules(settings.terms_file)
-        result = rewrite_draft(
-            raw,
-            context=clean_context,
-            terms=rules,
-            config=settings,
-            allowed_deletions=_allowed_rewrite_deletions(),
-        )
+        result = None
+        if settings.backend == "local-brain":  # 先問本機大腦；沒開／忙／逾時／守門拒絕都退回雲端
+            try:
+                result = rewrite_local_brain(
+                    raw,
+                    context=clean_context,
+                    terms=rules,
+                    config=settings,
+                    complete=local_brain_complete,
+                    allowed_deletions=_allowed_rewrite_deletions(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[refine] 本機大腦沒用上（{str(exc)[:160]}）→ 改用雲端", file=sys.stderr)
+        if result is None:
+            result = rewrite_draft(
+                raw,
+                context=clean_context,
+                terms=rules,
+                config=settings,
+                allowed_deletions=_allowed_rewrite_deletions(),
+            )
         text = _settle_text(result.text, rules)
         if not text:
             payload = {"ok": False, "reason": "雲端回空字串"}
@@ -1529,6 +1543,7 @@ def refine_in_background(raw, context, settings, refine_path, pasted_text):
                 "changed_chars": result.changed_chars,
                 "same_as_pasted": False,
             }
+        payload["backend"] = result.backend
     except Exception as exc:  # noqa: BLE001 - 定版失敗就保留規則版，不能影響已貼上的字
         payload = {"ok": False, "reason": str(exc)[:300]}
     payload["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
@@ -1538,7 +1553,7 @@ def refine_in_background(raw, context, settings, refine_path, pasted_text):
         print(f"[refine] 寫入精修檔失敗：{exc!r}", file=sys.stderr)
         return
     print(
-        f"[refine] 定版 {'成功' if payload.get('ok') else '放棄'} {payload['elapsed_ms']}ms "
+        f"[refine] 定版 {'成功' if payload.get('ok') else '放棄'} {payload.get('backend', '')} {payload['elapsed_ms']}ms "
         f"{payload.get('reason', '')[:120]}",
         file=sys.stderr,
     )

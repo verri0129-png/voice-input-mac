@@ -202,6 +202,25 @@ class LocalBrainRewriteTest(unittest.TestCase):
         self.assertEqual(t._text_only(out), t._text_only(self.DRAFT))
         self.assertEqual(self.cloud, [])
 
+    def _refine(self):
+        path = str(Path(self.td.name) / "refine.json")
+        t.refine_in_background(self.DRAFT, {}, self.settings, path, self.DRAFT)
+        return json.loads(Path(path).read_text())
+
+    def test_background_refine_uses_the_brain(self):  # ⌘E 走的是背景定版，11-16 前直接打 Gemini
+        t.local_brain_complete = lambda s, u: ("好啦，那我現在那個語音轉文字標點符號的問題要怎麼解？", "e128-ha")
+        payload = self._refine()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["backend"], "local-brain:e128-ha")
+        self.assertEqual(self.cloud, [])
+
+    def test_background_refine_falls_back_to_cloud_when_brain_fails(self):
+        def down(system, user):
+            raise RuntimeError("HTTP 503")
+        t.local_brain_complete = down
+        payload = self._refine()
+        self.assertEqual((payload["text"], payload["backend"], self.cloud), ("雲端版。", "cloud:gemini", [self.DRAFT]))
+
     def test_m2_goes_through_the_ssh_channel(self):
         keep = (t.STT_REMOTE_HOST, t._remote_call)
         sent = []
