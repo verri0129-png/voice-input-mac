@@ -75,6 +75,7 @@ class TermRule:
     text: str
     variants: tuple[str, ...] = ()
     note: str = ""
+    fuzzy: bool = False  # 純英文字的詞：字母相近的英文單字也換成正字（apply_terms）
 
 
 class RewriteRejected(RuntimeError):
@@ -474,8 +475,9 @@ def load_term_rules(path: str | os.PathLike[str]) -> list[TermRule]:
     seen: set[str] = set()
     for item in items:
         if isinstance(item, str):
-            text, variants, note = item.strip(), (), ""
+            text, variants, note, fuzzy = item.strip(), (), "", False
         elif isinstance(item, dict):
+            fuzzy = item.get("fuzzy") is True
             text = str(item.get("text", "")).strip()
             raw_variants = item.get("match", item.get("variants", []))
             if isinstance(raw_variants, str):
@@ -487,7 +489,7 @@ def load_term_rules(path: str | os.PathLike[str]) -> list[TermRule]:
         if len(text) < 2 or text in seen:
             continue
         seen.add(text)
-        rules.append(TermRule(text=text, variants=variants, note=note))
+        rules.append(TermRule(text=text, variants=variants, note=note, fuzzy=fuzzy))
     return rules
 
 

@@ -969,6 +969,33 @@ def _allowed_rewrite_deletions() -> set[str]:
     return set(_REPEAT_WORDS) | set(_STUTTER_CHARS) | set(_FILLERS)
 
 
+_LATIN_WORD = re.compile(r"(?<![A-Za-z])[A-Za-z]{3,}(?![A-Za-z])")
+
+
+def _fuzzy_replace(text: str, term: str, applied: list[str]) -> str:
+    """純英文字的詞（rule.fuzzy）：把「長度一樣、開頭至少一半字母相同、整個只差 1～2 個字母」的英文單字
+    換成正字，例如 Fable ← Faber、Fabio、Fabre。大小寫不同不算（只是大小寫就不動）。
+    門檻故意很窄：詞長 ≤4 只容許差 1 個。實測過寬會誤傷（file、Face、FAB、Fails 都曾被當成 Fable）。
+    中文不做：飛哥和飛機的發音距離一樣近，但「飛機」是真詞，要靠明列的變體。"""
+    if not term.isascii() or not term.isalpha():
+        return text
+    want = term.lower()
+    limit = 1 if len(want) <= 4 else 2
+    prefix = (len(want) + 1) // 2
+
+    def swap(match: re.Match) -> str:
+        word = match.group(0)
+        low = word.lower()
+        if low == want or len(low) != len(want) or low[:prefix] != want[:prefix]:
+            return word
+        if sum(x != y for x, y in zip(low, want)) > limit:
+            return word
+        applied.append(f"{word}→{term}×1（相近）")
+        return term
+
+    return _LATIN_WORD.sub(swap, text)
+
+
 def apply_terms(text: str, rules=()) -> str:
     """在本地套用使用者詞庫（變體 → 正字）。零模型、零延遲、零網路。
 
@@ -983,8 +1010,6 @@ def apply_terms(text: str, rules=()) -> str:
         for variant in getattr(rule, "variants", ()) or ():
             if variant and variant != rule.text and variant in text:
                 pairs.append((variant, rule.text))
-    if not pairs:
-        return text
     # 長的先換：避免短變體先吃掉長變體的一部分（例如「磁庫房」→「詞庫房」）
     pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
     out = text
@@ -995,6 +1020,9 @@ def apply_terms(text: str, rules=()) -> str:
             continue
         out = out.replace(variant, target)
         applied.append(f"{variant}→{target}×{hits}")
+    for rule in rules:
+        if getattr(rule, "fuzzy", False):
+            out = _fuzzy_replace(out, rule.text, applied)
     if applied:
         print(f"[terms] 詞庫套用：{'、'.join(applied)}", file=sys.stderr)
     return out
