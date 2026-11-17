@@ -86,6 +86,20 @@ class SocketShareTest(unittest.TestCase):
         self.assertEqual(json.loads(p.stdout)["text"], "n=2", p.stderr)
         self.assertIn("接上常駐伺服器", p.stderr)
 
+    def test_attach_exits_cleanly_when_server_hangs_up_while_stdin_is_open(self):
+        # 11-16～11-18：伺服器先斷、stdin 還開著時，讀 stdin 的 daemon 執行緒卡住鎖，收尾 abort → macOS「Python 未預期的結束」
+        srv = asr_server.open_listener(self.path)
+        self.addCleanup(srv.close)
+        threading.Thread(target=lambda: srv.accept()[0].close(), daemon=True).start()
+        env = {**os.environ, "VOICE_ASR_SOCKET": str(self.path)}
+        p = subprocess.Popen([sys.executable, str(HERE / "asr_server.py"), "--attach"], env=env, cwd=HERE,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(p.stdin.close)
+        rc = p.wait(timeout=60)
+        err = p.stderr.read().decode()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Fatal Python error", err)
+
 
 class LlmProxyTest(unittest.TestCase):
     def test_forwards_only_the_rewrite_fields(self):

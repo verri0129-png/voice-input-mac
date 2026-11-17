@@ -344,7 +344,9 @@ def attach(path: Path) -> int | None:
         for line in f:
             out.write(line)
             out.flush()
-    return 0
+    # 伺服器先斷時 up 還卡在讀 stdin、握著它的鎖；正常收尾會 abort（macOS 跳「Python 未預期的結束」），所以直接離開
+    sys.stderr.flush()
+    os._exit(0)
 
 
 def main(argv=None) -> int:
