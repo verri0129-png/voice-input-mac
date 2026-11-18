@@ -211,6 +211,9 @@ def _remote_whisper(samples, language, prompt, judge=False, backend=None):
     if "error" in resp:
         raise RuntimeError(f"遠端 ASR 失敗：{resp['error']}")
     got = resp.get("backend")  # 舊版伺服器不回報
+    if not got:  # 11-18 13:51 起增量 final 常拿到沒有 backend 的回應，原因未明：把拿到的內容記下來
+        print(f"[remote-stt] 回應沒有 backend：keys={sorted(resp)} text={str(resp.get('text'))[:40]!r} "
+              f"請求 op={'final' if n else 'whole'} backend={backend}", file=sys.stderr)
     print(f"[remote-stt] 遠端用的模型：{got or '未回報（遠端還是舊版）'}", file=sys.stderr)
     if backend and got != backend:
         # 不偷偷用別的模型：試用期間若悄悄跑 Breeze，使用者會把結果當成 Qwen 的
