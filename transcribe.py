@@ -93,6 +93,7 @@ def _local_qwen_model() -> str | None:
 AUDIO_JUDGE = _setting("VOICE_AUDIO_JUDGE", "0").strip() == "1"
 # Qwen 的熱詞太多會整段回吐（字幕專案實測），所以設上限
 STT_QWEN_MAX_TERMS = int(_setting("VOICE_STT_QWEN_MAX_TERMS", "40"))
+REMOTE_SLOW_LOG_S = 2.0
 _REMOTE_PROC = None
 _REMOTE_LOCK = threading.Lock()
 
@@ -121,11 +122,17 @@ def _remote_call(req, retry=True):
     （小妹重啟時共用的 asr_server 會換一個，舊連線讀到 EOF；增量請求重送會得到 error=offset → 改送整段。）"""
     global _REMOTE_PROC
     line = ""
+    t0 = time.time()
     try:
         proc = _remote_proc()
-        proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        payload = json.dumps(req, ensure_ascii=False) + "\n"
+        proc.stdin.write(payload)
         proc.stdin.flush()
         line = proc.stdout.readline()
+        took = time.time() - t0
+        if took >= REMOTE_SLOW_LOG_S:  # 只記慢的：之後能分清「連線抖」還是「M4 慢」（2026-11-18 無法事後歸因）
+            print(f"[remote-stt] 通道慢：op={req.get('op', 'final')} 送 {len(payload) // 1024}KB 來回 {took:.1f}s",
+                  file=sys.stderr)
     except (OSError, ValueError) as e:
         print(f"[remote-stt] 通訊失敗: {e!r}", file=sys.stderr)
     if not line:
