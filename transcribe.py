@@ -105,7 +105,7 @@ def _remote_proc():
         if STT_REMOTE_HOST:
             print(f"[remote-stt] 連線 {STT_REMOTE_HOST}（模型在遠端，本機不載入）", file=sys.stderr)
             argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", STT_REMOTE_HOST,
-                    f"{STT_REMOTE_PY} {STT_REMOTE_SCRIPT} --attach"]
+                    f"PATH=/opt/homebrew/bin:$PATH {STT_REMOTE_PY} {STT_REMOTE_SCRIPT} --attach"]
         else:
             print("[local-asr] 接上本機 asr_server（octo，跟櫃檯小妹共用一份）", file=sys.stderr)
             argv = [sys.executable, str(Path(__file__).with_name("asr_server.py")), "--attach"]
@@ -135,7 +135,13 @@ def _remote_call(req, retry=True):
                   file=sys.stderr)
     except (OSError, ValueError) as e:
         print(f"[remote-stt] 通訊失敗: {e!r}", file=sys.stderr)
-    if not line:
+    resp = None
+    if line.strip():
+        try:
+            resp = json.loads(line)
+        except ValueError:  # M4 常駐伺服器剛被重啟時會回空行／雜訊：當作斷線，重連重送（11-18 13:54 事故）
+            print(f"[remote-stt] 回應不是 JSON：{line[:80]!r}", file=sys.stderr)
+    if resp is None:
         if _REMOTE_PROC is not None:
             try:
                 _REMOTE_PROC.kill()
@@ -146,7 +152,7 @@ def _remote_call(req, retry=True):
         if retry:
             return _remote_call(req, retry=False)
         raise RuntimeError(f"遠端 ASR 無回應（確認 ssh {STT_REMOTE_HOST} 可用，且遠端有 asr_server.py）")
-    return json.loads(line)
+    return resp
 
 def _b64(pcm):
     return base64.b64encode(pcm.tobytes()).decode("ascii")
