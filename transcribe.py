@@ -97,6 +97,21 @@ REMOTE_SLOW_LOG_S = 2.0
 _REMOTE_PROC = None
 _REMOTE_LOCK = threading.Lock()
 
+# 共用 ssh 連線（ControlMaster）：暖機程序、一次性退路、斷線重連都搭同一條底層連線，
+# 省掉每次 3～13 秒的握手（M2↔M4 走 Tailscale 中繼時握手要來回很多趟）。
+# ControlPersist 只留 30 秒：主連線掛掉時不會長期卡住後續連線；偵測死線 5s×3 次。
+_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+             "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cm-vim-%C", "-o", "ControlPersist=30"]
+
+def _drop_shared_ssh():
+    """通訊失敗時先關掉共用的主連線，免得重連又掛回同一條壞掉的連線。"""
+    if not STT_REMOTE_HOST:
+        return
+    try:
+        subprocess.run(["ssh", "-O", "exit", *_SSH_OPTS, STT_REMOTE_HOST], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
 def _remote_proc():
     """長駐一條 ssh 連線（遠端的模型因此只載入一次）；斷線時自動重連。"""
     global _REMOTE_PROC
@@ -104,7 +119,7 @@ def _remote_proc():
         # --attach：接到 M4 上櫃檯小妹常駐的 asr_server（同一份 OctoASR）；小妹沒開才自己載
         if STT_REMOTE_HOST:
             print(f"[remote-stt] 連線 {STT_REMOTE_HOST}（模型在遠端，本機不載入）", file=sys.stderr)
-            argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", STT_REMOTE_HOST,
+            argv = ["ssh", "-T", *_SSH_OPTS, STT_REMOTE_HOST,
                     f"PATH=/opt/homebrew/bin:$PATH {STT_REMOTE_PY} {STT_REMOTE_SCRIPT} --attach"]
         else:
             print("[local-asr] 接上本機 asr_server（octo，跟櫃檯小妹共用一份）", file=sys.stderr)
@@ -148,6 +163,7 @@ def _remote_call(req, retry=True):
             except OSError:
                 pass
         _REMOTE_PROC = None
+        _drop_shared_ssh()
         _stream_reset()  # 遠端緩衝區跟著沒了
         if retry:
             return _remote_call(req, retry=False)
