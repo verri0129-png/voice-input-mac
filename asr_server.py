@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -319,12 +320,19 @@ def attach(path: Path) -> int | None:
     """--attach：把 stdin／stdout 接到常駐伺服器的 socket（M4 只留一份模型）。連不上回 None，呼叫端自己載模型。"""
     import socket
     import threading
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(str(path))
-    except OSError:
-        s.close()
-        return None
+    # 小妹重啟的空檔 socket 會消失約 10 秒（11-18 事故：撞上空檔就自己載一份模型，stdout 被雜訊污染，之後回應全部錯位）。
+    # 所以先重試一段時間再放棄。
+    deadline = time.time() + float(_setting("VOICE_ATTACH_WAIT", "15"))
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(str(path))
+            break
+        except OSError:
+            s.close()
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.5)
     print(f"[asr-server] 接上常駐伺服器 {path}（不另外載模型）", file=sys.stderr, flush=True)
 
     def up():
@@ -362,10 +370,15 @@ def main(argv=None) -> int:
         wanted.append(default)
     warm = (np.random.default_rng(0).standard_normal(16000).astype("float32") * 0.02)
     builders = _builders()
-    engines = load_engines(wanted, builders, warm)
+    # 載模型時第三方套件會往 stdout 印說明（例如 OctoASR 找不到 ffmpeg 時印 4 行），而 stdout 是協定通道：
+    # 一律導到 stderr，免得客戶端把雜訊當回應、之後每個回應都錯位。
+    import contextlib
+    with contextlib.redirect_stdout(sys.stderr):
+        engines = load_engines(wanted, builders, warm)
 
     def run(req, audio):
-        return run_backend(engines, default, req, audio, builders)
+        with contextlib.redirect_stdout(sys.stderr):
+            return run_backend(engines, default, req, audio, builders)
 
     if "--listen" not in argv:
         print(f"[asr-server] 就緒，等待請求（預設={default}，已載入={sorted(engines)}）", file=sys.stderr, flush=True)
