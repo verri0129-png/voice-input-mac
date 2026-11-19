@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 「先等潤稿再貼上」子選單：寫 off 或最多等幾秒，transcribe.py 每次辨識重讀（蓋過 local.env 的
     // VOICE_WAIT_REFINE／VOICE_WAIT_REFINE_MAX）。選「跟隨 local.env」＝刪掉檔案。預設關＝先貼規則版。
     private var waitRefineItems: [String: NSMenuItem] = [:]
+    private var waitRefineParent: NSMenuItem?
     private static let waitRefineFile = NSString(string: "~/orca/state/voice-input/wait-refine").expandingTildeInPath
     private static let waitRefineChoices: [(id: String, title: String)] = [
         ("", "跟隨 local.env（沒設＝關）"),
@@ -117,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let waitParent = NSMenuItem(title: "先等潤稿再貼上", action: nil, keyEquivalent: "")
         waitParent.submenu = waitMenu
         menu.addItem(waitParent)
+        waitRefineParent = waitParent
         refreshWaitRefineChecks()
         menu.delegate = self
         menu.addItem(.separator())
@@ -453,7 +455,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (id, item) in backendItems { item.state = (id == cur) ? .on : .off }
     }
     // 每次打開選單都重讀，檔案被別的方式改掉時勾選也不會過期
-    func menuWillOpen(_ menu: NSMenu) { refreshBackendChecks(); refreshWaitRefineChecks() }
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshBackendChecks(); refreshWaitRefineChecks()
+        // 潤稿設成只走規則版（local.env 的 VOICE_REWRITE_BACKEND）時沒有潤稿可等、也沒有背景定版，
+        // 「先等潤稿再貼上」整組選項都不會有作用，藏起來免得誤導。
+        waitRefineParent?.isHidden = Self.rewriteIsRulesOnly()
+    }
+    /// 與 transcribe.py 的 defer_cloud 條件一致：這些 backend 不會叫模型、不做背景定版。沒設＝local-brain。
+    static func rewriteIsRulesOnly() -> Bool {
+        let v = (EditLearning.localValue("VOICE_REWRITE_BACKEND") ?? "local-brain").lowercased()
+        return ["off", "none", "raw", "rules", "local"].contains(v)
+    }
     /// 目前「先等潤稿再貼上」的選項；沒有檔案＝跟隨 local.env（""）。不認得的值也當跟隨。
     static func readWaitRefine() -> String {
         guard let v = (try? String(contentsOfFile: waitRefineFile, encoding: .utf8))?
@@ -496,10 +508,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func revealInFinder() { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: Bundle.main.bundlePath)]) }
     @objc func relaunch() {
-        let url = URL(fileURLWithPath: Bundle.main.bundlePath)
-        let cfg = NSWorkspace.OpenConfiguration(); cfg.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: url, configuration: cfg, completionHandler: nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { NSApp.terminate(nil) }
+        // 不能先開新實例再關舊的：新實例啟動時看到舊 pid 還在，會判定「已有另一個實例」而自己結束，
+        // 舊的隨後也關閉＝整個 App 消失（先前「重新啟動」只會關閉的原因）。
+        // 改成：交給一個獨立的 shell，等舊 pid 結束後再開；本程序隨即結束。
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let path = Bundle.main.bundlePath.replacingOccurrences(of: "'", with: "'\\''")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done; /usr/bin/open -n '\(path)'"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch {
+            Transcriber.log("[app] 重新啟動失敗（無法啟動 shell）：\(error.localizedDescription)")
+            return
+        }
+        Transcriber.log("[app] 重新啟動：等 pid=\(pid) 結束後重開")
+        NSApp.terminate(nil)
     }
     @objc func quit() { NSApp.terminate(nil) }
 }
