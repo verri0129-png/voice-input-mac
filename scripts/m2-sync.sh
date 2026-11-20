@@ -29,9 +29,9 @@ cd "$HOME/orca/voice-input-mac"
 git fetch -q origin main
 git merge --ff-only -q origin/main
 echo "[m2] HEAD $(git log --oneline -1)"
-VOICE_ASR_BACKEND_FILE=/tmp/no-such-asr-backend ./.venv/bin/python -m unittest discover -s . -p 'test_*.py' > /tmp/m2-test.out 2>&1
-grep -E '^(Ran |OK|FAILED)' /tmp/m2-test.out
 mkdir -p "$HOME/orca/state/voice-input"
+VOICE_ASR_BACKEND_FILE=/tmp/no-such-asr-backend ./.venv/bin/python -m unittest discover -s . -p 'test_*.py' > "$HOME/orca/state/voice-input/m2-test.out" 2>&1
+grep -E '^(Ran |OK|FAILED)' "$HOME/orca/state/voice-input/m2-test.out"
 echo octo > "$HOME/orca/state/voice-input/asr-backend"
 (cd app && ./install.sh --no-open)
 echo "[m2] done"

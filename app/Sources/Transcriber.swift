@@ -36,7 +36,10 @@ enum Transcriber {
         logLock.lock()
         defer { logLock.unlock() }
         let fm = FileManager.default
-        if !fm.fileExists(atPath: logPath) { fm.createFile(atPath: logPath, contents: nil) }
+        if !fm.fileExists(atPath: logPath) {
+            // 0600：log 裡有聽寫內容，不讓同機其他帳號讀
+            fm.createFile(atPath: logPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
         guard let h = FileHandle(forWritingAtPath: logPath) else { return }
         defer { try? h.close() }
         h.seekToEndOfFile()

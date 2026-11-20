@@ -1926,7 +1926,10 @@ def second_opinion_record(
 
 
 def _append_jsonl(path: str, record: dict) -> None:
-    with open(path, "a", encoding="utf-8") as handle:
+    # 0600：逐字稿可能有私人內容，不讓同機其他帳號讀
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
